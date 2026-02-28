@@ -128,7 +128,7 @@ def get_val(df, ptn, bs, nj, qd, metric):
     return ""
 
 def generate_strict_excel(df_all, mixed_results, out_excel, model):
-    print("\n[INFO] 开始生成天翼云制式 Excel 报表...")
+    print("\n[INFO] 开始生成 Excel 报表...")
     
     QDS_STRICT =[1, 2, 4, 8, 16, 32, 64, 128, 256]
     MATRIX_COLS =[f"{n}_{q}" for n in NUMJOBS_LIST for q in QDS_STRICT]
