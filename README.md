@@ -14,7 +14,7 @@ The content below was summarized by an AI based on the scripts I created.
 ## 中文说明
 
 ### 性能准入套件 (nvme_cloud_qual_suite_*.sh)
-这是最核心的工具，专为云厂商准入级别（如天翼云标准）设计，分中英文版。
+这是最核心的工具，专为云厂商准入级别设计，分中英文版。
 
 * 全自动测试：跑完顺序、随机、混合读写及 QoS 一致性的性能矩阵（涵盖各种 BS 和 QD），并内置全盘安全擦除与稳态预处理。
 * 双轨测试模式：支持 single（单盘全矩阵深度遍历，用于极限摸底）与 multi（多盘并发定向抽样，用于批量一致性验证）模式。
