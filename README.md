@@ -14,8 +14,6 @@ The content below was summarized by an AI based on the scripts I created.
 ## 中文说明
 
 ### 性能准入套件 (nvme_cloud_qual_suite_*.sh)
-这是最核心的工具，专为云厂商准入级别设计，分中英文版。
-
 * 全自动测试：跑完顺序、随机、混合读写及 QoS 一致性的性能矩阵（涵盖各种 BS 和 QD），并内置全盘安全擦除与稳态预处理。
 * 双轨测试模式：支持 single（单盘全矩阵深度遍历，用于极限摸底）与 multi（多盘并发定向抽样，用于批量一致性验证）模式。
 * 智能 NUMA 绑定：底层自动侦测硬盘物理归属节点，智能绑定测试进程，彻底规避多盘高压并发时的 PCIe 跨路带宽衰减。
@@ -52,38 +50,6 @@ The content below was summarized by an AI based on the scripts I created.
 - **依赖**：`trace_player` 执行程序。
 - **功能**：按照设定的总时间（比如 30000 秒）循环跑指定的测试流（`multi_stream.txt`）。
 - **用途**：模拟长时间的高负载业务流，检查设备在持续运行下的表现。
-
----
-
-## English Description
-
-### Performance Qualification Suite (`nvme_cloud_qual_suite_*.sh`)
-- **Description**: The core tool of this repo, available in both Chinese and English versions.
-- **Function**: Fully automates a performance matrix covering sequential, random, and mixed R/W across various Block Sizes (BS) and Queue Depths (QD).
-- **Reporting**: Automatically invokes a Python engine to generate Excel reports, providing clear metrics for IOPS, Bandwidth, and Latency.
-- **Note**: Requires Python 3 with `pandas` and `openpyxl` libraries installed.
-
-### Surprise Hotplug Validation (`nvme_hotplug_unified.sh`)
-- **Function**: Simulates Surprise Removal (physically pulling the drive without notification).
-- **Workflow**: The script guides you through a step-by-step process: it writes data and records MD5 checksums, prompts you to remove and re-insert the drive, and then automatically verifies if the drive is recognized and if data integrity has been maintained.
-
-### Secure Erase Audit (`nvme_secure_erase_test.sh`)
-- **Function**: Verifies whether `nvme format` actually wipes all data completely.
-- **Principle**: After performing a format, the script executes a full-disk Hex Dump scan. It will report an error if any non-zero data is detected.
-
-### Slot Power Cycle Test (`nvme_slot_power_test.sh`)
-- **Function**: Cycles power directly via the PCI slot's power interface (no manual pulling required).
-- **Purpose**: Used to test the initialization stability of the SSD during repeated power-loss and reboot cycles.
-
-### Driver Load Stress Test (`nvme_driver_visible_check.sh`)
-- **Function**: Repeatedly unloads and reloads the nvme driver using `modprobe`.
-- **Purpose**: Checks kernel logs (dmesg) for identification errors or initialization failures during driver stress.
-
-### PPU / AI Monitoring & Stress Scripts
-#### Real-time Hardware Status Collection (`collect_ppu_monitor.sh`)
-- **Dependency**: Requires the `ppudbg` command.
-- **Function**: Performs background monitoring of multiple devices simultaneously (default IDs 0 and 1).
-- **Logging**: Automatically records real-time information for Stress, Power, ICN (Interconnect), and Video processing into separate log files.
 
 #### Automated Stress Test Loop (`trace_player_autorun.sh`)
 - **Dependency**: Requires the `trace_player` executable.
