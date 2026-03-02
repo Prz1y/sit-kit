@@ -13,11 +13,18 @@ The content below was summarized by an AI based on the scripts I created.
 
 ## 中文说明
 
-### 性能准入套件 (`nvme_cloud_qual_suite_*.sh`)
-这是最核心的工具，分中英文版。
-- **全自动测试**：跑完顺序、随机、混合读写的性能矩阵（涵盖各种 BS 和 QD）。
-- **报表生成**：跑完后会调用 Python 引擎自动生成 Excel 报表，直接看 IOPS、带宽和时延。
-- **注意**：环境里需要 Python3，且要安装 `pandas` 和 `openpyxl` 库。
+### 性能准入套件 (nvme_cloud_qual_suite_*.sh)
+这是最核心的工具，专为云厂商准入级别（如天翼云标准）设计，分中英文版。
+
+* 全自动测试：跑完顺序、随机、混合读写及 QoS 一致性的性能矩阵（涵盖各种 BS 和 QD），并内置全盘安全擦除与稳态预处理。
+* 双轨测试模式：支持 single（单盘全矩阵深度遍历，用于极限摸底）与 multi（多盘并发定向抽样，用于批量一致性验证）模式。
+* 智能 NUMA 绑定：底层自动侦测硬盘物理归属节点，智能绑定测试进程，彻底规避多盘高压并发时的 PCIe 跨路带宽衰减。
+* 报表直出：跑完后会调用 Python 引擎自动生成制式 Excel 交付报表，单位自动换算（MB/s, us），直接看 IOPS、带宽和长尾时延。
+* 健康自检：测试全程防串扰对齐，结束后自动解析 dmesg，排查底层是否有 PCIe Bus Error 或 I/O Timeout 异常。
+* 注意与依赖：
+  * 环境里需要安装 fio、nvme-cli、ipmitool、numactl 和 tmux。
+  * 需要 Python3 环境，且必须安装 pandas 和 openpyxl 库（pip3 install pandas openpyxl）。
+  * 执行提示：稳态测试耗时极长，绝对禁止在常规 SSH 终端直连运行，务必在 tmux 或后台会话中挂起执行。
 
 ### 暴力热插拔验证 (`nvme_hotplug_unified.sh`)
 - **功能**：模拟 Surprise Removal（直接拔盘）。
