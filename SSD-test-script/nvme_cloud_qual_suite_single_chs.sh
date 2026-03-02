@@ -78,7 +78,7 @@ for tool in fio nvme lspci python3; do
 done
 
 # 如果采用 numactl 模式，检查是否安装了 numactl
-if [ "$ENABLE_NUMA_BIND" == "yes" ] &&[ "$NUMA_BIND_METHOD" == "numactl" ]; then
+if [ "$ENABLE_NUMA_BIND" == "yes" ] && [ "$NUMA_BIND_METHOD" == "numactl" ]; then
     if ! command -v numactl >/dev/null 2>&1; then
         echo "[ERROR] 'numactl' is not installed but NUMA_BIND_METHOD is set to numactl."
         exit 1
@@ -87,7 +87,7 @@ fi
 
 # 检查配置的块设备是否真实存在
 for dev in "${TARGET_DEVS[@]}"; do
-    if[ ! -b "$dev" ]; then
+    if [ ! -b "$dev" ]; then
         echo "[ERROR] Block device '$dev' does not exist or is invalid."
         exit 1
     fi
