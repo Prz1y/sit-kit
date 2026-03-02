@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================================
-# NVMe 云准入测试套件 - by Prz1y
+# NVMe 云准入测试套件 (企业级正式版) - by Prz1y
 # ============================================================================
 # 特性:
 # 1. 多盘同步并发测试，动态生成自适应的 Excel 报表。
@@ -64,7 +64,7 @@ NUMA_FALLBACK_NODE="0"       # 兜底 NUMA 节点: 当无法识别归属或系�
 echo "[INFO] Commencing pre-flight system checks..."
 
 # 检查 Root 权限
-if[ "$EUID" -ne 0 ]; then
+if [ "$EUID" -ne 0 ]; then
     echo "[ERROR] This suite requires root privileges. Please run as root."
     exit 1
 fi
@@ -416,8 +416,8 @@ def main():
     args = parser.parse_args()
     devs = args.devs.split()
     bs_list = args.bs_list.split()
-    results =[] 
-    mixed_results = []
+    results = [] 
+    mixed_results =[]
     
     log_print("[INFO] Initiating drive preparation and formatting...")
     drive_infos = {}
@@ -493,7 +493,7 @@ def main():
     # ----- 4. QoS 测试模块 -----
     if args.run_qos == 'yes':
         log_print("\n[INFO] === Consistency & QoS Testing ===")
-        qos_bs = [b for b in ['4k', '8k', '16k'] if b in bs_list]
+        qos_bs =[b for b in ['4k', '8k', '16k'] if b in bs_list]
         for bs in qos_bs:
             for rw in['randread', 'randwrite']:
                 log_print(f"  -> QoS Test | {rw} | BS={bs}")
@@ -515,13 +515,11 @@ if __name__ == "__main__":
     main()
 EOF
 
-sed -i 's/^EOF.*/EOF/' "$PYTHON_ENGINE"
-
 # ====================[ 执行与触发 ] ====================
 EXCEL_REPORT="${BASE_DIR}/Cloud_qual_NVMe_Report_${SERVER_MODEL}.xlsx"
 
 echo "=========================================================================="
-echo "[WARNING] Enterprise NVMe Qualification Suite is ready."
+echo "[WARNING] Enterprise NVMe Qualification Suite is armed and ready."
 echo "[WARNING] All data on the selected drives will be permanently erased."
 echo "[INFO] Test Mode: $TEST_MODE"
 echo "[INFO] Drives targeted: ${TARGET_DEVS[*]}"
@@ -566,7 +564,7 @@ echo "[INFO] Performing automated anomaly detection (PCIe/AER/Timeout)..."
 echo "=== Anomaly Self-Check ===" > "$LOG_DIR/error_check_summary.txt"
 err_count=$(grep -iE 'pcie bus error|aer|bad tlp|bad dllp|nvme.*timeout|i/o error' "$LOG_DIR/post_dmesg.log" | wc -l)
 
-if[ "$err_count" -gt 0 ]; then
+if [ "$err_count" -gt 0 ]; then
     echo "[WARNING] Found $err_count related hardware errors in dmesg. Inspect $LOG_DIR/post_dmesg.log" | tee -a "$LOG_DIR/error_check_summary.txt"
     grep -iE 'pcie bus error|aer|bad tlp|bad dllp|nvme.*timeout|i/o error' "$LOG_DIR/post_dmesg.log" | tail -n 10 | tee -a "$LOG_DIR/error_check_summary.txt"
 else
