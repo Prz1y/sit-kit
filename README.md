@@ -50,8 +50,3 @@ The content below was summarized by an AI based on the scripts I created.
 - **依赖**：`trace_player` 执行程序。
 - **功能**：按照设定的总时间（比如 30000 秒）循环跑指定的测试流（`multi_stream.txt`）。
 - **用途**：模拟长时间的高负载业务流，检查设备在持续运行下的表现。
-
-#### Automated Stress Test Loop (`trace_player_autorun.sh`)
-- **Dependency**: Requires the `trace_player` executable.
-- **Function**: Runs specified test streams (`multi_stream.txt`) in a loop for a predefined duration (e.g., 30,000 seconds).
-- **Purpose**: Simulates long-term, high-load business traffic to check device performance and stability under continuous operation.
