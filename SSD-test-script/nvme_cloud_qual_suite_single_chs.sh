@@ -25,7 +25,7 @@ TEST_MODE="multi"
 TARGET_DEVS=("/dev/nvme0n1" "/dev/nvme1n1")
 
 # 3. 服务器型号 / 项目标识 (将作为生成的 Excel 文件名及表头标识)
-SERVER_MODEL="R5130Y-Gen5-Server"
+SERVER_MODEL="Server"
 
 # 4. 测试时长与预处理配置
 RUNTIME=300           # 常规顺序/随机测试时长 (单位: 秒，规范: 300)
