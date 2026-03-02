@@ -25,7 +25,7 @@ TEST_MODE="multi"
 TARGET_DEVS=("/dev/nvme0n1" "/dev/nvme1n1")
 
 # 3. Server / Project Identifier
-SERVER_MODEL="R5130Y-Gen5-Server"
+SERVER_MODEL="Server"
 
 # 4. Test Duration & Precondition Settings
 RUNTIME=300           # Normal RW test duration in seconds (Standard: 300)
