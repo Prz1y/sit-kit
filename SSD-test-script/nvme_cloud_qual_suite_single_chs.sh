@@ -120,6 +120,9 @@ import os, sys, json, time, subprocess, argparse, datetime
 from concurrent.futures import ThreadPoolExecutor
 import pandas as pd
 
+# 标准测试参数矩阵
+# NUMJOBS_LIST =[1, 2, 4, 8]
+# IODEPTH_LIST =[1, 2, 4, 8, 16, 32, 64, 128, 256]
 # 全量测试参数矩阵
 NUMJOBS_LIST =[1, 2, 4, 8, 16, 32]
 IODEPTH_LIST =[1, 2, 4, 8, 16, 32, 64, 128, 256, 512] 
