@@ -52,6 +52,12 @@ RUN_QOS_TEST="yes"
 # 脚本只会遍历留在这里的 BS，您可以自由删减不需要测试的块大小。
 TEST_BS_LIST="4k 8k 16k 32k 64k 128k 256k 512k 1m"
 
+# 7. 断点续测配置 (RESUME_FROM)
+# 如果需要从上次意外中断的测试中恢复，请填入上次生成的测试根目录路径 (BASE_DIR)。
+# 例如: RESUME_FROM="/root/NVME_TEST_20231027_100000"
+# 为空时则启动全新的测试流程。
+RESUME_FROM=""
+
 # ============================================================================
 # [ NUMA 智能绑定配置区 ]
 # ============================================================================
@@ -96,13 +102,21 @@ for dev in "${TARGET_DEVS[@]}"; do
     fi
 done
 
-# 创建日志和原生数据目录
-BASE_DIR="$(pwd)/NVME_TEST_$(date +%Y%m%d_%H%M%S)"
+# 创建日志和原生数据目录 (支持断点续测)
+if [ -n "$RESUME_FROM" ] && [ -d "$RESUME_FROM" ]; then
+    BASE_DIR="$RESUME_FROM"
+    RESUME_FLAG="--resume"
+    echo "[INFO] Resuming from existing workspace: $BASE_DIR"
+else
+    BASE_DIR="$(pwd)/NVME_TEST_$(date +%Y%m%d_%H%M%S)"
+    RESUME_FLAG=""
+    echo "[INFO] Test workspace created at: $BASE_DIR"
+fi
+
 RAW_DIR="${BASE_DIR}/raw_data"
 LOG_DIR="${BASE_DIR}/logs"
 
 mkdir -p "$RAW_DIR" "$LOG_DIR"
-echo "[INFO] Test workspace created at: $BASE_DIR"
 
 # 测试前抓取环境状态
 dmesg -T > "$LOG_DIR/pre_dmesg.log" 2>/dev/null || true
@@ -224,9 +238,13 @@ def run_fio_task(task_args):
     json_out = os.path.join(raw_dir, f"{job_name}_{dev_name}_{rw}_{bs}_{numjobs}j_{iodepth}qd.json")
     log_out = json_out.replace('.json', '.log')
     
+    if args.resume and os.path.exists(json_out) and os.path.getsize(json_out) > 0:
+        log_print(f"[RESUME] Skipping existing task: {os.path.basename(json_out)}")
+        return (json_out, dev_name)
+
     cmd = build_fio_cmd(job_name, dev, rw, bs, iodepth, numjobs, runtime, json_out, args, loops, rwmixread)
     run_cmd(cmd, log_out)
-    return json_out
+    return (json_out, dev_name)
 
 def execute_synchronized_parallel(devs, job_name, rw, bs, iodepth, numjobs, runtime, raw_dir, args, loops=0, rwmixread=None):
     # 并发控制：确保所有盘同时发车执行同一参数
@@ -418,6 +436,7 @@ def main():
     parser.add_argument('--run_rand_write', required=True)
     parser.add_argument('--run_mixed', required=True)
     parser.add_argument('--run_qos', required=True)
+    parser.add_argument('--resume', action='store_true')
     
     args = parser.parse_args()
     devs = args.devs.split()
@@ -428,7 +447,8 @@ def main():
     log_print("[INFO] Initiating drive preparation and formatting...")
     drive_infos = {}
     for d in devs:
-        format_drive(d)
+        if not args.resume:
+            format_drive(d)
         drive_infos[d] = get_drive_info(d)
         node = get_numa_node(d, args.fallback_node) if args.enable_numa == 'yes' else 'N/A'
         log_print(f"[INFO] Discovered {d}: {drive_infos[d]} (Assigned NUMA Node: {node})")
@@ -449,10 +469,9 @@ def main():
             for i, (bs, nj, qd) in enumerate(combos_to_run, 1):
                 log_print(f"  -> Progress[{i}/{len(combos_to_run)}] | {rw} | BS={bs} | Jobs={nj} | QD={qd}")
                 json_files = execute_synchronized_parallel(devs, "seq", rw, bs, qd, nj, args.runtime, args.raw_dir, args)
-                for jf in json_files:
+                for jf, d_name in json_files:
                     res = parse_fio_json(jf)
                     if res:
-                        d_name = os.path.basename(jf).split('_')[1]
                         res.update({"drive": d_name, "pattern": f"seq_{rw}", "bs": bs, "nj": nj, "qd": qd})
                         results.append(res)
 
@@ -472,10 +491,9 @@ def main():
             for i, (bs, nj, qd) in enumerate(combos_to_run, 1):
                 log_print(f"  -> Progress[{i}/{len(combos_to_run)}] | {rw} | BS={bs} | Jobs={nj} | QD={qd}")
                 json_files = execute_synchronized_parallel(devs, "rand", rw, bs, qd, nj, args.runtime, args.raw_dir, args)
-                for jf in json_files:
+                for jf, d_name in json_files:
                     res = parse_fio_json(jf)
                     if res:
-                        d_name = os.path.basename(jf).split('_')[1]
                         res.update({"drive": d_name, "pattern": f"{rw}", "bs": bs, "nj": nj, "qd": qd})
                         results.append(res)
 
@@ -487,10 +505,9 @@ def main():
             for ratio in MIX_RATIO_LIST:
                 log_print(f"  -> Mixed RW | BS={bs} | Ratio={ratio}R/{100-ratio}W")
                 json_files = execute_synchronized_parallel(devs, f"mixed_{ratio}", "randrw", bs, 128, 8, args.mix_runtime, args.raw_dir, args, rwmixread=ratio)
-                for jf in json_files:
+                for jf, d_name in json_files:
                     res = parse_fio_json(jf, is_mixed=True)
                     if res:
-                        d_name = os.path.basename(jf).split('_')[1]
                         mixed_results.append({
                             "drive": d_name, "bs_ratio": f"{bs}_{ratio}", 
                             "read_8_128": res['read_iops'], "write_8_128": res['write_iops']
@@ -504,10 +521,9 @@ def main():
             for rw in['randread', 'randwrite']:
                 log_print(f"  -> QoS Test | {rw} | BS={bs}")
                 json_files = execute_synchronized_parallel(devs, "qos", rw, bs, 64, 4, args.qos_runtime, args.raw_dir, args)
-                for jf in json_files:
+                for jf, d_name in json_files:
                     res = parse_fio_json(jf)
                     if res:
-                        d_name = os.path.basename(jf).split('_')[1]
                         res.update({"drive": d_name, "pattern": f"qos_{rw}", "bs": bs, "nj": 4, "qd": 64})
                         results.append(res)
 
@@ -555,7 +571,8 @@ python3 "$PYTHON_ENGINE" \
     --run_rand_read "$RUN_RAND_READ" \
     --run_rand_write "$RUN_RAND_WRITE" \
     --run_mixed "$RUN_MIXED_RW" \
-    --run_qos "$RUN_QOS_TEST"
+    --run_qos "$RUN_QOS_TEST" \
+    $RESUME_FLAG
 
 # ====================[ 测试后日志收集与健康检查 ] ====================
 echo "[INFO] Capturing post-flight diagnostics..."
