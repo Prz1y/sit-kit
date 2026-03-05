@@ -1,51 +1,67 @@
 #!/bin/bash
 # ============================================================================
-# NVMe 云准入测试套件 - by Prz1y
+# NVMe Storage Performance Test Suite
+# ============================================================================
+# Features:
+# 1. 多盘同步并发测试，动态生成自适应的 Excel 报表。
+# 2. 智能 NUMA 节点侦测与线程绑定 (支持 fio 原生或 numactl)。
+# 3. 支持参数矩阵全量遍历、预热机制 (ramp_time) 及混合读写比例测试。
+# 4. 包含严格的错误处理、依赖检查与自动重试机制。
+# 5. 模块化测试大项开关与自定义块大小 (Block Size) 支持。
+# 
+# Dependencies:
+# sudo yum/apt-get install -y fio nvme-cli pciutils python3 python3-pip numactl ipmitool
+# pip3 install pandas openpyxl
 # ============================================================================
 
 # ============================================================================
-#[ 核心配置区 ]
+# [ 核心配置区 ]
 # ============================================================================
 
-# 1. 运行模式设置 (TEST_MODE) ->[对齐图片要求]: 循环遍历，必须用 single
+# 1. 运行模式设置 (TEST_MODE)
+# - single : 全量遍历模式 (执行全部参数组合笛卡尔积，输出详细矩阵 Sheet)
+# - multi  : 抽样模式 (仅执行特定负载组合，用于快速验证)
 TEST_MODE="single"
 
-# 2. 被测硬盘阵列 (TARGET_DEVS) -> 请根据实际情况修改
+# 2. 被测块设备阵列 (TARGET_DEVS)
+# 支持填入多块盘，以空格分隔。例如: ("/dev/nvme0n1" "/dev/nvme1n1")
+# [警告] 测试会执行格式化，禁止填入系统盘或存有重要数据的磁盘！
 TARGET_DEVS=("/dev/nvme0n1")
 
-# 3. 服务器型号 / 项目标识
+# 3. 测试项目标识 (将作为生成的 Excel 文件名及表头标识)
 SERVER_MODEL="Server"
 
 # 4. 测试时长与预处理配置
 RUNTIME=300           # 常规顺序/随机测试时长 (单位: 秒)
 MIX_RUNTIME=1800      # 混合读写测试时长 (单位: 秒)
-QOS_RUNTIME=3600      # QoS 一致性测试时长 (本脚本已关闭，此项作废)
+QOS_RUNTIME=3600      # QoS 一致性测试时长 (单位: 秒)
 
-DO_SEQ_PRECON="yes"   # 顺序读写前是否进行预处理 (128k 顺序写)
+DO_SEQ_PRECON="yes"   # 顺序读写前是否进行预处理 (默认 128k 顺序写)
 SEQ_PRE_LOOPS=2       # 顺序预处理的全盘循环遍数
-DO_RAND_PRECON="yes"  # 随机读写前是否进行预处理 (4k 随机写)
+DO_RAND_PRECON="yes"  # 随机读写前是否进行预处理 (默认 4k 随机写)
 RAND_PRE_LOOPS=1      # 随机预处理的全盘循环遍数
 
-# 5. 测试阶段大项开关 (yes / no) -> [对齐图片要求]: 关闭不要的 QoS
+# 5. 测试阶段模块开关 (yes / no)
 RUN_SEQ_READ="yes"
 RUN_SEQ_WRITE="yes"
 RUN_RAND_READ="yes"
 RUN_RAND_WRITE="yes"
 RUN_MIXED_RW="yes"
-RUN_QOS_TEST="no"     # <--- 已关闭多余测试
+RUN_QOS_TEST="no"     # 默认关闭多余的 QoS 稳定性长测
 
-# 6. 块大小 (Block Size) 白名单 -> [对齐图片要求]: 包含所有列出的 BS
+# 6. 块大小 (Block Size) 遍历列表 (以空格分隔)
 TEST_BS_LIST="4k 8k 16k 32k 64k 128k 256k 512k 1m"
 
 # 7. 断点续测配置 (RESUME_FROM)
+# 若需从意外中断的测试中恢复，请填入上次生成的测试目录路径。为空则启动全新测试。
 RESUME_FROM=""
 
 # ============================================================================
-#[ NUMA 智能绑定配置区 ]
+# [ NUMA 智能绑定配置区 ]
 # ============================================================================
-ENABLE_NUMA_BIND="yes"       
-NUMA_BIND_METHOD="fio"       
-NUMA_FALLBACK_NODE="0"       
+ENABLE_NUMA_BIND="yes"       # 是否开启 NUMA 节点绑定
+NUMA_BIND_METHOD="fio"       # 绑定方式: "fio" (--numa_cpu_nodes) 或 "numactl"
+NUMA_FALLBACK_NODE="0"       # 兜底 NUMA 节点
 
 # ============================================================================
 # [ 环境与安全前置检查 ]
@@ -87,6 +103,7 @@ LOG_DIR="${BASE_DIR}/logs"
 
 mkdir -p "$RAW_DIR" "$LOG_DIR"
 
+# 抓取初始系统日志用于异常对比
 dmesg -T > "$LOG_DIR/pre_dmesg.log" 2>/dev/null || true
 lspci -vvv > "$LOG_DIR/pre_lspci.log" 2>/dev/null || true
 nvme smart-log "${TARGET_DEVS[0]}" > "$LOG_DIR/pre_smart.log" 2>/dev/null || true
@@ -99,12 +116,15 @@ import os, sys, json, time, subprocess, argparse, datetime
 from concurrent.futures import ThreadPoolExecutor
 import pandas as pd
 
-# [对齐图片要求]: 严格的参数矩阵
+# ----------------------------------------------------------------------------
+# 参数矩阵定义
+# ----------------------------------------------------------------------------
+# 全量遍历基础参数
 NUMJOBS_LIST =[1, 2, 4, 8]
 IODEPTH_LIST =[1, 2, 4, 8, 16, 32, 64, 128, 256]
 MIX_RATIO_LIST =[10, 20, 30, 40, 50, 60, 70, 80, 90]
 
-# multi模式的抽样组合（当前为single模式，这些变量作为备用不生效）
+# Multi 模式备用抽样组合 (Single 模式下不生效)
 SEQ_COMBOS =[('128k', 1, 32)] 
 RAND_COMBOS =[('4k', 1, 32)]
 
@@ -113,6 +133,7 @@ def log_print(msg):
     print(f"[{ts}] {msg}")
 
 def get_drive_info(dev):
+    """获取 NVMe 硬盘的型号与固件版本"""
     try:
         res = subprocess.run(f"nvme id-ctrl {dev}", shell=True, capture_output=True, text=True)
         mn, fr = "Unknown_Model", "Unknown_FW"
@@ -126,6 +147,7 @@ def get_drive_info(dev):
         return "Unknown | Unknown"
 
 def get_numa_node(dev_path, fallback):
+    """自动获取硬盘对应的 PCIe NUMA Node"""
     try:
         dev_name = os.path.basename(dev_path)
         ctrl_name = dev_name.split('n')[0]
@@ -139,6 +161,7 @@ def get_numa_node(dev_path, fallback):
     return fallback
 
 def run_cmd(cmd, log_file=None):
+    """执行 Shell 命令并记录日志"""
     try:
         res = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         if log_file:
@@ -150,6 +173,7 @@ def run_cmd(cmd, log_file=None):
         return False
 
 def format_drive(dev):
+    """执行 NVMe 安全擦除"""
     for attempt in range(1, 4):
         log_print(f"[INFO] Formatting {dev} (Attempt {attempt}/3)...")
         if run_cmd(f"nvme format {dev} -s 1"):
@@ -160,18 +184,20 @@ def format_drive(dev):
     sys.exit(1)
 
 def build_fio_cmd(job_name, dev, rw, bs, iodepth, numjobs, runtime, json_out, args, loops=0, rwmixread=None):
+    """构建 FIO 测试命令"""
     cmd = f"fio --name={job_name} --filename={dev} --rw={rw} --bs={bs} --iodepth={iodepth} --numjobs={numjobs} --direct=1 --group_reporting --output-format=json --output={json_out}"
     
     if loops > 0:
-        # 全盘预处理模式：按百分比跑满全盘（不加预热）
+        # 预处理模式：按全盘容量比例写入 (无预热)
         cmd += f" --loops={loops} --size=100%"
     else:
-        # [新增]: 测试模式注入 30 秒预热 (ramp_time)
+        # 常规测试模式：基于时间运行，并设置 30s 预热机制
         cmd += f" --ramp_time=30 --runtime={runtime} --time_based"
         
     if rwmixread is not None:
         cmd += f" --rwmixread={rwmixread}"
 
+    # 应用 NUMA 节点绑定
     if args.enable_numa == 'yes':
         node = get_numa_node(dev, args.fallback_node)
         if args.numa_method == 'fio':
@@ -182,11 +208,13 @@ def build_fio_cmd(job_name, dev, rw, bs, iodepth, numjobs, runtime, json_out, ar
     return cmd
 
 def run_fio_task(task_args):
+    """单体 FIO 任务执行包装器"""
     job_name, dev, rw, bs, iodepth, numjobs, runtime, raw_dir, args, loops, rwmixread = task_args
     dev_name = os.path.basename(dev)
     json_out = os.path.join(raw_dir, f"{job_name}_{dev_name}_{rw}_{bs}_{numjobs}j_{iodepth}qd.json")
     log_out = json_out.replace('.json', '.log')
     
+    # 断点续测逻辑
     if args.resume and os.path.exists(json_out) and os.path.getsize(json_out) > 0:
         log_print(f"[RESUME] Skipping existing task: {os.path.basename(json_out)}")
         return (json_out, dev_name)
@@ -196,6 +224,7 @@ def run_fio_task(task_args):
     return (json_out, dev_name)
 
 def execute_synchronized_parallel(devs, job_name, rw, bs, iodepth, numjobs, runtime, raw_dir, args, loops=0, rwmixread=None):
+    """使用线程池实现多盘并发测试"""
     tasks =[(job_name, d, rw, bs, iodepth, numjobs, runtime, raw_dir, args, loops, rwmixread) for d in devs]
     json_results =[]
     with ThreadPoolExecutor(max_workers=len(devs)) as executor:
@@ -204,6 +233,7 @@ def execute_synchronized_parallel(devs, job_name, rw, bs, iodepth, numjobs, runt
     return json_results
 
 def parse_fio_json(json_file, is_mixed=False):
+    """解析 FIO 生成的 JSON 数据文件"""
     if not os.path.exists(json_file):
         return None
     try:
@@ -222,6 +252,7 @@ def parse_fio_json(json_file, is_mixed=False):
         bw_mb = tgt['bw_bytes'] / (1024 * 1024)
         iops = tgt['iops']
         
+        # 时延统一转换为 us (微秒)
         lat_dict = tgt.get('lat_ns', {})
         min_lat = lat_dict.get('min', 0) / 1000.0
         avg_lat = lat_dict.get('mean', 0) / 1000.0
@@ -242,12 +273,14 @@ def get_val(df, dev, ptn, bs, nj, qd, metric):
     return match.iloc[0][metric] if not match.empty else ""
 
 def generate_excel(df_all, mixed_results, args, devs, drive_infos):
+    """生成测试报告 Excel"""
     log_print("[INFO] Compiling data into standard Excel report...")
     out_excel = args.out_excel
     bs_list = args.bs_list.split()
     
     with pd.ExcelWriter(out_excel, engine='openpyxl') as writer:
         
+        # 1. 详细矩阵数据 Sheet
         if args.mode == 'single':
             QDS_STRICT =[1, 2, 4, 8, 16, 32, 64, 128, 256]
             MATRIX_COLS =[f"{n}_{q}" for n in NUMJOBS_LIST for q in QDS_STRICT]
@@ -288,9 +321,11 @@ def generate_excel(df_all, mixed_results, args, devs, drive_infos):
                 pd.DataFrame([["latency:bs_thread_iodepth"]]).to_excel(writer, sheet_name=sheet_name, startrow=lat_start_row, startcol=0, header=False, index=False)
                 df_lat.to_excel(writer, sheet_name=sheet_name, startrow=lat_start_row+1)
 
+        # 2. 混合读写数据 Sheet
         if mixed_results:
             pd.DataFrame(mixed_results).to_excel(writer, sheet_name='混合读写', index=False)
 
+        # 3. 全局原始扁平数据 Sheet
         df_all.to_excel(writer, sheet_name="Raw_Matrix_Data", index=False)
         
     log_print(f"[SUCCESS] Report successfully generated: {out_excel}")
@@ -328,7 +363,7 @@ def main():
     devs = args.devs.split()
     bs_list = args.bs_list.split()
     results = [] 
-    mixed_results =[]
+    mixed_results = []
     
     log_print("[INFO] Initiating drive preparation...")
     drive_infos = {}
@@ -348,7 +383,7 @@ def main():
             log_print(f"\n[INFO] === Matrix Testing: Sequential {rw} ===")
             
             combos_to_run = SEQ_COMBOS if args.mode == 'multi' else[(b, n, q) for b in bs_list for n in NUMJOBS_LIST for q in IODEPTH_LIST]
-            combos_to_run =[c for c in combos_to_run if c[0] in bs_list]
+            combos_to_run = [c for c in combos_to_run if c[0] in bs_list]
             
             for i, (bs, nj, qd) in enumerate(combos_to_run, 1):
                 log_print(f"  -> Progress[{i}/{len(combos_to_run)}] | {rw} | BS={bs} | Jobs={nj} | QD={qd}")
@@ -370,7 +405,7 @@ def main():
             log_print(f"\n[INFO] === Matrix Testing: Random {rw} ===")
             
             combos_to_run = RAND_COMBOS if args.mode == 'multi' else[(b, n, q) for b in bs_list for n in NUMJOBS_LIST for q in IODEPTH_LIST]
-            combos_to_run =[c for c in combos_to_run if c[0] in bs_list]
+            combos_to_run = [c for c in combos_to_run if c[0] in bs_list]
             
             for i, (bs, nj, qd) in enumerate(combos_to_run, 1):
                 log_print(f"  -> Progress[{i}/{len(combos_to_run)}] | {rw} | BS={bs} | Jobs={nj} | QD={qd}")
@@ -384,11 +419,10 @@ def main():
     # ----- 3. 混合读写模块 -----
     if args.run_mixed == 'yes':
         log_print("\n[INFO] === Matrix Testing: Mixed RW ===")
-        mix_bs =[b for b in['4k', '8k', '16k', '32k'] if b in bs_list]
+        mix_bs =[b for b in ['4k', '8k', '16k', '32k'] if b in bs_list]
         for bs in mix_bs:
             for ratio in MIX_RATIO_LIST:
                 log_print(f"  -> Mixed RW | BS={bs} | Ratio={ratio}R/{100-ratio}W")
-                #[对齐图片要求]: nj=4, qd=64
                 json_files = execute_synchronized_parallel(devs, f"mixed_{ratio}", "randrw", bs, 64, 4, args.mix_runtime, args.raw_dir, args, rwmixread=ratio)
                 for jf, d_name in json_files:
                     res = parse_fio_json(jf, is_mixed=True)
@@ -409,11 +443,12 @@ if __name__ == "__main__":
 EOF
 
 # ====================[ 执行与触发 ] ====================
-EXCEL_REPORT="${BASE_DIR}/Cloud_qual_NVMe_Report_${SERVER_MODEL}.xlsx"
+EXCEL_REPORT="${BASE_DIR}/Storage_Performance_Report_${SERVER_MODEL}.xlsx"
 
 echo "=========================================================================="
-echo "[WARNING] Enterprise NVMe Qualification Suite is armed and ready."
-echo "[INFO] Matrix Test Mode: $TEST_MODE (Full Cartesian Traversal)"
+echo "[WARNING] Enterprise NVMe Test Suite is armed and ready."
+echo "[INFO] Matrix Test Mode: $TEST_MODE"
+echo "[INFO] Drives targeted: ${TARGET_DEVS[*]}"
 echo "=========================================================================="
 sleep 10
 
@@ -441,3 +476,30 @@ python3 "$PYTHON_ENGINE" \
     --run_mixed "$RUN_MIXED_RW" \
     --run_qos "$RUN_QOS_TEST" \
     $RESUME_FLAG
+
+# ====================[ 测试后诊断信息收集 ] ====================
+echo "[INFO] Capturing post-flight diagnostics..."
+dmesg -T > "$LOG_DIR/post_dmesg.log" 2>/dev/null || true
+nvme smart-log "${TARGET_DEVS[0]}" > "$LOG_DIR/post_smart.log" 2>/dev/null || true
+
+if command -v ipmitool >/dev/null 2>&1; then
+    ipmitool sel elist > "$LOG_DIR/post_ipmi_sel.log" 2>/dev/null || true
+fi
+
+echo "[INFO] Performing automated anomaly detection (PCIe/AER/Timeout)..."
+echo "=== Anomaly Self-Check ===" > "$LOG_DIR/error_check_summary.txt"
+err_count=$(grep -iE 'pcie bus error|aer|bad tlp|bad dllp|nvme.*timeout|i/o error' "$LOG_DIR/post_dmesg.log" | wc -l)
+
+if [ "$err_count" -gt 0 ]; then
+    echo "[WARNING] Found $err_count related hardware errors in dmesg. Inspect $LOG_DIR/post_dmesg.log" | tee -a "$LOG_DIR/error_check_summary.txt"
+    grep -iE 'pcie bus error|aer|bad tlp|bad dllp|nvme.*timeout|i/o error' "$LOG_DIR/post_dmesg.log" | tail -n 10 | tee -a "$LOG_DIR/error_check_summary.txt"
+else
+    echo "[PASS] System logs are clean. No PCIe or IO anomalies detected." | tee -a "$LOG_DIR/error_check_summary.txt"
+fi
+
+echo "=========================================================================="
+echo "Suite Execution Completed."
+echo "Raw JSONs & Command Logs: $RAW_DIR"
+echo "System Logs & Diags:      $LOG_DIR"
+echo "Final Delivered Report:   $EXCEL_REPORT"
+echo "=========================================================================="
