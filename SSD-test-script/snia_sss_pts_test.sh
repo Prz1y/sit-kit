@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================================
-# SNIA SSS PTS NVMe Performance Test Suite (Enterprise Grade) - FIXED VERSION
+# SNIA SSS PTS NVMe Performance Test Suite
 # ============================================================================
 # 修复说明:
 # 1. 修复了致命的 shebang 错误与 shell 语法格式错误。
