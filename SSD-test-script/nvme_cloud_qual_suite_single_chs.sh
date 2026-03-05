@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================================
-# NVMe Storage Performance Test Suite - by Prz1y
+# NVMe Storage Performance Test Suite
 # ============================================================================
 # Features:
 # 1. 多盘同步并发测试，动态生成自适应的 Excel 报表。
@@ -69,7 +69,7 @@ NUMA_FALLBACK_NODE="0"       # 兜底 NUMA 节点
 
 echo "[INFO] Commencing pre-flight system checks..."
 
-if[ "$EUID" -ne 0 ]; then
+if [ "$EUID" -ne 0 ]; then
     echo "[ERROR] This suite requires root privileges. Please run as root."
     exit 1
 fi
@@ -88,7 +88,7 @@ for dev in "${TARGET_DEVS[@]}"; do
     fi
 done
 
-if[ -n "$RESUME_FROM" ] && [ -d "$RESUME_FROM" ]; then
+if [ -n "$RESUME_FROM" ] && [ -d "$RESUME_FROM" ]; then
     BASE_DIR="$RESUME_FROM"
     RESUME_FLAG="--resume"
     echo "[INFO] Resuming from existing workspace: $BASE_DIR"
