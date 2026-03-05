@@ -362,7 +362,7 @@ def main():
     args = parser.parse_args()
     devs = args.devs.split()
     bs_list = args.bs_list.split()
-    results = [] 
+    results =[] 
     mixed_results = []
     
     log_print("[INFO] Initiating drive preparation...")
