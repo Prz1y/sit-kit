@@ -2,13 +2,6 @@
 # ============================================================================
 # NVMe Storage Performance Test Suite
 # ============================================================================
-# Features:
-# 1. 多盘同步并发测试，动态生成自适应的 Excel 报表。
-# 2. 智能 NUMA 节点侦测与线程绑定 (支持 fio 原生或 numactl)。
-# 3. 支持参数矩阵全量遍历、预热机制 (ramp_time) 及混合读写比例测试。
-# 4. 包含严格的错误处理、依赖检查与自动重试机制。
-# 5. 模块化测试大项开关与自定义块大小 (Block Size) 支持。
-# 
 # Dependencies:
 # sudo yum/apt-get install -y fio nvme-cli pciutils python3 python3-pip numactl ipmitool
 # pip3 install pandas openpyxl
