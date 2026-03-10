@@ -16,7 +16,7 @@ TARGET_DEVS=("/dev/nvme1n1")
 SERVER_MODEL="Server"
 
 RUNTIME=300
-MIX_RUNTIME=1800
+MIX_RUNTIME=1200
 QOS_RUNTIME=3600
 
 DO_SEQ_PRECON="yes"
@@ -153,11 +153,36 @@ def format_drive(dev):
     log_print(f"[CRITICAL] Failed to secure erase {dev} after 3 attempts.")
     sys.exit(1)
 
+def calc_ramp_time(iodepth, numjobs):
+    """Dynamically calculate ramp time based on I/O concurrency level.
+    High concurrency saturates the device almost instantly, so less ramp is needed."""
+    total = iodepth * numjobs
+    if total >= 128:
+        return 10
+    elif total >= 32:
+        return 15
+    elif total >= 8:
+        return 30
+    else:
+        return 60
+
+def calc_runtime(base_runtime, iodepth, numjobs):
+    """Dynamically calculate test runtime based on I/O concurrency level.
+    High concurrency produces stable data faster, so shorter runtime suffices."""
+    total = iodepth * numjobs
+    if total >= 128:
+        return max(120, base_runtime // 2)
+    elif total >= 32:
+        return max(180, int(base_runtime * 0.6))
+    else:
+        return base_runtime
+
 def build_fio_cmd(job_name, dev, rw, bs, iodepth, numjobs, runtime, json_out, args, loops=0, rwmixread=None):
     cmd = (f"fio --name={job_name} --filename={dev} --rw={rw} --bs={bs} "
            f"--iodepth={iodepth} --numjobs={numjobs} --direct=1 --ioengine=libaio "
            f"--thread --end_fsync=0 --buffer_compress_percentage=0 --invalidate=1 "
-           f"--norandommap --randrepeat=0 --exitall "
+           f"--norandommap --randrepeat=0 --refill_buffers --exitall "
+           f"--percentile_list=50:99:99.9:99.99 "
            f"--group_reporting --output-format=json --output={json_out}")
     
     if bs == "512B":
@@ -166,7 +191,9 @@ def build_fio_cmd(job_name, dev, rw, bs, iodepth, numjobs, runtime, json_out, ar
     if loops > 0:
         cmd += f" --loops={loops} --size=100%"
     else:
-        cmd += f" --ramp_time=60 --runtime={runtime} --time_based"
+        ramp = calc_ramp_time(iodepth, numjobs)
+        actual_runtime = calc_runtime(runtime, iodepth, numjobs)
+        cmd += f" --ramp_time={ramp} --runtime={actual_runtime} --time_based"
         
     if rwmixread is not None:
         cmd += f" --rwmixread={rwmixread}"
