@@ -36,8 +36,6 @@ RUN_RAND_WRITE="yes"
 RUN_MIXED_RW="yes"
 RUN_QOS_TEST="yes"
 
-# Removed 256k/512k/1m — negligible value in cloud qualification
-# 删除 256k/512k/1m — 在云验证测试中价值极低
 TEST_BS_LIST="4k 8k 16k 32k 64k 128k"
 RESUME_FROM=""
 
@@ -462,11 +460,9 @@ def main():
     parser.add_argument('--seq_loops', type=int, required=True)
     parser.add_argument('--rand_pre', required=True)
     parser.add_argument('--rand_loops', type=int, required=True)
-    # New v2 args: steady-state detection / 新增 v2 参数：稳态检测
     parser.add_argument('--rand_pre_max_loops', type=int, required=True)
     parser.add_argument('--steady_threshold', type=float, required=True)
     parser.add_argument('--steady_window', type=int, required=True)
-    # New v2 arg: max outstanding I/O cap / 新增 v2 参数：最大未完成 IO 上限
     parser.add_argument('--max_outstanding_io', type=int, required=True)
     parser.add_argument('--enable_numa', required=True)
     parser.add_argument('--numa_method', required=True)
