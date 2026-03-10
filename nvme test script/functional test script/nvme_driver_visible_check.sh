@@ -67,7 +67,7 @@ for ((i=1; i<=LOOP_COUNT; i++)); do
     sleep $WAIT_TIME
     
     # Check if devices appeared
-    CONTROLLERS=$(ls -1 /dev/nvme* 2>/dev/null | grep -v "n[0-9]")
+    CONTROLLERS=$(for f in /dev/nvme* ; do [[ "$f" =~ n[0-9] ]] || echo "$f"; done 2>/dev/null)
     if [ -z "$CONTROLLERS" ]; then
             echo "FATAL ERROR: No devices found after load."
             exit 1
@@ -96,6 +96,7 @@ for ((i=1; i<=LOOP_COUNT; i++)); do
     done
 
     # 4. Sort and Display
+    LAST_SIZE=""
     sort -V "$TMP_LOGS" | while read line; do
         CURRENT_SIZE=${line%%__*}
         LOG_TEXT=${line#*__}

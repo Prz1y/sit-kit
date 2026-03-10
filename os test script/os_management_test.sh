@@ -30,7 +30,7 @@ run_test_item() {
     # 1. 创建独立的测试结果文件夹
     mkdir -p "$folder_name"
     local log_file="${folder_name}/execution.log"
-    > "$log_file"
+    : > "$log_file"
 
     echo "正在测试并生成目录: $folder_name ..."
 

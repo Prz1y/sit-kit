@@ -45,7 +45,6 @@ log "命令: cp $TEST_FILE $COPY_FILE && sync"
 { time ( cp "$TEST_FILE" "$COPY_FILE" && sync ) ; } 2>> "$LOG_FILE"
 
 # 4. 计算并输出简要总结
-END_TIME=$(date +%s)
 log "\n-------------------------------------------"
 log "测试完成！"
 log "详细计时结果已保存至: $LOG_FILE"

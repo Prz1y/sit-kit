@@ -54,10 +54,8 @@ do_full_audit() {
         # 检查耗时
         if [ ${DURATION} -gt 0 ]; then
             echo "结果: [PASS] 擦除耗时: ${DURATION}s"
-            local TIME_RES="PASS"
         else
             echo "结果: [FAIL] 擦除动作异常 (耗时过短)"
-            local TIME_RES="FAIL"
         fi
 
         # 检查 Hex Dump 证据
