@@ -158,7 +158,7 @@ def calc_ramp_time(iodepth, numjobs):
     High concurrency saturates the device almost instantly, so less ramp is needed."""
     total = iodepth * numjobs
     if total >= 128:
-        return 10
+        return 20
     elif total >= 32:
         return 15
     elif total >= 8:
@@ -171,7 +171,7 @@ def calc_runtime(base_runtime, iodepth, numjobs):
     High concurrency produces stable data faster, so shorter runtime suffices."""
     total = iodepth * numjobs
     if total >= 128:
-        return max(120, base_runtime // 2)
+        return max(180, base_runtime // 2)
     elif total >= 32:
         return max(180, int(base_runtime * 0.6))
     else:
