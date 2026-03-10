@@ -26,6 +26,7 @@ SEQ_PRE_LOOPS=2
 DO_RAND_PRECON="yes"
 RAND_PRE_LOOPS=2           # Minimum random precon loops / 随机预处理最少循环次数
 RAND_PRE_MAX_LOOPS=5       # Maximum random precon loops / 随机预处理最多循环次数（安全上限）
+ENABLE_STEADY_STATE_CHECK="yes"   # Enable steady-state detection; "no" = fixed 3-pass fill / 启用稳态检测；"no"=固定3次填充
 STEADY_STATE_THRESHOLD=0.10  # CV threshold for steady-state / 稳态判定阈值（变异系数）
 STEADY_STATE_WINDOW=5      # Consecutive stable samples required / 判定稳态所需连续样本数
 
@@ -313,21 +314,47 @@ def check_steady_state(iops_history, threshold, window):
     return is_stable, cv, range_ratio, slope_pct
 
 def run_rand_precon_with_steady_state(devs, raw_dir, args):
-    """Run random preconditioning loops with steady-state detection.
-    执行带稳态检测的随机预处理循环。
+    """Run random preconditioning loops with optional steady-state detection.
+    执行带可选稳态检测的随机预处理循环。
 
-    Runs at least rand_loops iterations, up to rand_pre_max_loops, stopping early
-    when the last steady_window probe IOPS satisfy CV < steady_threshold.
-    最少执行 rand_loops 次，最多执行 rand_pre_max_loops 次；
-    当最近 steady_window 次探测 IOPS 的 CV < steady_threshold 时提前停止。
+    When steady_state_check is 'yes': runs at least rand_loops iterations, up to
+    rand_pre_max_loops, stopping early when the triple criteria (CV, Range, Slope)
+    are all satisfied.
+    当 steady_state_check='yes' 时：最少执行 rand_loops 次，最多 rand_pre_max_loops 次，
+    三重条件全部满足时提前停止。
+
+    When steady_state_check is 'no': always performs exactly 3 fixed full-disk fill
+    passes with no probe or stability check.
+    当 steady_state_check='no' 时：固定执行3次全盘填充，不进行探测或稳态检测。
     """
     min_loops = args.rand_loops
     max_loops = args.rand_pre_max_loops
     threshold = args.steady_threshold
     window = args.steady_window
+    check_enabled = args.steady_state_check == 'yes'
 
     iops_history = []
     precon_log = []  # Records per-loop info for Excel sheet / 记录每轮信息用于 Excel 稳态页
+
+    # When steady-state check is disabled: fixed 3-pass fill, no probe / 禁用稳态检测时：固定3次全盘填充，无探测
+    if not check_enabled:
+        fixed_loops = 3
+        log_print(f"[PRECON] Steady-state check DISABLED. Running fixed {fixed_loops}-pass random preconditioning.")
+        for loop_idx in range(1, fixed_loops + 1):
+            log_print(f"[PRECON] Starting loop {loop_idx}/{fixed_loops} — full 4k randwrite pass (no steady-state check)...")
+            execute_synchronized_parallel(devs, f"pre_rand_loop{loop_idx}", "randwrite", "4k",
+                                          128, 4, 0, raw_dir, args, loops=1)
+            log_print(f"[PRECON] Loop {loop_idx}/{fixed_loops} completed.")
+            precon_log.append({
+                "Loop#": loop_idx,
+                "Probe_IOPS": "N/A",
+                "Cumulative_CV": "N/A",
+                "Range_Ratio": "N/A",
+                "Slope_Pct": "N/A",
+                "Status": "CHECK_DISABLED"
+            })
+        log_print(f"[PRECON] Fixed {fixed_loops}-pass preconditioning complete. Proceeding to tests.")
+        return precon_log
 
     for loop_idx in range(1, max_loops + 1):
         # Full 4k randwrite preconditioning pass / 完整 4k randwrite 预处理扫描
@@ -341,7 +368,7 @@ def run_rand_precon_with_steady_state(devs, raw_dir, args):
             dev_name = os.path.basename(dev)
             probe_json = os.path.join(raw_dir, f"probe_rand_loop{loop_idx}_{dev_name}.json")
             probe_log = probe_json.replace('.json', '.log')
-            # 30s probe: 4k randwrite, iodepth=32, numjobs=4 / 30秒探测：4k randwrite，iodepth=32，numjobs=4
+            # 60s probe: 4k randwrite, iodepth=32, numjobs=4 / 60秒探测：4k randwrite，iodepth=32，numjobs=4
             cmd = (f"fio --name=probe --filename={dev} --rw=randwrite --bs=4k "
                    f"--iodepth=32 --numjobs=4 --direct=1 --ioengine=libaio "
                    f"--thread --norandommap --randrepeat=0 --refill_buffers "
@@ -488,6 +515,7 @@ def main():
     parser.add_argument('--rand_pre', required=True)
     parser.add_argument('--rand_loops', type=int, required=True)
     parser.add_argument('--rand_pre_max_loops', type=int, required=True)
+    parser.add_argument('--steady_state_check', required=True)
     parser.add_argument('--steady_threshold', type=float, required=True)
     parser.add_argument('--steady_window', type=int, required=True)
     parser.add_argument('--max_outstanding_io', type=int, required=True)
@@ -505,6 +533,9 @@ def main():
     args = parser.parse_args()
 
     # Input validation for new v2 parameters / 对新增 v2 参数进行合法性校验
+    if args.steady_state_check not in ('yes', 'no'):
+        print(f"[ERROR] --steady_state_check must be 'yes' or 'no', got '{args.steady_state_check}'.")
+        sys.exit(1)
     if args.rand_pre_max_loops < args.rand_loops:
         print(f"[ERROR] --rand_pre_max_loops ({args.rand_pre_max_loops}) must be >= "
               f"--rand_loops ({args.rand_loops}).")
@@ -646,6 +677,7 @@ python3 "$PYTHON_ENGINE" \
     --rand_pre "$DO_RAND_PRECON" \
     --rand_loops "$RAND_PRE_LOOPS" \
     --rand_pre_max_loops "$RAND_PRE_MAX_LOOPS" \
+    --steady_state_check "$ENABLE_STEADY_STATE_CHECK" \
     --steady_threshold "$STEADY_STATE_THRESHOLD" \
     --steady_window "$STEADY_STATE_WINDOW" \
     --max_outstanding_io "$MAX_OUTSTANDING_IO" \
