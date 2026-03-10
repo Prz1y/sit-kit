@@ -403,7 +403,7 @@ EOF
 EXCEL_REPORT="${BASE_DIR}/Storage_Performance_Report_${SERVER_MODEL}.xlsx"
 
 echo "=========================================================================="
-echo "[WARNING] Enterprise NVMe Test Suite is armed and ready."
+echo "[WARNING] Enterprise NVMe Test Suite is ready to go."
 echo "[INFO] Matrix Test Mode: $TEST_MODE"
 echo "[INFO] Drives targeted: ${TARGET_DEVS[*]}"
 echo "=========================================================================="
