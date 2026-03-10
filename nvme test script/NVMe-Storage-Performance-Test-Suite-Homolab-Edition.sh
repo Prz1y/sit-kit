@@ -27,7 +27,7 @@ DO_RAND_PRECON="yes"
 RAND_PRE_LOOPS=2           # Minimum random precon loops / 随机预处理最少循环次数
 RAND_PRE_MAX_LOOPS=5       # Maximum random precon loops / 随机预处理最多循环次数（安全上限）
 STEADY_STATE_THRESHOLD=0.10  # CV threshold for steady-state / 稳态判定阈值（变异系数）
-STEADY_STATE_WINDOW=3      # Consecutive stable samples required / 判定稳态所需连续样本数
+STEADY_STATE_WINDOW=5      # Consecutive stable samples required / 判定稳态所需连续样本数
 
 RUN_SEQ_READ="yes"
 RUN_SEQ_WRITE="yes"
@@ -267,30 +267,50 @@ def parse_probe_iops(json_file):
         return 0.0
 
 def check_steady_state(iops_history, threshold, window):
-    """Check whether the drive has entered steady state using coefficient of variation (CV).
-    使用变异系数（CV = stdev/mean）判断磁盘是否进入稳态。
+    """Check whether the drive has entered steady state using three criteria:
+    使用三重条件判断磁盘是否进入稳态：
+    1. CV (Coefficient of Variation) < threshold — measures dispersion
+       变异系数 < 阈值 — 衡量离散度
+    2. Range Ratio = (max - min) / mean < 0.20 — SNIA PTS core metric
+       极差比 < 20% — SNIA PTS 核心指标
+    3. Normalized Slope < 0.02 — detects monotonic trends
+       归一化斜率 < 2% — 检测单调趋势
 
     Args:
-        iops_history: list of IOPS samples from each probe loop / 每次探测循环的 IOPS 样本列表
-        threshold: CV threshold below which steady state is declared / 低于该阈值则判定为稳态
-        window: number of most recent samples to consider / 考察的最近样本数量
+        iops_history: list of IOPS samples from each probe loop
+        threshold: CV threshold below which steady state is declared
+        window: number of most recent samples to consider
 
     Returns:
-        (is_stable, cv) where is_stable is bool and cv is the calculated CV value
-        返回 (is_stable, cv)，is_stable 为是否稳态，cv 为计算出的变异系数
+        (is_stable, cv, range_ratio, slope_pct) tuple
+        返回 (is_stable, cv, range_ratio, slope_pct) 元组
     """
     if len(iops_history) < window:
-        return False, None
+        return False, None, None, None
     recent = iops_history[-window:]
-    # statistics.stdev() requires at least 2 data points / statistics.stdev() 需要至少 2 个数据点
     if len(recent) < 2:
-        return False, None
+        return False, None, None, None
     mean_val = statistics.mean(recent)
     if mean_val == 0:
-        return False, None
+        return False, None, None, None
+
+    # Criterion 1: CV (dispersion) / 条件1：变异系数（离散度）
     stdev_val = statistics.stdev(recent)
     cv = stdev_val / mean_val
-    return cv < threshold, cv
+
+    # Criterion 2: Range Ratio (SNIA-style) / 条件2：极差比（SNIA 风格）
+    range_ratio = (max(recent) - min(recent)) / mean_val
+
+    # Criterion 3: Normalized linear regression slope / 条件3：归一化线性回归斜率
+    n = len(recent)
+    x_mean = (n - 1) / 2.0
+    numerator = sum((i - x_mean) * (recent[i] - mean_val) for i in range(n))
+    denominator = sum((i - x_mean) ** 2 for i in range(n))
+    slope = numerator / denominator if denominator != 0 else 0.0
+    slope_pct = abs(slope / mean_val) if mean_val != 0 else 0.0
+
+    is_stable = (cv < threshold and range_ratio < 0.20 and slope_pct < 0.02)
+    return is_stable, cv, range_ratio, slope_pct
 
 def run_rand_precon_with_steady_state(devs, raw_dir, args):
     """Run random preconditioning loops with steady-state detection.
@@ -304,7 +324,7 @@ def run_rand_precon_with_steady_state(devs, raw_dir, args):
     min_loops = args.rand_loops
     max_loops = args.rand_pre_max_loops
     threshold = args.steady_threshold
-    window = args.steady_state_window
+    window = args.steady_window
 
     iops_history = []
     precon_log = []  # Records per-loop info for Excel sheet / 记录每轮信息用于 Excel 稳态页
@@ -325,7 +345,7 @@ def run_rand_precon_with_steady_state(devs, raw_dir, args):
             cmd = (f"fio --name=probe --filename={dev} --rw=randwrite --bs=4k "
                    f"--iodepth=32 --numjobs=4 --direct=1 --ioengine=libaio "
                    f"--thread --norandommap --randrepeat=0 --refill_buffers "
-                   f"--ramp_time=5 --runtime=30 --time_based "
+                   f"--ramp_time=10 --runtime=60 --time_based "
                    f"--group_reporting --output-format=json --output={probe_json}")
             if args.enable_numa == 'yes':
                 node = get_numa_node(dev, args.fallback_node)
@@ -345,34 +365,42 @@ def run_rand_precon_with_steady_state(devs, raw_dir, args):
                   f"Probe IOPS={avg_probe_iops:.0f}. History={[round(v, 0) for v in iops_history]}")
 
         # Determine stability status for logging / 判断稳定状态用于记录
-        is_stable, cv = check_steady_state(iops_history, threshold, window)
+        is_stable, cv, range_ratio, slope_pct = check_steady_state(iops_history, threshold, window)
         cv_pct = f"{cv * 100:.2f}%" if cv is not None else "N/A"
+        range_pct = f"{range_ratio * 100:.2f}%" if range_ratio is not None else "N/A"
+        slope_pct_str = f"{slope_pct * 100:.2f}%" if slope_pct is not None else "N/A"
         threshold_pct = f"{threshold * 100:.2f}%"
         status = "STABLE" if is_stable else "UNSTABLE"
         precon_log.append({
             "Loop#": loop_idx,
             "Probe_IOPS": round(avg_probe_iops, 0),
             "Cumulative_CV": cv_pct,
+            "Range_Ratio": range_pct,
+            "Slope_Pct": slope_pct_str,
             "Status": status
         })
 
         if loop_idx >= min_loops:
             if is_stable:
                 log_print(f"[PRECON] Steady-state REACHED at loop {loop_idx}. "
-                          f"CV={cv_pct} (threshold={threshold_pct}). Proceeding to tests.")
+                          f"CV={cv_pct}, Range={range_pct}, Slope={slope_pct_str} "
+                          f"(threshold={threshold_pct}). Proceeding to tests.")
                 break
             elif cv is not None:
-                log_print(f"[PRECON] Steady-state check: CV={cv_pct} (threshold={threshold_pct}). "
+                log_print(f"[PRECON] Steady-state check: CV={cv_pct}, Range={range_pct}, "
+                          f"Slope={slope_pct_str} (threshold={threshold_pct}). "
                           f"NOT STABLE — continuing.")
             else:
                 log_print(f"[PRECON] Steady-state check: insufficient history (need {window} samples). "
                           f"NOT STABLE — continuing.")
 
         if loop_idx == max_loops:
-            _, final_cv = check_steady_state(iops_history, threshold, window)
+            _, final_cv, final_range, final_slope = check_steady_state(iops_history, threshold, window)
             final_cv_pct = f"{final_cv * 100:.2f}%" if final_cv is not None else "N/A"
+            final_range_pct = f"{final_range * 100:.2f}%" if final_range is not None else "N/A"
+            final_slope_pct = f"{final_slope * 100:.2f}%" if final_slope is not None else "N/A"
             log_print(f"[PRECON] WARNING: Max loops ({max_loops}) reached without steady state. "
-                      f"CV={final_cv_pct}. Proceeding anyway.")
+                      f"CV={final_cv_pct}, Range={final_range_pct}, Slope={final_slope_pct}. Proceeding anyway.")
 
     return precon_log
 
@@ -434,11 +462,11 @@ def generate_excel(df_all, mixed_results, precon_log, args, devs, drive_infos):
         # Columns: Loop#, Probe_IOPS, Cumulative_CV, Status (STABLE/UNSTABLE)
         # 列：循环编号、探测 IOPS、累计变异系数、状态（稳态/非稳态）
         if precon_log:
-            df_precon = pd.DataFrame(precon_log, columns=["Loop#", "Probe_IOPS", "Cumulative_CV", "Status"])
+            df_precon = pd.DataFrame(precon_log, columns=["Loop#", "Probe_IOPS", "Cumulative_CV", "Range_Ratio", "Slope_Pct", "Status"])
             df_precon.to_excel(writer, sheet_name='预处理稳态', index=False)
         else:
             # Write empty placeholder if preconditioning was skipped / 若跳过预处理则写占位空表
-            pd.DataFrame(columns=["Loop#", "Probe_IOPS", "Cumulative_CV", "Status"]).to_excel(
+            pd.DataFrame(columns=["Loop#", "Probe_IOPS", "Cumulative_CV", "Range_Ratio", "Slope_Pct", "Status"]).to_excel(
                 writer, sheet_name='预处理稳态', index=False)
 
     log_print(f"[SUCCESS] Report successfully generated: {out_excel}")
