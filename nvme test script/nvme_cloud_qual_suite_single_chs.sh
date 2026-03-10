@@ -236,8 +236,6 @@ def parse_fio_json(json_file, is_mixed=False):
     except Exception as e:
         return None
 
-# [修复] 移除了从未使用的冗余函数 get_val()
-
 def generate_excel(df_all, mixed_results, args, devs, drive_infos):
     log_print("[INFO] Compiling data into standard Excel report...")
     out_excel = args.out_excel
