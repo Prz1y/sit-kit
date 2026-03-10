@@ -32,7 +32,7 @@ test_drive() {
         
         # A. 获取 PCI 地址并匹配 Slot ID
         local pci_link="/sys/class/block/$dev_name/device/device"
-        local pci_full=$(basename $(readlink -f "$pci_link"))
+        local pci_full=$(basename "$(readlink -f "$pci_link")")
         local pci_base=$(echo "$pci_full" | cut -d'.' -f1) # 得到 0000:41:00
         
         local slot_file=$(grep -l "^$pci_base" /sys/bus/pci/slots/*/address | head -n 1 || true)
@@ -40,7 +40,7 @@ test_drive() {
             echo "ERROR: No slot found for $pci_base"
             return 1
         fi
-        local slot_id=$(basename $(dirname "$slot_file"))
+        local slot_id=$(basename "$(dirname "$slot_file")")
         local slot_pwr_path="/sys/bus/pci/slots/$slot_id/power"
         
         echo "Device: $dev_name | PCI: $pci_full | Slot: $slot_id"
@@ -127,7 +127,7 @@ for d in $drives; do
     name=$(basename "$d")
     d_log="$LOG_DIR/details/${name}.log"
     
-    sid=$(grep "Matched Slot ID:" "$d_log" | awk '{print $NF}' || echo "N/A")
+    sid=$(grep "Slot:" "$d_log" | awk '{print $NF}' || echo "N/A")
     off=$(grep "RESULT_OFF:" "$d_log" | awk '{print $2}' || echo "FAIL")
     on=$(grep "RESULT_ON:" "$d_log" | awk '{print $2}' || echo "FAIL")
     wr=$(grep "WRITE_TEST:" "$d_log" | awk '{print $2}' || echo "FAIL")

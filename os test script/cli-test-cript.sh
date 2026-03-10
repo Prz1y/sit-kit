@@ -25,11 +25,9 @@ run_test() {
     local log_file="${folder_name}/execution.log"
 
     # 清空并初始化日志文件
-    > "$log_file"
+    : > "$log_file"
 
     echo "正在执行测试并生成日志: ${folder_name}/execution.log ..."
-    
-    # 将 uname -r 写入日志头部
     echo "==================================================" >> "$log_file"
     echo "系统内核版本 (uname -r): $OS_KERNEL" >> "$log_file"
     echo "==================================================" >> "$log_file"

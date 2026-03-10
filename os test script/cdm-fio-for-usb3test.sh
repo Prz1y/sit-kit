@@ -6,7 +6,7 @@
 DEV="/dev/sdb"               # 盘符
 RESULT_DIR="fio_results_$(date +%Y%m%d_%H%M%S)"
 SIZE="1G"                    # 1G数据范围循环读写
-RAMP="10"                    # 30秒预热
+RAMP="10"                    # 10秒预热
 RUN="60"                     # 60秒实测
 ENGINE="libaio"
 DIRECT=1

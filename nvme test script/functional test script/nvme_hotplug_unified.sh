@@ -111,7 +111,7 @@ run_cycle() {
     
     # --- 强力清理旧挂载和分区 (同步自新逻辑) ---
     umount -R "$MOUNT_DIR" 2>/dev/null
-    for part in $(ls ${current_dev}* 2>/dev/null); do umount "$part" 2>/dev/null; done
+    for part in ${current_dev}* ; do umount "$part" 2>/dev/null; done
     wipefs -a -q "$current_dev" >/dev/null 2>&1
     partprobe "$current_dev" 2>/dev/null
     udevadm settle

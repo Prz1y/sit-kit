@@ -16,11 +16,11 @@ echo "----------------------------------------"
 
     echo "[$(date)] 启动"
 
-    while [ $(date +%s) -lt $end_time ]; do
+    while [ "$(date +%s)" -lt $end_time ]; do
         echo "[$(date)] loops started..."
 
         ./trace_player -s multi_stream.txt -n 22 -r 100000
-        AlippuDeviceIndex=1. /trace_player -s multi_stream.txt -n 22 -r 100000
+        AlippuDeviceIndex=1 ./trace_player -s multi_stream.txt -n 22 -r 100000
 
         echo "[$(date)] loop done..."
     done

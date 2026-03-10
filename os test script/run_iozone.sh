@@ -140,7 +140,7 @@ else
 fi
 
 # Check if Excel generation was successful
-if[ $? -eq 0 ] && [ -f "$EXCEL_FILE" ]; then
+if [ $? -eq 0 ] && [ -f "$EXCEL_FILE" ]; then
     # Excel created successfully, safe to delete the CSV backup
     rm -f "$CSV_FILE"
 else
