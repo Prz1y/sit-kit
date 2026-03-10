@@ -1,7 +1,6 @@
 #!/bin/bash
 # ============================================================================
-# NVMe Storage Performance Test Suite - v2
-# NVMe 存储性能测试套件 - v2
+# NVMe Storage Performance Test Suite - Homolab Edition
 # ============================================================================
 # Dependencies / 依赖项:
 # sudo yum/apt-get install -y fio nvme-cli pciutils python3 python3-pip numactl ipmitool libaio-devel
