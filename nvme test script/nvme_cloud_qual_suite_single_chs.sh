@@ -44,7 +44,7 @@ NUMA_FALLBACK_NODE="0"
 
 echo "[INFO] Commencing pre-flight system checks..."
 
-if[ "$EUID" -ne 0 ]; then
+if [ "$EUID" -ne 0 ]; then
     echo "[ERROR] This suite requires root privileges. Please run as root."
     exit 1
 fi
@@ -58,7 +58,7 @@ done
 
 for dev in "${TARGET_DEVS[@]}"; do
     # [修复] 补齐 if 和 [ 之间的空格
-    if[ ! -b "$dev" ]; then
+    if [ ! -b "$dev" ]; then
         echo "[ERROR] Block device '$dev' does not exist or is invalid."
         exit 1
     fi
@@ -95,12 +95,12 @@ import pandas as pd
 # ----------------------------------------------------------------------------
 # 参数矩阵定义 (规范了代码格式)
 # ----------------------------------------------------------------------------
-NUMJOBS_LIST =[1, 2, 4, 8]
-IODEPTH_LIST =[1, 2, 4, 8, 16, 32, 64, 128, 256]
-MIX_RATIO_LIST =[10, 20, 30, 40, 50, 60, 70, 80, 90]
+NUMJOBS_LIST = [1, 2, 4, 8]
+IODEPTH_LIST = [1, 2, 4, 8, 16, 32, 64, 128, 256]
+MIX_RATIO_LIST = [10, 20, 30, 40, 50, 60, 70, 80, 90]
 
 SEQ_COMBOS = [('128k', 1, 32)] 
-RAND_COMBOS =[('4k', 1, 32)]
+RAND_COMBOS = [('4k', 1, 32)]
 
 def log_print(msg):
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -195,8 +195,8 @@ def run_fio_task(task_args):
     return (json_out, dev_name)
 
 def execute_synchronized_parallel(devs, job_name, rw, bs, iodepth, numjobs, runtime, raw_dir, args, loops=0, rwmixread=None):
-    tasks =[(job_name, d, rw, bs, iodepth, numjobs, runtime, raw_dir, args, loops, rwmixread) for d in devs]
-    json_results =[]
+    tasks = [(job_name, d, rw, bs, iodepth, numjobs, runtime, raw_dir, args, loops, rwmixread) for d in devs]
+    json_results = []
     with ThreadPoolExecutor(max_workers=len(devs)) as executor:
         for result in executor.map(run_fio_task, tasks):
             json_results.append(result)
@@ -322,7 +322,7 @@ def main():
     args = parser.parse_args()
     devs = args.devs.split()
     bs_list = args.bs_list.split()
-    results =[] 
+    results = [] 
     mixed_results = []
     
     log_print("[INFO] Initiating drive preparation...")
@@ -337,12 +337,12 @@ def main():
             log_print("\n[INFO] === Executing Sequential Preconditioning ===")
             execute_synchronized_parallel(devs, "pre_seq", "write", "128k", 128, 1, 0, args.raw_dir, args, loops=args.seq_loops)
 
-        for rw, run_flag in[('read', args.run_seq_read), ('write', args.run_seq_write)]:
+        for rw, run_flag in [('read', args.run_seq_read), ('write', args.run_seq_write)]:
             if run_flag != 'yes': continue
             log_print(f"\n[INFO] === Matrix Testing: Sequential {rw} ===")
             
-            combos_to_run = SEQ_COMBOS if args.mode == 'multi' else[(b, n, q) for b in bs_list for n in NUMJOBS_LIST for q in IODEPTH_LIST]
-            combos_to_run =[c for c in combos_to_run if c[0] in bs_list]
+            combos_to_run = SEQ_COMBOS if args.mode == 'multi' else [(b, n, q) for b in bs_list for n in NUMJOBS_LIST for q in IODEPTH_LIST]
+            combos_to_run = [c for c in combos_to_run if c[0] in bs_list]
             
             for i, (bs, nj, qd) in enumerate(combos_to_run, 1):
                 log_print(f"  -> Progress[{i}/{len(combos_to_run)}] | {rw} | BS={bs} | Jobs={nj} | QD={qd}")
@@ -358,11 +358,11 @@ def main():
             log_print("\n[INFO] === Executing Random Preconditioning ===")
             execute_synchronized_parallel(devs, "pre_rand", "randwrite", "4k", 128, 4, 0, args.raw_dir, args, loops=args.rand_loops)
 
-        for rw, run_flag in[('randread', args.run_rand_read), ('randwrite', args.run_rand_write)]:
+        for rw, run_flag in [('randread', args.run_rand_read), ('randwrite', args.run_rand_write)]:
             if run_flag != 'yes': continue
             log_print(f"\n[INFO] === Matrix Testing: Random {rw} ===")
             
-            combos_to_run = RAND_COMBOS if args.mode == 'multi' else[(b, n, q) for b in bs_list for n in NUMJOBS_LIST for q in IODEPTH_LIST]
+            combos_to_run = RAND_COMBOS if args.mode == 'multi' else [(b, n, q) for b in bs_list for n in NUMJOBS_LIST for q in IODEPTH_LIST]
             combos_to_run = [c for c in combos_to_run if c[0] in bs_list]
             
             for i, (bs, nj, qd) in enumerate(combos_to_run, 1):
@@ -376,7 +376,7 @@ def main():
 
     if args.run_mixed == 'yes':
         log_print("\n[INFO] === Matrix Testing: Mixed RW ===")
-        mix_bs = [b for b in['4k', '8k', '16k', '32k'] if b in bs_list]
+        mix_bs = [b for b in ['4k', '8k', '16k', '32k'] if b in bs_list]
         for bs in mix_bs:
             for ratio in MIX_RATIO_LIST:
                 log_print(f"  -> Mixed RW | BS={bs} | Ratio={ratio}R/{100-ratio}W")
