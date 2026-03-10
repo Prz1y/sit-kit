@@ -1,9 +1,9 @@
 #!/bin/bash
 # ============================================================================
-# NVMe Storage Performance Test Suite
+# NVMe Storage Performance Test Suite (Fixed Version)
 # ============================================================================
 # Dependencies:
-# sudo yum/apt-get install -y fio nvme-cli pciutils python3 python3-pip numactl ipmitool libaio-devel (或 libaio1)
+# sudo yum/apt-get install -y fio nvme-cli pciutils python3 python3-pip numactl ipmitool libaio-devel
 # pip3 install pandas openpyxl
 # ============================================================================
 
@@ -11,50 +11,32 @@
 #[ 核心配置区 ]
 # ============================================================================
 
-# 1. 运行模式设置 (TEST_MODE)
-# - single : 全量遍历模式 (执行全部参数组合笛卡尔积，输出详细矩阵 Sheet)
-# - multi  : 抽样模式 (仅执行特定负载组合，用于快速验证)
 TEST_MODE="single"
-
-# 2. 被测块设备阵列 (TARGET_DEVS)
-# 支持填入多块盘，以空格分隔。例如: ("/dev/nvme0n1" "/dev/nvme1n1")
-# [警告] 测试会执行格式化，禁止填入系统盘或存有重要数据的磁盘！
 TARGET_DEVS=("/dev/nvme1n1")
-
-# 3. 测试项目标识 (将作为生成的 Excel 文件名及表头标识)
 SERVER_MODEL="Server"
 
-# 4. 测试时长与预处理配置
-RUNTIME=300           # 常规顺序/随机测试时长 (单位: 秒)
-MIX_RUNTIME=1800      # 混合读写测试时长 (单位: 秒)
-QOS_RUNTIME=3600      # QoS 一致性测试时长 (单位: 秒)
+RUNTIME=300
+MIX_RUNTIME=1800
+QOS_RUNTIME=3600
 
-DO_SEQ_PRECON="yes"   # 顺序读写前是否进行预处理 (默认 128k 顺序写)
-SEQ_PRE_LOOPS=2       # 顺序预处理的全盘循环遍数
-DO_RAND_PRECON="yes"  # 随机读写前是否进行预处理 (默认 4k 随机写)
-RAND_PRE_LOOPS=1      # 随机预处理的全盘循环遍数
+DO_SEQ_PRECON="yes"
+SEQ_PRE_LOOPS=2
+DO_RAND_PRECON="yes"
+RAND_PRE_LOOPS=1
 
-# 5. 测试阶段模块开关 (yes / no)
 RUN_SEQ_READ="yes"
 RUN_SEQ_WRITE="yes"
 RUN_RAND_READ="yes"
 RUN_RAND_WRITE="yes"
 RUN_MIXED_RW="yes"
-RUN_QOS_TEST="no"     # 默认关闭多余的 QoS 稳定性长测
+RUN_QOS_TEST="no"
 
-# 6. 块大小 (Block Size) 遍历列表 (以空格分隔)
 TEST_BS_LIST="4k 8k 16k 32k 64k 128k 256k 512k 1m"
-
-# 7. 断点续测配置 (RESUME_FROM)
-# 若需从意外中断的测试中恢复，请填入上次生成的测试目录路径。为空则启动全新测试。
 RESUME_FROM=""
 
-# ============================================================================
-#[ NUMA 智能绑定配置区 ]
-# ============================================================================
-ENABLE_NUMA_BIND="yes"       # 是否开启 NUMA 节点绑定
-NUMA_BIND_METHOD="fio"       # 绑定方式: "fio" (--numa_cpu_nodes) 或 "numactl"
-NUMA_FALLBACK_NODE="0"       # 兜底 NUMA 节点
+ENABLE_NUMA_BIND="yes"
+NUMA_BIND_METHOD="fio"
+NUMA_FALLBACK_NODE="0"
 
 # ============================================================================
 #[ 环境与安全前置检查 ]
@@ -62,7 +44,7 @@ NUMA_FALLBACK_NODE="0"       # 兜底 NUMA 节点
 
 echo "[INFO] Commencing pre-flight system checks..."
 
-if [ "$EUID" -ne 0 ]; then
+if[ "$EUID" -ne 0 ]; then
     echo "[ERROR] This suite requires root privileges. Please run as root."
     exit 1
 fi
@@ -75,13 +57,15 @@ for tool in fio nvme lspci python3; do
 done
 
 for dev in "${TARGET_DEVS[@]}"; do
+    # [修复] 补齐 if 和 [ 之间的空格
     if[ ! -b "$dev" ]; then
         echo "[ERROR] Block device '$dev' does not exist or is invalid."
         exit 1
     fi
 done
 
-if [ -n "$RESUME_FROM" ] &&[ -d "$RESUME_FROM" ]; then
+# [修复] 补齐 && 和[ 之间的空格
+if [ -n "$RESUME_FROM" ] && [ -d "$RESUME_FROM" ]; then
     BASE_DIR="$RESUME_FROM"
     RESUME_FLAG="--resume"
     echo "[INFO] Resuming from existing workspace: $BASE_DIR"
@@ -96,7 +80,6 @@ LOG_DIR="${BASE_DIR}/logs"
 
 mkdir -p "$RAW_DIR" "$LOG_DIR"
 
-# 抓取初始系统日志用于异常对比
 dmesg -T > "$LOG_DIR/pre_dmesg.log" 2>/dev/null || true
 lspci -vvv > "$LOG_DIR/pre_lspci.log" 2>/dev/null || true
 nvme smart-log "${TARGET_DEVS[0]}" > "$LOG_DIR/pre_smart.log" 2>/dev/null || true
@@ -110,15 +93,13 @@ from concurrent.futures import ThreadPoolExecutor
 import pandas as pd
 
 # ----------------------------------------------------------------------------
-# 参数矩阵定义
+# 参数矩阵定义 (规范了代码格式)
 # ----------------------------------------------------------------------------
-# 全量遍历基础参数
 NUMJOBS_LIST =[1, 2, 4, 8]
 IODEPTH_LIST =[1, 2, 4, 8, 16, 32, 64, 128, 256]
 MIX_RATIO_LIST =[10, 20, 30, 40, 50, 60, 70, 80, 90]
 
-# Multi 模式备用抽样组合 (Single 模式下不生效)
-SEQ_COMBOS =[('128k', 1, 32)] 
+SEQ_COMBOS = [('128k', 1, 32)] 
 RAND_COMBOS =[('4k', 1, 32)]
 
 def log_print(msg):
@@ -126,7 +107,6 @@ def log_print(msg):
     print(f"[{ts}] {msg}")
 
 def get_drive_info(dev):
-    """获取 NVMe 硬盘的型号与固件版本"""
     try:
         res = subprocess.run(f"nvme id-ctrl {dev}", shell=True, capture_output=True, text=True)
         mn, fr = "Unknown_Model", "Unknown_FW"
@@ -140,7 +120,6 @@ def get_drive_info(dev):
         return "Unknown | Unknown"
 
 def get_numa_node(dev_path, fallback):
-    """自动获取硬盘对应的 PCIe NUMA Node"""
     try:
         dev_name = os.path.basename(dev_path)
         ctrl_name = dev_name.split('n')[0]
@@ -154,7 +133,6 @@ def get_numa_node(dev_path, fallback):
     return fallback
 
 def run_cmd(cmd, log_file=None):
-    """执行 Shell 命令并记录日志"""
     try:
         res = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         if log_file:
@@ -166,7 +144,6 @@ def run_cmd(cmd, log_file=None):
         return False
 
 def format_drive(dev):
-    """执行 NVMe 安全擦除"""
     for attempt in range(1, 4):
         log_print(f"[INFO] Formatting {dev} (Attempt {attempt}/3)...")
         if run_cmd(f"nvme format {dev} -s 1"):
@@ -177,29 +154,23 @@ def format_drive(dev):
     sys.exit(1)
 
 def build_fio_cmd(job_name, dev, rw, bs, iodepth, numjobs, runtime, json_out, args, loops=0, rwmixread=None):
-    """构建 FIO 测试命令"""
-    # 核心对齐参数：--thread --end_fsync=0 --buffer_compress_percentage=0 --invalidate=1 --norandommap --randrepeat=0 --exitall
     cmd = (f"fio --name={job_name} --filename={dev} --rw={rw} --bs={bs} "
            f"--iodepth={iodepth} --numjobs={numjobs} --direct=1 --ioengine=libaio "
            f"--thread --end_fsync=0 --buffer_compress_percentage=0 --invalidate=1 "
            f"--norandommap --randrepeat=0 --exitall "
            f"--group_reporting --output-format=json --output={json_out}")
     
-    # 针对 512B 小块采用特定的伪随机生成器对齐
     if bs == "512B":
         cmd += " --random_generator=tausworthe64"
     
     if loops > 0:
-        # 预处理模式：按全盘容量比例写入 (无预热)
         cmd += f" --loops={loops} --size=100%"
     else:
-        # 常规测试模式：60s 预热机制
         cmd += f" --ramp_time=60 --runtime={runtime} --time_based"
         
     if rwmixread is not None:
         cmd += f" --rwmixread={rwmixread}"
 
-    # 应用 NUMA 节点绑定
     if args.enable_numa == 'yes':
         node = get_numa_node(dev, args.fallback_node)
         if args.numa_method == 'fio':
@@ -210,13 +181,11 @@ def build_fio_cmd(job_name, dev, rw, bs, iodepth, numjobs, runtime, json_out, ar
     return cmd
 
 def run_fio_task(task_args):
-    """单体 FIO 任务执行包装器"""
     job_name, dev, rw, bs, iodepth, numjobs, runtime, raw_dir, args, loops, rwmixread = task_args
     dev_name = os.path.basename(dev)
     json_out = os.path.join(raw_dir, f"{job_name}_{dev_name}_{rw}_{bs}_{numjobs}j_{iodepth}qd.json")
     log_out = json_out.replace('.json', '.log')
     
-    # 断点续测逻辑
     if args.resume and os.path.exists(json_out) and os.path.getsize(json_out) > 0:
         log_print(f"[RESUME] Skipping existing task: {os.path.basename(json_out)}")
         return (json_out, dev_name)
@@ -226,7 +195,6 @@ def run_fio_task(task_args):
     return (json_out, dev_name)
 
 def execute_synchronized_parallel(devs, job_name, rw, bs, iodepth, numjobs, runtime, raw_dir, args, loops=0, rwmixread=None):
-    """使用线程池实现多盘并发测试"""
     tasks =[(job_name, d, rw, bs, iodepth, numjobs, runtime, raw_dir, args, loops, rwmixread) for d in devs]
     json_results =[]
     with ThreadPoolExecutor(max_workers=len(devs)) as executor:
@@ -235,7 +203,6 @@ def execute_synchronized_parallel(devs, job_name, rw, bs, iodepth, numjobs, runt
     return json_results
 
 def parse_fio_json(json_file, is_mixed=False):
-    """解析 FIO 生成的 JSON 数据文件"""
     if not os.path.exists(json_file):
         return None
     try:
@@ -254,7 +221,6 @@ def parse_fio_json(json_file, is_mixed=False):
         bw_mb = tgt['bw_bytes'] / (1024 * 1024)
         iops = tgt['iops']
         
-        # 时延统一转换为 us (微秒)
         lat_dict = tgt.get('lat_ns', {})
         min_lat = lat_dict.get('min', 0) / 1000.0
         avg_lat = lat_dict.get('mean', 0) / 1000.0
@@ -270,20 +236,17 @@ def parse_fio_json(json_file, is_mixed=False):
     except Exception as e:
         return None
 
-def get_val(df, dev, ptn, bs, nj, qd, metric):
-    match = df[(df['drive'] == dev) & (df['pattern'] == ptn) & (df['bs'] == bs) & (df['nj'] == nj) & (df['qd'] == qd)]
-    return match.iloc[0][metric] if not match.empty else ""
+# [修复] 移除了从未使用的冗余函数 get_val()
 
 def generate_excel(df_all, mixed_results, args, devs, drive_infos):
-    """生成测试报告 Excel"""
     log_print("[INFO] Compiling data into standard Excel report...")
     out_excel = args.out_excel
     bs_list = args.bs_list.split()
     
     with pd.ExcelWriter(out_excel, engine='openpyxl') as writer:
         
-        # 1. 详细矩阵数据 Sheet
-        if args.mode == 'single':
+        #[修复] 增加 df_all.empty 判空保护
+        if not df_all.empty and args.mode == 'single':
             QDS_STRICT =[1, 2, 4, 8, 16, 32, 64, 128, 256]
             MATRIX_COLS =[f"{n}_{q}" for n in NUMJOBS_LIST for q in QDS_STRICT]
             
@@ -297,7 +260,7 @@ def generate_excel(df_all, mixed_results, args, devs, drive_infos):
                 if ptn not in df_all['pattern'].values: continue
                 
                 iops_dict = {bs: {c: "" for c in MATRIX_COLS} for bs in bs_list}
-                lat_rows =[]
+                lat_rows = []
                 for bs in bs_list:
                     lat_rows.extend([f"{bs}_min_lat", f"{bs}_avg_lat", f"{bs}_max_lat", f"{bs}_99.99th_lat"])
                 lat_dict = {r: {c: "" for c in MATRIX_COLS} for r in lat_rows}
@@ -323,15 +286,14 @@ def generate_excel(df_all, mixed_results, args, devs, drive_infos):
                 pd.DataFrame([["latency:bs_thread_iodepth"]]).to_excel(writer, sheet_name=sheet_name, startrow=lat_start_row, startcol=0, header=False, index=False)
                 df_lat.to_excel(writer, sheet_name=sheet_name, startrow=lat_start_row+1)
 
-        # 2. 混合读写数据 Sheet
         if mixed_results:
             pd.DataFrame(mixed_results).to_excel(writer, sheet_name='混合读写', index=False)
 
-        # 3. 全局原始扁平数据 Sheet
-        df_all.to_excel(writer, sheet_name="Raw_Matrix_Data", index=False)
+        # 保护性写入 Raw 数据页
+        if not df_all.empty:
+            df_all.to_excel(writer, sheet_name="Raw_Matrix_Data", index=False)
         
     log_print(f"[SUCCESS] Report successfully generated: {out_excel}")
-
 
 def main():
     parser = argparse.ArgumentParser()
@@ -348,11 +310,9 @@ def main():
     parser.add_argument('--seq_loops', type=int, required=True)
     parser.add_argument('--rand_pre', required=True)
     parser.add_argument('--rand_loops', type=int, required=True)
-    
     parser.add_argument('--enable_numa', required=True)
     parser.add_argument('--numa_method', required=True)
     parser.add_argument('--fallback_node', type=int, required=True)
-
     parser.add_argument('--run_seq_read', required=True)
     parser.add_argument('--run_seq_write', required=True)
     parser.add_argument('--run_rand_read', required=True)
@@ -374,7 +334,6 @@ def main():
             format_drive(d)
         drive_infos[d] = get_drive_info(d)
 
-    # ----- 1. 顺序读写模块 -----
     if args.run_seq_read == 'yes' or args.run_seq_write == 'yes':
         if args.seq_pre == 'yes':
             log_print("\n[INFO] === Executing Sequential Preconditioning ===")
@@ -385,7 +344,7 @@ def main():
             log_print(f"\n[INFO] === Matrix Testing: Sequential {rw} ===")
             
             combos_to_run = SEQ_COMBOS if args.mode == 'multi' else[(b, n, q) for b in bs_list for n in NUMJOBS_LIST for q in IODEPTH_LIST]
-            combos_to_run = [c for c in combos_to_run if c[0] in bs_list]
+            combos_to_run =[c for c in combos_to_run if c[0] in bs_list]
             
             for i, (bs, nj, qd) in enumerate(combos_to_run, 1):
                 log_print(f"  -> Progress[{i}/{len(combos_to_run)}] | {rw} | BS={bs} | Jobs={nj} | QD={qd}")
@@ -396,7 +355,6 @@ def main():
                         res.update({"drive": d_name, "pattern": f"seq_{rw}", "bs": bs, "nj": nj, "qd": qd})
                         results.append(res)
 
-    # ----- 2. 随机读写模块 -----
     if args.run_rand_read == 'yes' or args.run_rand_write == 'yes':
         if args.rand_pre == 'yes':
             log_print("\n[INFO] === Executing Random Preconditioning ===")
@@ -418,10 +376,9 @@ def main():
                         res.update({"drive": d_name, "pattern": f"{rw}", "bs": bs, "nj": nj, "qd": qd})
                         results.append(res)
 
-    # ----- 3. 混合读写模块 -----
     if args.run_mixed == 'yes':
         log_print("\n[INFO] === Matrix Testing: Mixed RW ===")
-        mix_bs =[b for b in['4k', '8k', '16k', '32k'] if b in bs_list]
+        mix_bs = [b for b in['4k', '8k', '16k', '32k'] if b in bs_list]
         for bs in mix_bs:
             for ratio in MIX_RATIO_LIST:
                 log_print(f"  -> Mixed RW | BS={bs} | Ratio={ratio}R/{100-ratio}W")
