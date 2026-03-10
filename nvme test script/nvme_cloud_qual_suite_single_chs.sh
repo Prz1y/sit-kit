@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================================
-# NVMe Storage Performance Test Suite (Fixed Version)
+# NVMe Storage Performance Test Suite
 # ============================================================================
 # Dependencies:
 # sudo yum/apt-get install -y fio nvme-cli pciutils python3 python3-pip numactl ipmitool libaio-devel
