@@ -3,12 +3,12 @@
 # NVMe Storage Performance Test Suite
 # ============================================================================
 # Dependencies:
-# sudo yum/apt-get install -y fio nvme-cli pciutils python3 python3-pip numactl ipmitool
+# sudo yum/apt-get install -y fio nvme-cli pciutils python3 python3-pip numactl ipmitool libaio-devel (或 libaio1)
 # pip3 install pandas openpyxl
 # ============================================================================
 
 # ============================================================================
-# [ 核心配置区 ]
+#[ 核心配置区 ]
 # ============================================================================
 
 # 1. 运行模式设置 (TEST_MODE)
@@ -19,7 +19,7 @@ TEST_MODE="single"
 # 2. 被测块设备阵列 (TARGET_DEVS)
 # 支持填入多块盘，以空格分隔。例如: ("/dev/nvme0n1" "/dev/nvme1n1")
 # [警告] 测试会执行格式化，禁止填入系统盘或存有重要数据的磁盘！
-TARGET_DEVS=("/dev/nvme0n1")
+TARGET_DEVS=("/dev/nvme1n1")
 
 # 3. 测试项目标识 (将作为生成的 Excel 文件名及表头标识)
 SERVER_MODEL="Server"
@@ -57,7 +57,7 @@ NUMA_BIND_METHOD="fio"       # 绑定方式: "fio" (--numa_cpu_nodes) 或 "numac
 NUMA_FALLBACK_NODE="0"       # 兜底 NUMA 节点
 
 # ============================================================================
-# [ 环境与安全前置检查 ]
+#[ 环境与安全前置检查 ]
 # ============================================================================
 
 echo "[INFO] Commencing pre-flight system checks..."
@@ -81,7 +81,7 @@ for dev in "${TARGET_DEVS[@]}"; do
     fi
 done
 
-if [ -n "$RESUME_FROM" ] && [ -d "$RESUME_FROM" ]; then
+if[ -n "$RESUME_FROM" ] && [ -d "$RESUME_FROM" ]; then
     BASE_DIR="$RESUME_FROM"
     RESUME_FLAG="--resume"
     echo "[INFO] Resuming from existing workspace: $BASE_DIR"
@@ -178,7 +178,8 @@ def format_drive(dev):
 
 def build_fio_cmd(job_name, dev, rw, bs, iodepth, numjobs, runtime, json_out, args, loops=0, rwmixread=None):
     """构建 FIO 测试命令"""
-    cmd = f"fio --name={job_name} --filename={dev} --rw={rw} --bs={bs} --iodepth={iodepth} --numjobs={numjobs} --direct=1 --group_reporting --output-format=json --output={json_out}"
+    # 【已修改】添加了 --ioengine=libaio 异步IO引擎
+    cmd = f"fio --name={job_name} --filename={dev} --rw={rw} --bs={bs} --iodepth={iodepth} --numjobs={numjobs} --direct=1 --ioengine=libaio --group_reporting --output-format=json --output={json_out}"
     
     if loops > 0:
         # 预处理模式：按全盘容量比例写入 (无预热)
@@ -483,7 +484,7 @@ echo "[INFO] Performing automated anomaly detection (PCIe/AER/Timeout)..."
 echo "=== Anomaly Self-Check ===" > "$LOG_DIR/error_check_summary.txt"
 err_count=$(grep -iE 'pcie bus error|aer|bad tlp|bad dllp|nvme.*timeout|i/o error' "$LOG_DIR/post_dmesg.log" | wc -l)
 
-if [ "$err_count" -gt 0 ]; then
+if[ "$err_count" -gt 0 ]; then
     echo "[WARNING] Found $err_count related hardware errors in dmesg. Inspect $LOG_DIR/post_dmesg.log" | tee -a "$LOG_DIR/error_check_summary.txt"
     grep -iE 'pcie bus error|aer|bad tlp|bad dllp|nvme.*timeout|i/o error' "$LOG_DIR/post_dmesg.log" | tail -n 10 | tee -a "$LOG_DIR/error_check_summary.txt"
 else
