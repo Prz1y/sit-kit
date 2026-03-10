@@ -43,7 +43,7 @@ ENABLE_NUMA_BIND="yes"
 NUMA_BIND_METHOD="fio"
 NUMA_FALLBACK_NODE="0"
 
-# Maximum Outstanding I/O cap / 最大未完成IO上限（防止高并发导致延迟爆炸）
+# Maximum Outstanding I/O cap / 最大未完成IO上限
 MAX_OUTSTANDING_IO=1024
 
 # ============================================================================
@@ -100,10 +100,9 @@ import pandas as pd
 
 # ----------------------------------------------------------------------------
 # 参数矩阵定义 / Parameter Matrix Definition
-# Added numjobs 16 and 32 for complete coverage / 增加16和32以覆盖完整矩阵
 # ----------------------------------------------------------------------------
 NUMJOBS_LIST = [1, 2, 4, 8, 16, 32]
-IODEPTH_LIST = [1, 2, 4, 8, 16, 32, 64, 128, 256]
+IODEPTH_LIST = [1, 2, 4, 8, 16, 32, 64, 128]
 MIX_RATIO_LIST = [10, 20, 30, 40, 50, 60, 70, 80, 90]
 
 SEQ_COMBOS = [('128k', 1, 32)]
