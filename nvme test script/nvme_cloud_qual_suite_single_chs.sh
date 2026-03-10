@@ -50,7 +50,7 @@ TEST_BS_LIST="4k 8k 16k 32k 64k 128k 256k 512k 1m"
 RESUME_FROM=""
 
 # ============================================================================
-# [ NUMA 智能绑定配置区 ]
+#[ NUMA 智能绑定配置区 ]
 # ============================================================================
 ENABLE_NUMA_BIND="yes"       # 是否开启 NUMA 节点绑定
 NUMA_BIND_METHOD="fio"       # 绑定方式: "fio" (--numa_cpu_nodes) 或 "numactl"
@@ -75,13 +75,13 @@ for tool in fio nvme lspci python3; do
 done
 
 for dev in "${TARGET_DEVS[@]}"; do
-    if [ ! -b "$dev" ]; then
+    if[ ! -b "$dev" ]; then
         echo "[ERROR] Block device '$dev' does not exist or is invalid."
         exit 1
     fi
 done
 
-if[ -n "$RESUME_FROM" ] && [ -d "$RESUME_FROM" ]; then
+if [ -n "$RESUME_FROM" ] &&[ -d "$RESUME_FROM" ]; then
     BASE_DIR="$RESUME_FROM"
     RESUME_FLAG="--resume"
     echo "[INFO] Resuming from existing workspace: $BASE_DIR"
@@ -101,7 +101,7 @@ dmesg -T > "$LOG_DIR/pre_dmesg.log" 2>/dev/null || true
 lspci -vvv > "$LOG_DIR/pre_lspci.log" 2>/dev/null || true
 nvme smart-log "${TARGET_DEVS[0]}" > "$LOG_DIR/pre_smart.log" 2>/dev/null || true
 
-# ==================== [ Python 测试引擎注入 ] ====================
+# ====================[ Python 测试引擎注入 ] ====================
 PYTHON_ENGINE="${BASE_DIR}/nvme_fio_engine.py"
 
 cat << 'EOF' > "$PYTHON_ENGINE"
@@ -178,15 +178,23 @@ def format_drive(dev):
 
 def build_fio_cmd(job_name, dev, rw, bs, iodepth, numjobs, runtime, json_out, args, loops=0, rwmixread=None):
     """构建 FIO 测试命令"""
-    # 【已修改】添加了 --ioengine=libaio 异步IO引擎
-    cmd = f"fio --name={job_name} --filename={dev} --rw={rw} --bs={bs} --iodepth={iodepth} --numjobs={numjobs} --direct=1 --ioengine=libaio --group_reporting --output-format=json --output={json_out}"
+    # 核心对齐参数：--thread --end_fsync=0 --buffer_compress_percentage=0 --invalidate=1 --norandommap --randrepeat=0 --exitall
+    cmd = (f"fio --name={job_name} --filename={dev} --rw={rw} --bs={bs} "
+           f"--iodepth={iodepth} --numjobs={numjobs} --direct=1 --ioengine=libaio "
+           f"--thread --end_fsync=0 --buffer_compress_percentage=0 --invalidate=1 "
+           f"--norandommap --randrepeat=0 --exitall "
+           f"--group_reporting --output-format=json --output={json_out}")
+    
+    # 针对 512B 小块采用特定的伪随机生成器对齐
+    if bs == "512B":
+        cmd += " --random_generator=tausworthe64"
     
     if loops > 0:
         # 预处理模式：按全盘容量比例写入 (无预热)
-        cmd += f" --loops={loops} --size=100% --ioengine=libaio"
+        cmd += f" --loops={loops} --size=100%"
     else:
-        # 常规测试模式：基于时间运行，并设置 30s 预热机制
-        cmd += f" --ramp_time=30 --runtime={runtime} --time_based --ioengine=libaio"
+        # 常规测试模式：60s 预热机制
+        cmd += f" --ramp_time=60 --runtime={runtime} --time_based"
         
     if rwmixread is not None:
         cmd += f" --rwmixread={rwmixread}"
@@ -413,7 +421,7 @@ def main():
     # ----- 3. 混合读写模块 -----
     if args.run_mixed == 'yes':
         log_print("\n[INFO] === Matrix Testing: Mixed RW ===")
-        mix_bs =[b for b in ['4k', '8k', '16k', '32k'] if b in bs_list]
+        mix_bs =[b for b in['4k', '8k', '16k', '32k'] if b in bs_list]
         for bs in mix_bs:
             for ratio in MIX_RATIO_LIST:
                 log_print(f"  -> Mixed RW | BS={bs} | Ratio={ratio}R/{100-ratio}W")
@@ -484,7 +492,7 @@ echo "[INFO] Performing automated anomaly detection (PCIe/AER/Timeout)..."
 echo "=== Anomaly Self-Check ===" > "$LOG_DIR/error_check_summary.txt"
 err_count=$(grep -iE 'pcie bus error|aer|bad tlp|bad dllp|nvme.*timeout|i/o error' "$LOG_DIR/post_dmesg.log" | wc -l)
 
-if[ "$err_count" -gt 0 ]; then
+if [ "$err_count" -gt 0 ]; then
     echo "[WARNING] Found $err_count related hardware errors in dmesg. Inspect $LOG_DIR/post_dmesg.log" | tee -a "$LOG_DIR/error_check_summary.txt"
     grep -iE 'pcie bus error|aer|bad tlp|bad dllp|nvme.*timeout|i/o error' "$LOG_DIR/post_dmesg.log" | tail -n 10 | tee -a "$LOG_DIR/error_check_summary.txt"
 else
