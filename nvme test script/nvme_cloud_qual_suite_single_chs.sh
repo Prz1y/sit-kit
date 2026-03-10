@@ -183,10 +183,10 @@ def build_fio_cmd(job_name, dev, rw, bs, iodepth, numjobs, runtime, json_out, ar
     
     if loops > 0:
         # 预处理模式：按全盘容量比例写入 (无预热)
-        cmd += f" --loops={loops} --size=100%"
+        cmd += f" --loops={loops} --size=100% --ioengine=libaio"
     else:
         # 常规测试模式：基于时间运行，并设置 30s 预热机制
-        cmd += f" --ramp_time=30 --runtime={runtime} --time_based"
+        cmd += f" --ramp_time=30 --runtime={runtime} --time_based --ioengine=libaio"
         
     if rwmixread is not None:
         cmd += f" --rwmixread={rwmixread}"
