@@ -65,6 +65,13 @@ for tool in fio nvme lspci python3; do
     fi
 done
 
+python3 -c "import pandas; import openpyxl" 2>/dev/null
+if [ $? -ne 0 ]; then
+    echo "[ERROR] Required Python packages 'pandas' and/or 'openpyxl' are not installed."
+    echo "[ERROR] Install with: pip3 install pandas openpyxl"
+    exit 1
+fi
+
 for dev in "${TARGET_DEVS[@]}"; do
     if [ ! -b "$dev" ]; then
         echo "[ERROR] Block device '$dev' does not exist or is invalid."
@@ -104,6 +111,7 @@ import pandas as pd
 # ----------------------------------------------------------------------------
 NUMJOBS_LIST = [1, 2, 4, 8, 16, 32]
 IODEPTH_LIST = [1, 2, 4, 8, 16, 32, 64, 128]
+QDS_STRICT   = [1, 2, 4, 8, 16, 32, 64, 128]   # Must match IODEPTH_LIST / 必须与 IODEPTH_LIST 保持一致
 MIX_RATIO_LIST = [10, 20, 30, 40, 50, 60, 70, 80, 90]
 
 SEQ_COMBOS = [('128k', 1, 32)]
@@ -151,13 +159,36 @@ def run_cmd(cmd, log_file=None):
         return False
 
 def format_drive(dev):
+    # Attempt 1: Secure Erase (User Data Erase) / 尝试1：安全擦除（用户数据擦除）
     for attempt in range(1, 4):
-        log_print(f"[INFO] Formatting {dev} (Attempt {attempt}/3)...")
+        log_print(f"[INFO] Formatting {dev} with -s 1 (Attempt {attempt}/3)...")
         if run_cmd(f"nvme format {dev} -s 1"):
+            log_print(f"[INFO] Format with -s 1 succeeded on {dev}.")
             time.sleep(10)
             return True
         time.sleep(5)
-    log_print(f"[CRITICAL] Failed to secure erase {dev} after 3 attempts.")
+    log_print(f"[WARN] nvme format {dev} -s 1 failed after 3 attempts. Falling back to -s 0...")
+
+    # Attempt 2: Format without secure erase / 尝试2：不执行安全擦除的格式化
+    for attempt in range(1, 4):
+        log_print(f"[INFO] Formatting {dev} with -s 0 (Attempt {attempt}/3)...")
+        if run_cmd(f"nvme format {dev} -s 0"):
+            log_print(f"[INFO] Format with -s 0 succeeded on {dev}.")
+            time.sleep(10)
+            return True
+        time.sleep(5)
+    log_print(f"[WARN] nvme format {dev} -s 0 failed after 3 attempts. Falling back to -n 1 -s 0...")
+
+    # Attempt 3: Explicit namespace format / 尝试3：指定命名空间格式化
+    for attempt in range(1, 4):
+        log_print(f"[INFO] Formatting {dev} with -n 1 -s 0 (Attempt {attempt}/3)...")
+        if run_cmd(f"nvme format {dev} -n 1 -s 0"):
+            log_print(f"[INFO] Format with -n 1 -s 0 succeeded on {dev}.")
+            time.sleep(10)
+            return True
+        time.sleep(5)
+
+    log_print(f"[CRITICAL] All format attempts failed for {dev}. Aborting.")
     sys.exit(1)
 
 def build_fio_cmd(job_name, dev, rw, bs, iodepth, numjobs, runtime, json_out, args, loops=0, rwmixread=None):
@@ -202,8 +233,16 @@ def run_fio_task(task_args):
     log_out = json_out.replace('.json', '.log')
 
     if args.resume and os.path.exists(json_out) and os.path.getsize(json_out) > 0:
-        log_print(f"[RESUME] Skipping existing task: {os.path.basename(json_out)}")
-        return (json_out, dev_name)
+        try:
+            with open(json_out, 'r') as f:
+                data = json.load(f)
+            if 'jobs' in data and len(data['jobs']) > 0:
+                log_print(f"[RESUME] Skipping valid existing task: {os.path.basename(json_out)}")
+                return (json_out, dev_name)
+            else:
+                log_print(f"[RESUME] Existing file invalid (no jobs data), re-running: {os.path.basename(json_out)}")
+        except (json.JSONDecodeError, KeyError, IOError):
+            log_print(f"[RESUME] Existing file corrupted, re-running: {os.path.basename(json_out)}")
 
     cmd = build_fio_cmd(job_name, dev, rw, bs, iodepth, numjobs, runtime, json_out, args, loops, rwmixread)
     run_cmd(cmd, log_out)
@@ -249,6 +288,42 @@ def parse_fio_json(json_file, is_mixed=False):
         return {"iops": round(iops, 2), "bw": round(bw_mb, 2), "min_lat": round(min_lat, 2),
                 "avg_lat": round(avg_lat, 2), "max_lat": round(max_lat, 2), "p9999": round(p9999, 2)}
     except Exception as e:
+        return None
+
+def parse_fio_json_qos(json_file, rw_pattern):
+    """Extract QoS metrics including latency percentiles from a fio JSON output.
+    从 fio JSON 输出中提取 QoS 指标，包括延迟百分位数。
+    Returns a dict with iops, bw, p50, p99, p999, p9999, or None on failure.
+    成功时返回包含 iops、bw、p50、p99、p999、p9999 的字典，失败时返回 None。
+    """
+    if not os.path.exists(json_file):
+        return None
+    try:
+        with open(json_file, 'r') as f:
+            data = json.load(f)
+        job = data['jobs'][0]
+
+        is_read = 'read' in rw_pattern
+        tgt = job['read'] if is_read else job['write']
+
+        iops = tgt['iops']
+        bw_mb = tgt['bw_bytes'] / (1024 * 1024)
+
+        clat_dict = tgt.get('clat_ns', {}).get('percentile', {})
+        p50   = clat_dict.get('50.000000', 0) / 1000.0
+        p99   = clat_dict.get('99.000000', 0) / 1000.0
+        p999  = clat_dict.get('99.900000', 0) / 1000.0
+        p9999 = clat_dict.get('99.990000', 0) / 1000.0
+
+        return {
+            "iops": round(iops, 2),
+            "bw_mb": round(bw_mb, 2),
+            "p50_us": round(p50, 2),
+            "p99_us": round(p99, 2),
+            "p99.9_us": round(p999, 2),
+            "p99.99_us": round(p9999, 2),
+        }
+    except Exception:
         return None
 
 def parse_probe_iops(json_file):
@@ -431,52 +506,98 @@ def run_rand_precon_with_steady_state(devs, raw_dir, args):
 
     return precon_log
 
-def generate_excel(df_all, mixed_results, precon_log, args, devs, drive_infos):
+def generate_excel(df_all, mixed_results, precon_log, args, devs, drive_infos, qos_results=None):
     log_print("[INFO] Compiling data into standard Excel report...")
     out_excel = args.out_excel
     bs_list = args.bs_list.split()
 
     with pd.ExcelWriter(out_excel, engine='openpyxl') as writer:
 
-        if not df_all.empty and args.mode == 'single':
-            QDS_STRICT = [1, 2, 4, 8, 16, 32, 64, 128, 256]
+        if not df_all.empty:
             MATRIX_COLS = [f"{n}_{q}" for n in NUMJOBS_LIST for q in QDS_STRICT]
 
             sheet_mapping = {
                 'seq_read': '顺序读测试', 'seq_write': '顺序写测试',
                 'randread': '随机读测试', 'randwrite': '随机写测试'
             }
-            target_dev = os.path.basename(devs[0])
 
-            for ptn, sheet_name in sheet_mapping.items():
-                if ptn not in df_all['pattern'].values: continue
+            if args.mode == 'single':
+                # Single-drive mode: one sheet per pattern / 单盘模式：每个测试模式一个 Sheet
+                target_dev = os.path.basename(devs[0])
+                for ptn, sheet_name in sheet_mapping.items():
+                    if ptn not in df_all['pattern'].values: continue
 
-                iops_dict = {bs: {c: "" for c in MATRIX_COLS} for bs in bs_list}
-                lat_rows = []
-                for bs in bs_list:
-                    lat_rows.extend([f"{bs}_min_lat", f"{bs}_avg_lat", f"{bs}_max_lat", f"{bs}_99.99th_lat"])
-                lat_dict = {r: {c: "" for c in MATRIX_COLS} for r in lat_rows}
+                    iops_dict = {bs: {c: "" for c in MATRIX_COLS} for bs in bs_list}
+                    lat_rows = []
+                    for bs in bs_list:
+                        lat_rows.extend([f"{bs}_min_lat", f"{bs}_avg_lat", f"{bs}_max_lat", f"{bs}_99.99th_lat"])
+                    lat_dict = {r: {c: "" for c in MATRIX_COLS} for r in lat_rows}
 
-                ptn_df = df_all[(df_all['pattern'] == ptn) & (df_all['drive'] == target_dev)]
-                for _, r in ptn_df.iterrows():
-                    c = f"{r['nj']}_{r['qd']}"
-                    if c in MATRIX_COLS and r['bs'] in iops_dict:
-                        bs = r['bs']
-                        iops_dict[bs][c] = r['iops']
-                        lat_dict[f"{bs}_min_lat"][c] = r['min_lat']
-                        lat_dict[f"{bs}_avg_lat"][c] = r['avg_lat']
-                        lat_dict[f"{bs}_max_lat"][c] = r['max_lat']
-                        lat_dict[f"{bs}_99.99th_lat"][c] = r['p9999']
+                    ptn_df = df_all[(df_all['pattern'] == ptn) & (df_all['drive'] == target_dev)]
+                    for _, r in ptn_df.iterrows():
+                        c = f"{r['nj']}_{r['qd']}"
+                        if c in MATRIX_COLS and r['bs'] in iops_dict:
+                            bs = r['bs']
+                            iops_dict[bs][c] = r['iops']
+                            lat_dict[f"{bs}_min_lat"][c] = r['min_lat']
+                            lat_dict[f"{bs}_avg_lat"][c] = r['avg_lat']
+                            lat_dict[f"{bs}_max_lat"][c] = r['max_lat']
+                            lat_dict[f"{bs}_99.99th_lat"][c] = r['p9999']
 
-                df_iops = pd.DataFrame.from_dict(iops_dict, orient='index')
-                df_lat = pd.DataFrame.from_dict(lat_dict, orient='index')
+                    df_iops = pd.DataFrame.from_dict(iops_dict, orient='index')
+                    df_lat = pd.DataFrame.from_dict(lat_dict, orient='index')
 
-                pd.DataFrame([["iops:bs_thread_iodepth"]]).to_excel(writer, sheet_name=sheet_name, startrow=0, startcol=0, header=False, index=False)
-                df_iops.to_excel(writer, sheet_name=sheet_name, startrow=1)
+                    pd.DataFrame([["iops:bs_thread_iodepth"]]).to_excel(writer, sheet_name=sheet_name, startrow=0, startcol=0, header=False, index=False)
+                    df_iops.to_excel(writer, sheet_name=sheet_name, startrow=1)
 
-                lat_start_row = len(bs_list) + 3
-                pd.DataFrame([["latency:bs_thread_iodepth"]]).to_excel(writer, sheet_name=sheet_name, startrow=lat_start_row, startcol=0, header=False, index=False)
-                df_lat.to_excel(writer, sheet_name=sheet_name, startrow=lat_start_row + 1)
+                    lat_start_row = len(bs_list) + 3
+                    pd.DataFrame([["latency:bs_thread_iodepth"]]).to_excel(writer, sheet_name=sheet_name, startrow=lat_start_row, startcol=0, header=False, index=False)
+                    df_lat.to_excel(writer, sheet_name=sheet_name, startrow=lat_start_row + 1)
+
+            else:
+                # Multi-drive mode: one sheet per drive per pattern / 多盘模式：每块盘每个测试模式一个 Sheet
+                all_drives = df_all['drive'].unique()
+                for drive_name in all_drives:
+                    for ptn, sheet_base_name in sheet_mapping.items():
+                        drive_df = df_all[(df_all['pattern'] == ptn) & (df_all['drive'] == drive_name)]
+                        if drive_df.empty: continue
+
+                        # Truncate to 31-char Excel limit; append suffix on collision
+                        # 截断至 Excel 31 字符限制；冲突时追加数字后缀
+                        raw_sheet = f"{sheet_base_name}_{drive_name}"
+                        base_truncated = raw_sheet[:31]
+                        sheet_name = base_truncated
+                        collision_idx = 1
+                        while sheet_name in writer.sheets:
+                            suffix = f"_{collision_idx}"
+                            sheet_name = base_truncated[:31 - len(suffix)] + suffix
+                            collision_idx += 1
+
+                        iops_dict = {bs: {c: "" for c in MATRIX_COLS} for bs in bs_list}
+                        lat_rows = []
+                        for bs in bs_list:
+                            lat_rows.extend([f"{bs}_min_lat", f"{bs}_avg_lat", f"{bs}_max_lat", f"{bs}_99.99th_lat"])
+                        lat_dict = {r: {c: "" for c in MATRIX_COLS} for r in lat_rows}
+
+                        for _, r in drive_df.iterrows():
+                            c = f"{r['nj']}_{r['qd']}"
+                            if c in MATRIX_COLS and r['bs'] in iops_dict:
+                                bs = r['bs']
+                                iops_dict[bs][c] = r['iops']
+                                lat_dict[f"{bs}_min_lat"][c] = r['min_lat']
+                                lat_dict[f"{bs}_avg_lat"][c] = r['avg_lat']
+                                lat_dict[f"{bs}_max_lat"][c] = r['max_lat']
+                                lat_dict[f"{bs}_99.99th_lat"][c] = r['p9999']
+
+                        df_iops = pd.DataFrame.from_dict(iops_dict, orient='index')
+                        df_lat = pd.DataFrame.from_dict(lat_dict, orient='index')
+
+                        pd.DataFrame([["iops:bs_thread_iodepth"]]).to_excel(writer, sheet_name=sheet_name, startrow=0, startcol=0, header=False, index=False)
+                        df_iops.to_excel(writer, sheet_name=sheet_name, startrow=1)
+
+                        lat_start_row = len(bs_list) + 3
+                        pd.DataFrame([["latency:bs_thread_iodepth"]]).to_excel(writer, sheet_name=sheet_name, startrow=lat_start_row, startcol=0, header=False, index=False)
+                        df_lat.to_excel(writer, sheet_name=sheet_name, startrow=lat_start_row + 1)
 
         if mixed_results:
             pd.DataFrame(mixed_results).to_excel(writer, sheet_name='混合读写', index=False)
@@ -495,6 +616,10 @@ def generate_excel(df_all, mixed_results, precon_log, args, devs, drive_infos):
             # Write empty placeholder if preconditioning was skipped / 若跳过预处理则写占位空表
             pd.DataFrame(columns=["Loop#", "Probe_IOPS", "Cumulative_CV", "Range_Ratio", "Slope_Pct", "Status"]).to_excel(
                 writer, sheet_name='预处理稳态', index=False)
+
+        # QoS 延迟测试页 / QoS Latency Test sheet
+        if qos_results:
+            pd.DataFrame(qos_results).to_excel(writer, sheet_name='QoS延迟测试', index=False)
 
     log_print(f"[SUCCESS] Report successfully generated: {out_excel}")
 
@@ -552,6 +677,7 @@ def main():
     results = []
     mixed_results = []
     precon_log = []
+    qos_results = []
 
     log_print("[INFO] Initiating drive preparation...")
     drive_infos = {}
@@ -643,7 +769,23 @@ def main():
         log_print("[ERROR] Final dataset is empty. Check log outputs.")
         sys.exit(1)
 
-    generate_excel(pd.DataFrame(results) if results else pd.DataFrame(), mixed_results, precon_log, args, devs, drive_infos)
+    if args.run_qos == 'yes':
+        log_print("\n[INFO] === QoS Latency Testing (4k RandRead/RandWrite, QD=32, NJ=4) ===")
+        # QoS test: 4k randread and randwrite at QD=32, numjobs=4 / QoS 测试：4k 随机读写，QD=32，NJ=4
+        for rw in ['randread', 'randwrite']:
+            log_print(f"  -> QoS test | {rw} | BS=4k | QD=32 | NJ=4 | Runtime={args.qos_runtime}s")
+            json_files = execute_synchronized_parallel(devs, "qos", rw, "4k", 32, 4, args.qos_runtime, args.raw_dir, args)
+            for jf, d_name in json_files:
+                res = parse_fio_json_qos(jf, rw)
+                if res:
+                    res.update({"drive": d_name, "workload": rw, "bs": "4k", "qd": 32, "nj": 4})
+                    qos_results.append(res)
+        if qos_results:
+            log_print(f"[INFO] QoS test completed. Collected {len(qos_results)} result(s).")
+        else:
+            log_print("[WARN] QoS test produced no results. Check raw JSON files.")
+
+    generate_excel(pd.DataFrame(results) if results else pd.DataFrame(), mixed_results, precon_log, args, devs, drive_infos, qos_results)
 
 if __name__ == "__main__":
     main()
