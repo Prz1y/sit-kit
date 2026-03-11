@@ -3,22 +3,31 @@
 # 网络性能测试脚本
 # 功能：测试TCP/UDP吞吐量、响应时间，收集环境信息及系统日志。
 # 依赖：netperf, netserver
+# 用法：./network_perf_test.sh [目标IP] [测试时长(秒)]
 
-# 设置语言环境
 export LC_ALL=C
 export LANG=C
 
-# 基础路径
 SCRIPT_DIR=$(cd "$(dirname "$0")"; pwd)
 TIMESTAMP=$(date "+%Y%m%d_%H%M%S")
 RESULT_DIR="${SCRIPT_DIR}/network_test_${TIMESTAMP}"
 LOG_FILE="${RESULT_DIR}/test_execution.log"
 
-# 创建结果目录
 mkdir -p "${RESULT_DIR}"
 
 log() {
     echo -e "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "${LOG_FILE}"
+}
+
+run_netperf() {
+    local desc="$1"
+    local outfile="$2"
+    shift 2
+    log "  正在进行 ${desc} 测试..."
+    netperf "$@" > "${outfile}" 2>&1
+    if [ $? -ne 0 ]; then
+        log "  警告: ${desc} 测试执行失败或返回非零值，请检查 ${outfile}"
+    fi
 }
 
 log "=================================================="
@@ -29,18 +38,41 @@ log "=================================================="
 # 1. 环境信息收集
 log "[1/5] 收集环境信息..."
 {
-    echo "--- 系统信息 ---"
+    echo "===== 系统基本信息 ====="
     uname -a
+    echo ""
+    echo "--- 内核版本 ---"
+    uname -r
+    echo ""
+    echo "--- OS Release ---"
     [ -f /etc/os-release ] && cat /etc/os-release
-    echo -e "\n--- CPU信息 ---"
+    echo ""
+    echo "===== CPU 信息 ====="
     lscpu
-    echo -e "\n--- 内存信息 ---"
+    echo ""
+    echo "===== 内存信息 ====="
     free -h
-    echo -e "\n--- 网络接口 ---"
+    echo ""
+    echo "===== 网络接口详情 ====="
     ip addr
-    echo -e "\n--- 网卡硬件信息 ---"
+    echo ""
+    echo "===== 网络接口统计 ====="
+    ip -s link
+    echo ""
+    echo "===== 网卡硬件信息 (PCI) ====="
     lspci | grep -i ether
-} > "${RESULT_DIR}/env_info.txt"
+    echo ""
+    echo "===== 网卡驱动信息 ====="
+    for iface in $(ip -o link show | awk -F': ' '{print $2}' | awk -F'@' '{print $1}' | grep -v lo); do
+        echo "--- ${iface} ---"
+        ethtool "${iface}" 2>/dev/null || echo "  (ethtool 不可用或无此接口信息)"
+        ethtool -i "${iface}" 2>/dev/null
+    done
+    echo ""
+    echo "===== 路由表 ====="
+    ip route
+} > "${RESULT_DIR}/env_info.txt" 2>&1
+log "  环境信息已保存至 env_info.txt"
 
 # 2. 检查并启动 netserver
 log "[2/5] 检查并启动 netserver..."
@@ -49,74 +81,145 @@ if ! command -v netperf &> /dev/null; then
     exit 1
 fi
 
-# 尝试启动 netserver
-netserver -p 12865 >> "${LOG_FILE}" 2>&1
-if [ $? -ne 0 ]; then
-    log "提示: netserver 启动返回非零值，可能已经在运行。"
+# 若本地已有 netserver 在监听则跳过
+if ! ss -tlnp | grep -q ":12865"; then
+    netserver -p 12865 >> "${LOG_FILE}" 2>&1
+    sleep 1
+    log "  netserver 已在端口 12865 启动"
+else
+    log "  netserver 已在监听端口 12865，跳过启动"
 fi
 
 # 3. 执行 netperf 测试
 TARGET_IP=${1:-"127.0.0.1"}
-log "[3/5] 开始执行 netperf 测试 (测试目标: ${TARGET_IP})..."
-TEST_DURATION=10
+TEST_DURATION=${2:-10}
+log "[3/5] 开始执行 netperf 测试 (目标: ${TARGET_IP}, 时长: ${TEST_DURATION}s)..."
 
-# TCP Stream (吞吐量)
-log "正在进行 TCP_STREAM 测试 (吞吐量)..."
-netperf -H ${TARGET_IP} -l ${TEST_DURATION} -t TCP_STREAM -- -m 1024 > "${RESULT_DIR}/tcp_stream.txt" 2>&1
+# TCP Stream 正向吞吐量
+run_netperf "TCP_STREAM (正向吞吐)" \
+    "${RESULT_DIR}/tcp_stream.txt" \
+    -H "${TARGET_IP}" -l "${TEST_DURATION}" -t TCP_STREAM -P 1 -- -m 1024
 
-# UDP Stream (吞吐量)
-log "正在进行 UDP_STREAM 测试 (吞吐量)..."
-netperf -H ${TARGET_IP} -l ${TEST_DURATION} -t UDP_STREAM -- -m 1024 > "${RESULT_DIR}/udp_stream.txt" 2>&1
+# TCP Stream 反向吞吐量
+run_netperf "TCP_MAERTS (反向吞吐)" \
+    "${RESULT_DIR}/tcp_maerts.txt" \
+    -H "${TARGET_IP}" -l "${TEST_DURATION}" -t TCP_MAERTS -P 1 -- -m 1024
 
-# TCP Request/Response (响应时间/速率)
-log "正在进行 TCP_RR 测试 (响应时间/速率)..."
-netperf -H ${TARGET_IP} -l ${TEST_DURATION} -t TCP_RR -- -r 64,64 > "${RESULT_DIR}/tcp_rr.txt" 2>&1
+# UDP Stream 吞吐量
+run_netperf "UDP_STREAM (UDP吞吐)" \
+    "${RESULT_DIR}/udp_stream.txt" \
+    -H "${TARGET_IP}" -l "${TEST_DURATION}" -t UDP_STREAM -P 1 -- -m 1024
 
-# UDP Request/Response (响应时间/速率)
-log "正在进行 UDP_RR 测试 (响应时间/速率)..."
-netperf -H ${TARGET_IP} -l ${TEST_DURATION} -t UDP_RR -- -r 64,64 > "${RESULT_DIR}/udp_rr.txt" 2>&1
+# TCP Request/Response 响应速率与延迟
+run_netperf "TCP_RR (TCP响应时间/速率)" \
+    "${RESULT_DIR}/tcp_rr.txt" \
+    -H "${TARGET_IP}" -l "${TEST_DURATION}" -t TCP_RR -P 1 -- -r 64,64
+
+# UDP Request/Response 响应速率与延迟
+run_netperf "UDP_RR (UDP响应时间/速率)" \
+    "${RESULT_DIR}/udp_rr.txt" \
+    -H "${TARGET_IP}" -l "${TEST_DURATION}" -t UDP_RR -P 1 -- -r 64,64
 
 # 4. 收集系统日志
-log "[4/5] 收集系统日志 (dmesg & messages)..."
-dmesg > "${RESULT_DIR}/dmesg.log"
+log "[4/5] 收集系统日志..."
+dmesg > "${RESULT_DIR}/dmesg.log" 2>&1
 if [ -f /var/log/messages ]; then
     cp /var/log/messages "${RESULT_DIR}/messages.log"
+    log "  已复制 /var/log/messages"
 elif [ -f /var/log/syslog ]; then
     cp /var/log/syslog "${RESULT_DIR}/syslog.log"
+    log "  已复制 /var/log/syslog"
 else
-    log "警告: 未找到 /var/log/messages 或 /var/log/syslog"
+    log "  警告: 未找到 /var/log/messages 或 /var/log/syslog"
 fi
 
-# 5. 生成简要报告
+# 解析 netperf 输出的通用函数
+# netperf -P 1 会输出表头，数据在表头下一行
+parse_throughput() {
+    # TCP/UDP STREAM: 最后一行数据，吞吐量在最后一列
+    local file="$1"
+    [ -f "${file}" ] || { echo "N/A (文件不存在)"; return; }
+    local val
+    val=$(awk 'NR>1 && /^[0-9]/' "${file}" | tail -n 1 | awk '{print $NF}')
+    echo "${val:-N/A}"
+}
+
+parse_rr_trans() {
+    # RR 测试: Trans/sec 在最后一列
+    local file="$1"
+    [ -f "${file}" ] || { echo "N/A (文件不存在)"; return; }
+    local val
+    val=$(awk '/^[0-9]/ && NF>=5' "${file}" | tail -n 1 | awk '{print $NF}')
+    echo "${val:-N/A}"
+}
+
+parse_rr_latency() {
+    # RR 测试: Mean Latency (us) 通常在 Trans/sec 前一列
+    local file="$1"
+    [ -f "${file}" ] || { echo "N/A (文件不存在)"; return; }
+    local val
+    # 取数据行，字段数>=6时，倒数第二列为平均延迟
+    val=$(awk '/^[0-9]/ && NF>=6' "${file}" | tail -n 1 | awk '{print $(NF-1)}')
+    echo "${val:-N/A}"
+}
+
+# 5. 生成详细报告
 log "[5/5] 生成测试报告..."
+REPORT="${RESULT_DIR}/test_report.txt"
 {
     echo "=================================================="
-    echo "            网络性能测试简报                     "
-    echo "测试时间: $(date)"
-    echo "测试目标: ${TARGET_IP}"
+    echo "            网络性能测试报告                      "
     echo "=================================================="
+    echo "测试时间   : $(date)"
+    echo "测试目标IP : ${TARGET_IP}"
+    echo "单项测试时长: ${TEST_DURATION} 秒"
     echo ""
-    echo "1. TCP 吞吐量 (TCP_STREAM) [10^6bits/sec]:"
-    [ -f "${RESULT_DIR}/tcp_stream.txt" ] && tail -n 1 "${RESULT_DIR}/tcp_stream.txt" | awk '{print $NF}'
-    echo ""
-    echo "2. UDP 吞吐量 (UDP_STREAM) [10^6bits/sec]:"
-    [ -f "${RESULT_DIR}/udp_stream.txt" ] && tail -n 2 "${RESULT_DIR}/udp_stream.txt" | head -n 1 | awk '{print $NF}'
-    echo ""
-    echo "3. TCP 响应速率 (TCP_RR) [Trans/sec]:"
-    [ -f "${RESULT_DIR}/tcp_rr.txt" ] && tail -n 2 "${RESULT_DIR}/tcp_rr.txt" | head -n 1 | awk '{print $NF}'
-    echo ""
-    echo "4. UDP 响应速率 (UDP_RR) [Trans/sec]:"
-    [ -f "${RESULT_DIR}/udp_rr.txt" ] && tail -n 2 "${RESULT_DIR}/udp_rr.txt" | head -n 1 | awk '{print $NF}'
+    echo "--- 环境摘要 ---"
+    echo "主机名     : $(hostname)"
+    echo "内核版本   : $(uname -r)"
+    echo "OS         : $(grep PRETTY_NAME /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '\"')"
+    echo "CPU        : $(lscpu | grep 'Model name' | awk -F: '{print $2}' | xargs)"
+    echo "CPU核心数  : $(nproc)"
+    echo "总内存     : $(free -h | awk '/Mem:/{print $2}')"
+    echo "网卡 (PCI) : $(lspci | grep -i ether | head -n 1)"
     echo ""
     echo "=================================================="
-    echo "详细日志及原始数据请查看目录: ${RESULT_DIR}"
-} > "${RESULT_DIR}/test_report.txt"
+    echo "                性能测试结果                      "
+    echo "=================================================="
+    echo ""
+    echo "[ 吞吐量测试 ]"
+    echo "  1. TCP 正向吞吐量 (TCP_STREAM)  : $(parse_throughput "${RESULT_DIR}/tcp_stream.txt") Mbps"
+    echo "  2. TCP 反向吞吐量 (TCP_MAERTS)  : $(parse_throughput "${RESULT_DIR}/tcp_maerts.txt") Mbps"
+    echo "  3. UDP 吞吐量     (UDP_STREAM)  : $(parse_throughput "${RESULT_DIR}/udp_stream.txt") Mbps"
+    echo ""
+    echo "[ 响应时间 / 传输速率测试 (请求包大小 64B) ]"
+    echo "  4. TCP 响应速率  (TCP_RR)       : $(parse_rr_trans "${RESULT_DIR}/tcp_rr.txt") Trans/sec"
+    echo "     TCP 平均延迟  (TCP_RR)       : $(parse_rr_latency "${RESULT_DIR}/tcp_rr.txt") us"
+    echo "  5. UDP 响应速率  (UDP_RR)       : $(parse_rr_trans "${RESULT_DIR}/udp_rr.txt") Trans/sec"
+    echo "     UDP 平均延迟  (UDP_RR)       : $(parse_rr_latency "${RESULT_DIR}/udp_rr.txt") us"
+    echo ""
+    echo "=================================================="
+    echo "原始数据文件列表:"
+    echo "  env_info.txt      - 系统及网卡环境信息"
+    echo "  tcp_stream.txt    - TCP_STREAM 原始输出"
+    echo "  tcp_maerts.txt    - TCP_MAERTS 原始输出"
+    echo "  udp_stream.txt    - UDP_STREAM 原始输出"
+    echo "  tcp_rr.txt        - TCP_RR 原始输出"
+    echo "  udp_rr.txt        - UDP_RR 原始输出"
+    echo "  dmesg.log         - 内核环形缓冲区日志"
+    echo "  test_execution.log- 测试执行日志"
+    echo "结果目录: ${RESULT_DIR}"
+    echo "=================================================="
+} > "${REPORT}"
 
-# 清理 netserver (仅在测试本地时尝试停止)
+# 同步报告内容到执行日志
+cat "${REPORT}" >> "${LOG_FILE}"
+
+# 清理 netserver (仅本地测试时停止)
 if [ "${TARGET_IP}" == "127.0.0.1" ] || [ "${TARGET_IP}" == "localhost" ]; then
     pkill netserver > /dev/null 2>&1
+    log "  已停止本地 netserver"
 fi
 
-log "测试完成！"
-log "结果已保存在目录: ${RESULT_DIR}"
-chmod +x "${RESULT_DIR}"
+log "测试完成！结果目录: ${RESULT_DIR}"
+chmod -R a+rX "${RESULT_DIR}"
