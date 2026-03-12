@@ -9,77 +9,134 @@ SERVER_IP="127.0.0.1"
 DURATION=14400
 
 # 日志文件
-REPORT_FILE="$SCRIPT_DIR/iperf_test_report_${TIMESTAMP}.log"
-DMESG_LOG="$SCRIPT_DIR/dmesg_${TIMESTAMP}.log"
-MESSAGE_LOG="$SCRIPT_DIR/message_${TIMESTAMP}.log"
-BMC_LOG="$SCRIPT_DIR/bmc_${TIMESTAMP}.log"
-IPERF_RAW="$SCRIPT_DIR/iperf_raw_${TIMESTAMP}.log"
+RESULT_DIR="$SCRIPT_DIR/iperf_test_${TIMESTAMP}"
+REPORT_FILE="$RESULT_DIR/test_execution.log"
+ENV_INFO="$RESULT_DIR/env_info.txt"
+DMESG_LOG="$RESULT_DIR/dmesg.log"
+MESSAGE_LOG="$RESULT_DIR/message.log"
+BMC_LOG="$RESULT_DIR/bmc.log"
+IPERF_RAW="$RESULT_DIR/iperf_raw.log"
 
-# 全局 PID 变量
-DMESG_PID=""
-MESSAGE_PID=""
-BMC_PID=""
+mkdir -p "$RESULT_DIR"
 
-start_log_collection() {
-    dmesg -w > "$DMESG_LOG" 2>&1 &
-    DMESG_PID=$!
-    
-    tail -f /var/log/messages > "$MESSAGE_LOG" 2>&1 &
-    MESSAGE_PID=$!
-    
-    {
-        while true; do
-            echo "=== $(date) ===" >> "$BMC_LOG"
-            ipmitool sel list >> "$BMC_LOG" 2>&1
-            sleep 60
-        done
-    } &
-    BMC_PID=$!
+log() {
+    echo -e "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "${REPORT_FILE}"
 }
 
-stop_log_collection() {
-    local pids=()
-    [ -n "$DMESG_PID" ] && kill "$DMESG_PID" 2>/dev/null && pids+=("$DMESG_PID")
-    [ -n "$MESSAGE_PID" ] && kill "$MESSAGE_PID" 2>/dev/null && pids+=("$MESSAGE_PID")
-    [ -n "$BMC_PID" ] && kill "$BMC_PID" 2>/dev/null && pids+=("$BMC_PID")
-    [ ${#pids[@]} -gt 0 ] && wait "${pids[@]}" 2>/dev/null
-}
+log "=================================================="
+log "开始执行 iPerf 测试"
+log "结果目录: ${RESULT_DIR}"
+log "=================================================="
+
+# 1. 检查 iperf（先检查依赖，失败时尽早退出，避免浪费时间采集环境信息）
+log "[1/5] 检查 iPerf..."
+if ! command -v iperf &> /dev/null; then
+    log "错误: 未找到 iperf 命令，请先安装 (例如: sudo apt install iperf)"
+    exit 1
+fi
+IPERF_VER=$(iperf --version 2>&1 | head -1)
+log "  iPerf 版本: $IPERF_VER"
+
+# 2. 环境信息收集
+log "[2/5] 收集环境信息..."
+{
+    echo "===== 系统基本信息 ====="
+    uname -a
+    echo ""
+    echo "--- 内核版本 ---"
+    uname -r
+    echo ""
+    echo "--- OS Release ---"
+    [ -f /etc/os-release ] && cat /etc/os-release
+    echo ""
+    echo "===== CPU 信息 ====="
+    lscpu
+    echo ""
+    echo "===== 内存信息 ====="
+    free -h
+    echo ""
+    echo "===== 网络接口详情 ====="
+    ip addr
+    echo ""
+    echo "===== 网络接口统计 ====="
+    ip -s link
+    echo ""
+    echo "===== 网卡硬件信息 (PCI) ====="
+    lspci | grep -i ether
+    echo ""
+    echo "===== 网卡驱动信息 ====="
+    for iface in $(ip -o link show | awk -F': ' '{print $2}' | awk -F'@' '{print $1}' | grep -v lo); do
+        echo "--- ${iface} ---"
+        ethtool "${iface}" 2>/dev/null || echo "  (ethtool 不可用或无此接口信息)"
+        ethtool -i "${iface}" 2>/dev/null
+    done
+    echo ""
+    echo "===== 路由表 ====="
+    ip route
+} > "$ENV_INFO" 2>&1
+log "  环境信息已保存至 env_info.txt"
+
+# 3. 检查并启动 iperf 服务端（仅本地回环测试时自动启动）
+log "[3/5] 检查 iperf 服务端..."
+IPERF_SERVER_PID=""
+if [ "$SERVER_IP" = "127.0.0.1" ] || [ "$SERVER_IP" = "localhost" ]; then
+    if ! ss -tlnp | grep -q ":5001"; then
+        iperf -s >> "${REPORT_FILE}" 2>&1 &
+        IPERF_SERVER_PID=$!
+        sleep 1
+        log "  iperf 服务端已在端口 5001 后台启动 (PID: $IPERF_SERVER_PID)"
+    else
+        log "  iperf 服务端已在监听端口 5001，跳过启动"
+    fi
+else
+    log "  远程服务器模式，请确认 ${SERVER_IP}:5001 上 iperf -s 已启动"
+fi
+
+# 4. 执行 iPerf 测试
+# 参数说明：-c 客户端模式  -t 测试时长  -i 1 每秒输出一次报告  -f m 单位固定为 Mbits/sec
+log "[4/5] 开始执行 iPerf 测试 (服务器: ${SERVER_IP}, 时长: ${DURATION}s)..."
+iperf -c "$SERVER_IP" -t "$DURATION" -i 1 -f m > "$IPERF_RAW" 2>&1
+if [ $? -ne 0 ]; then
+    log "警告: iPerf 测试执行失败或返回非零值，请检查 $IPERF_RAW"
+fi
+
+# 停止本地 iperf 服务端（仅本脚本自行启动的情况）
+if [ -n "$IPERF_SERVER_PID" ] && kill -0 "$IPERF_SERVER_PID" 2>/dev/null; then
+    kill "$IPERF_SERVER_PID" 2>/dev/null
+    wait "$IPERF_SERVER_PID" 2>/dev/null
+    log "  已停止本地 iperf 服务端 (PID: $IPERF_SERVER_PID)"
+fi
+
+# 5. 收集系统日志
+log "[5/5] 收集系统日志..."
+dmesg > "$DMESG_LOG" 2>&1
+if [ -f /var/log/messages ]; then
+    cp /var/log/messages "$MESSAGE_LOG"
+    log "  已复制 /var/log/messages"
+elif [ -f /var/log/syslog ]; then
+    cp /var/log/syslog "$MESSAGE_LOG"
+    log "  已复制 /var/log/syslog"
+else
+    log "  警告: 未找到 /var/log/messages 或 /var/log/syslog"
+fi
+
+ipmitool sel elist > "$BMC_LOG" 2>&1 || log "  警告: ipmitool sel elist 执行失败"
 
 {
-    echo "================ iPerf 测试记录 - $(date '+%Y-%m-%d %H:%M:%S') ================"
-    echo "--- 环境记录 ---"
-    echo "内核版本: $(uname -a)"
-    echo "操作系统: $(cat /etc/os-release 2>/dev/null | grep PRETTY_NAME | cut -d'"' -f2 || echo 'N/A')"
-    echo "CPU信息: $(lscpu 2>/dev/null | grep 'Model name' | sed 's/Model name:[[:space:]]*//' || echo 'N/A')"
-    echo "内存信息: $(free -h 2>/dev/null | grep Mem | awk '{print $2}' || echo 'N/A')"
-    echo "iPerf版本: $(iperf3 --version 2>&1 | head -1 || echo 'N/A')"
-    echo "------------------------------------------------"
-    echo "服务器IP: $SERVER_IP"
-    echo "测试时长: 4小时 ($DURATION 秒)"
-    echo "测试开始时间: $(date '+%Y-%m-%d %H:%M:%S')"
-    echo "日志位置: $SCRIPT_DIR"
-    echo "------------------------------------------------"
-} >> "$REPORT_FILE" 2>&1
-
-start_log_collection
-
-iperf3 -c "$SERVER_IP" -t "$DURATION" --logfile "$IPERF_RAW" 2>&1 || true
-
-sleep 2
-stop_log_collection
-
-{
-    echo "测试结束时间: $(date '+%Y-%m-%d %H:%M:%S')"
-    echo "================================================"
+    echo ""
+    echo "=================================================="
+    echo "测试完成时间: $(date '+%Y-%m-%d %H:%M:%S')"
+    echo "结果目录: ${RESULT_DIR}"
     echo "输出文件："
-    echo "  - 测试报告: $(basename $REPORT_FILE)"
-    echo "  - dmesg日志: $(basename $DMESG_LOG)"
-    echo "  - message日志: $(basename $MESSAGE_LOG)"
-    echo "  - BMC日志: $(basename $BMC_LOG)"
-    echo "  - iPerf结果: $(basename $IPERF_RAW)"
-    echo "================================================"
+    echo "  - env_info.txt       - 系统及网卡环境信息"
+    echo "  - iperf_raw.log      - iPerf 原始输出"
+    echo "  - dmesg.log          - 内核环形缓冲区日志"
+    echo "  - message.log        - 系统日志"
+    echo "  - bmc.log            - BMC 事件日志"
+    echo "  - test_execution.log - 测试执行日志"
+    echo "=================================================="
 } >> "$REPORT_FILE" 2>&1
 
-echo "✓ iPerf 测试已完成"
-echo "✓ 所有结果已保存至: $SCRIPT_DIR"
-echo "✓ 报告文件: $(basename $REPORT_FILE)"
+log "测试已完成"
+log "所有结果已保存至: $RESULT_DIR"
+chmod -R a+rX "$RESULT_DIR"
