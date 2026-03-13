@@ -39,6 +39,15 @@ if ! command -v cpupower >/dev/null 2>&1; then
   echo "建议安装 cpupower（通常在 linux-tools 或 cpufrequtils 软件包中）并以 root 执行。"
 fi
 
+# 检查 stress 是否存在（不存在时降级为 bash busy-loop）
+HAS_STRESS=false
+if command -v stress >/dev/null 2>&1; then
+  HAS_STRESS=true
+else
+  echo "提示：未检测到 stress，压力测试将使用 bash busy-loop 代替。"
+  echo "建议安装 stress（apt install stress 或 yum install stress）以获得更准确的负载。"
+fi
+
 if [ "$(id -u)" -ne 0 ]; then
   echo "建议以 root 或通过 sudo 运行此脚本以确保能设置 governor。"
 fi
@@ -104,18 +113,78 @@ cpu_count() {
 
 cpu_stress() {
   local dur="$1"
+  local gov_name="${2:-}"
+  local sample_dur
+  sample_dur=$(( dur * 3 ))
   local n
   n=$(cpu_count)
-  echo "启动 $n 个 busy-loop 线程，持续 ${dur}s 来观察频率变化"
-  local PIDS=()
+  echo "--- 压力测试开始（governor: ${gov_name}，压力时长: ${dur}s，采样时长: ${sample_dur}s，CPU 线程: $n）---"
+
+  # 启动压力负载
+  local STRESS_PIDS=()
   local i
-  for i in $(seq 1 "$n"); do
-    ( while :; do :; done ) &
-    PIDS+=("$!")
+  if [ "$HAS_STRESS" = true ]; then
+    echo "工具: stress --cpu $n --timeout ${dur}s"
+    stress --cpu "$n" --timeout "${dur}s" >/dev/null 2>&1 &
+    STRESS_PIDS+=("$!")
+  else
+    echo "工具: bash busy-loop（$n 线程）"
+    for i in $(seq 1 "$n"); do
+      ( while :; do :; done ) &
+      STRESS_PIDS+=("$!")
+    done
+  fi
+
+  # 逐秒采样 cpu0 实时频率，采样时长完整覆盖压力+冷却阶段
+  local SAMPLES=()
+  local elapsed=0
+  local khz mhz
+  echo "实时频率采样（cpu0，每秒一次，共 ${sample_dur}s）："
+  while [ "$elapsed" -lt "$sample_dur" ]; do
+    khz=0
+    if [ -r /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq ]; then
+      khz=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq 2>/dev/null || echo 0)
+    fi
+    mhz=$(( khz / 1000 ))
+    if [ "$elapsed" -lt "$dur" ]; then
+      printf "  [%3ds/压力中] %d MHz\n" "$elapsed" "$mhz"
+    else
+      printf "  [%3ds/冷却中] %d MHz\n" "$elapsed" "$mhz"
+    fi
+    SAMPLES+=("$khz")
+    sleep 1
+    elapsed=$(( elapsed + 1 ))
+    # busy-loop 模式：到达压力时长时精确 kill（stress 工具自行 --timeout 退出）
+    if [ "$elapsed" -eq "$dur" ] && [ "$HAS_STRESS" = false ]; then
+      local _p
+      for _p in "${STRESS_PIDS[@]}"; do kill "$_p" 2>/dev/null || true; done
+    fi
   done
-  sleep "$dur"
+
+  # 清理剩余压力进程
   local p
-  for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null || true; done
+  for p in "${STRESS_PIDS[@]}"; do kill "$p" 2>/dev/null || true; done
+  if [ "${#STRESS_PIDS[@]}" -gt 0 ]; then
+    wait "${STRESS_PIDS[@]}" 2>/dev/null || true
+  fi
+
+  # 频率统计：最小 / 最大 / 平均
+  if [ "${#SAMPLES[@]}" -gt 0 ]; then
+    local min_k max_k sum_k count avg_k s
+    min_k=${SAMPLES[0]}; max_k=${SAMPLES[0]}; sum_k=0
+    count=${#SAMPLES[@]}
+    for s in "${SAMPLES[@]}"; do
+      if [ "$s" -lt "$min_k" ]; then min_k=$s; fi
+      if [ "$s" -gt "$max_k" ]; then max_k=$s; fi
+      sum_k=$(( sum_k + s ))
+    done
+    avg_k=$(( sum_k / count ))
+    echo "--- 频率统计（$count 次采样）---"
+    printf "  最小: %d MHz\n" "$(( min_k / 1000 ))"
+    printf "  最大: %d MHz\n" "$(( max_k / 1000 ))"
+    printf "  平均: %d MHz\n" "$(( avg_k / 1000 ))"
+  fi
+  echo "--- 压力测试结束 ---"
 }
 
 available=""
@@ -130,6 +199,18 @@ if [ -z "$available" ]; then
   echo "请确认 cpufreq 驱动已正确加载（cpupower frequency-info 查看详情）。" >&2
   exit 3
 fi
+
+# 输出 lscpu 一次，保存至系统信息文件
+SYSINFO_FILE="${RESULT_ROOT}/system_info_${TIMESTAMP}.txt"
+{
+  echo "========================================"
+  echo "测试时间: $(date)"
+  echo "内核版本: $(uname -r)"
+  echo "======== lscpu 输出 ========"
+  lscpu 2>/dev/null || echo "（lscpu 不可用）"
+  echo "========================================"
+} | tee "$SYSINFO_FILE"
+echo "系统信息已保存至: $SYSINFO_FILE"
 
 for gov in "${GOVS[@]}"; do
   if [[ -n "$available" && ! " $available " =~ " $gov " ]]; then
@@ -195,7 +276,7 @@ for gov in "${GOVS[@]}"; do
     grep -H . /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>/dev/null | sed -n '1,5p' || echo "（无法读取 /sys cpufreq 信息）"
 
     if [ "$STRESS" = true ]; then
-      cpu_stress "$DURATION"
+      cpu_stress "$DURATION" "$gov"
     else
       echo "未启用压力测试，等待 2s 以便观察默认行为"
       sleep 2
