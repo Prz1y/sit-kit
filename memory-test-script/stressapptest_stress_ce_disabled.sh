@@ -1,6 +1,6 @@
 #!/bin/bash
 ################################################################################
-# Memtester 加严测试脚本 (CE阈值关闭)
+# Stressapptest 加严测试脚本 (CE阈值关闭)
 #
 # 用途: 在内存错误管理加严的BIOS配置下，执行内存压力测试，自动收集日志并检查ECC错误
 #
@@ -14,19 +14,18 @@
 #       - 内存CE错误小风暴时间 = 0
 #
 # 执行流程:
-#   1. 检查memtester可执行文件（PATH中）
+#   1. 检查stressapptest可执行文件（当前目录或PATH）
 #   2. 检查BIOS配置 (BIOS版本、BMC版本、内存容量、CE阈值状态)
 #   3. 提示人工确认内存错误管理的其余BIOS项
-#   4. 运行压力测试 (默认3小时，占用90%内存)
-#   5. 收集日志 (dmesg、messages/syslog、memtester输出、BMC事件)
-#   6. 日志保存在: /tmp/memtester_test_<时间戳>/
+#   4. 运行压力测试 (默认3小时，占用94%内存，线程数=CPU核心数)
+#   5. 收集日志 (dmesg、messages/syslog、stressapptest输出、BMC事件)
+#   6. 日志保存在: /tmp/stressapptest_test_<时间戳>/
 #
 # 可调参数 (修改下方 "用户可调参数" 区域):
 #   TEST_TIME    - 测试时长（秒），默认10800（3小时）
-#   MEM_RATIO    - 内存占用比例，默认90%
 #
 # 查看ECC错误:
-#   grep -i ecc /tmp/memtester_test_<时间戳>/dmesg.log
+#   grep -i ecc /tmp/stressapptest_test_<时间戳>/dmesg.log
 ################################################################################
 
 set -euo pipefail
@@ -35,7 +34,7 @@ set -euo pipefail
 # 用户可调参数
 # ============================================================
 TEST_TIME=10800       # 测试时长（秒）：3小时=10800，1小时=3600，6小时=21600
-MEM_RATIO=0.90        # 内存占用比例，默认90%
+MEM_RATIO=0.94        # 内存占用比例，默认94%
 # ============================================================
 
 # 颜色定义
@@ -47,17 +46,42 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-LOG_DIR="/tmp/memtester_test_${TIMESTAMP}"
+LOG_DIR="/tmp/stressapptest_test_${TIMESTAMP}"
 mkdir -p "${LOG_DIR}"
 
-echo -e "${BLUE}========== Memtester 加严测试 ==========${NC}"
+echo -e "${BLUE}========== Stressapptest 加严测试 ==========${NC}"
 
-# 首先检查root权限
+# ── 检查root权限 ──────────────────────────────────────────
 if [ "$(id -u)" -ne 0 ]; then
     echo -e "${RED}需要root权限运行此脚本${NC}"
     exit 1
 fi
 
+# ── 查找stressapptest二进制文件 ──────────────────────────
+# 优先使用当前目录，其次在PATH中查找
+SAT_BIN=""
+if [ -x "./stressapptest" ]; then
+    SAT_BIN="./stressapptest"
+elif command -v stressapptest &>/dev/null; then
+    SAT_BIN="stressapptest"
+else
+    echo -e "${RED}未找到stressapptest：请将二进制文件放到当前目录，或确保其在PATH中${NC}"
+    exit 1
+fi
+echo -e "${GREEN}stressapptest已找到: ${SAT_BIN}${NC}"
+
+# ── 计算测试参数 ──────────────────────────────────────────
+cpu_cores=$(nproc)
+mem_total_mb=$(free -m | awk 'NR==2 {print $2}')
+mem_test_mb=$(awk "BEGIN {printf \"%d\", ${mem_total_mb} * ${MEM_RATIO}}")
+test_hours=$(awk "BEGIN {printf \"%.1f\", ${TEST_TIME} / 3600}")
+
+echo -e "  CPU核心数:   ${CYAN}${cpu_cores}${NC}"
+echo -e "  测试内存:    ${CYAN}${mem_test_mb} MB${NC} (总 ${mem_total_mb} MB 的 $(awk "BEGIN {printf \"%.0f\", ${MEM_RATIO}*100}")%)"
+echo -e "  测试时长:    ${CYAN}${test_hours} 小时 (${TEST_TIME} 秒)${NC}"
+echo ""
+
+# ── 检查BIOS配置 ──────────────────────────────────────────
 check_bios_config() {
     # BIOS版本
     if command -v dmidecode &>/dev/null; then
@@ -83,30 +107,14 @@ check_bios_config() {
     if [ -f /sys/devices/system/machinecheck/machinecheck0/dont_log_ce ]; then
         local dont_log
         dont_log=$(cat /sys/devices/system/machinecheck/machinecheck0/dont_log_ce 2>/dev/null)
-        if [ "$dont_log" = "0" ]; then
+        if [ "${dont_log}" = "0" ]; then
             ce_status="${GREEN}CE阈值已关闭（CE错误将被记录）${NC}"
         else
-            ce_status="${RED}CE阈值未关闭（dont_log_ce=$dont_log，应为0）${NC}"
+            ce_status="${RED}CE阈值未关闭（dont_log_ce=${dont_log}，应为0）${NC}"
         fi
     fi
-    echo -e "  CE阈值:   $(echo -e "$ce_status")"
+    echo -e "  CE阈值:   $(echo -e "${ce_status}")"
 }
-
-# ── 查找 memtester 二进制文件 ─────────────────────────────
-if ! command -v memtester &>/dev/null; then
-    echo -e "${RED}未找到memtester：请先安装（yum install memtester / apt install memtester）${NC}"
-    exit 1
-fi
-echo -e "${GREEN}memtester已找到: $(command -v memtester)${NC}"
-
-# ── 计算测试参数 ──────────────────────────────────────────
-mem_total_mb=$(free -m | awk 'NR==2 {print $2}')
-mem_test_mb=$(awk "BEGIN {printf \"%d\", ${mem_total_mb} * ${MEM_RATIO}}")
-test_hours=$(awk "BEGIN {printf \"%.1f\", ${TEST_TIME} / 3600}")
-
-echo -e "  测试内存:    ${CYAN}${mem_test_mb} MB${NC} (总 ${mem_total_mb} MB 的 $(awk "BEGIN {printf \"%.0f\", ${MEM_RATIO}*100}")%)"
-echo -e "  测试时长:    ${CYAN}${test_hours} 小时 (${TEST_TIME} 秒)${NC}"
-echo ""
 
 echo -e "${BLUE}检查BIOS配置...${NC}"
 check_bios_config
@@ -119,26 +127,31 @@ echo -e "${GREEN}dmesg缓冲区已清空${NC}"
 # ── 启动压力测试 ──────────────────────────────────────────
 echo ""
 echo -e "${BLUE}========== 启动压力测试 ==========${NC}"
-echo -e "命令: ${CYAN}timeout ${TEST_TIME} memtester ${mem_test_mb}M 0${NC}"
+echo -e "命令: ${CYAN}${SAT_BIN} -i ${cpu_cores} -C ${cpu_cores} -W -M ${mem_test_mb} -s ${TEST_TIME}${NC}"
 echo -e "开始时间: $(date)"
 echo ""
 
-MEM_LOG="${LOG_DIR}/memtester_output.log"
+SAT_LOG="${LOG_DIR}/stressapptest_output.log"
 EXIT_CODE=0
 
-# memtester 以 loops=0 无限循环，由 timeout 控制测试时长
+# stressapptest 自带计时（-s 参数），无需外部 timeout
 # tee 同时输出到终端和日志文件
-timeout "${TEST_TIME}" memtester "${mem_test_mb}M" 0 \
-    2>&1 | tee "${MEM_LOG}" || EXIT_CODE=${PIPESTATUS[0]}
+"${SAT_BIN}" \
+    -i "${cpu_cores}" \
+    -C "${cpu_cores}" \
+    -W \
+    -M "${mem_test_mb}" \
+    -s "${TEST_TIME}" \
+    2>&1 | tee "${SAT_LOG}" || EXIT_CODE=${PIPESTATUS[0]}
 
 echo ""
 echo -e "结束时间: $(date)"
 
-if [ "${EXIT_CODE}" -eq 0 ] || [ "${EXIT_CODE}" -eq 124 ]; then
-    echo -e "${GREEN}memtester 正常完成（运行 ${test_hours} 小时）${NC}"
+if [ "${EXIT_CODE}" -eq 0 ]; then
+    echo -e "${GREEN}stressapptest 正常完成（退出码: 0）${NC}"
 else
-    echo -e "${RED}memtester 异常退出（退出码: ${EXIT_CODE}）${NC}"
-    echo -e "${RED}请检查输出日志: ${MEM_LOG}${NC}"
+    echo -e "${RED}stressapptest 异常退出（退出码: ${EXIT_CODE}）${NC}"
+    echo -e "${RED}请检查输出日志: ${SAT_LOG}${NC}"
 fi
 
 # ── 收集日志 ──────────────────────────────────────────────
@@ -165,13 +178,14 @@ fi
 
 # 保存测试参数摘要
 cat > "${LOG_DIR}/test_summary.txt" <<EOF
-=== Memtester 加严测试摘要 ===
-测试时间:  $(date)
-memtester: $(command -v memtester)
-测试内存:  ${mem_test_mb} MB (共 ${mem_total_mb} MB)
-测试时长:  ${TEST_TIME} 秒 (${test_hours} 小时)
-退出码:    ${EXIT_CODE}
-日志目录:  ${LOG_DIR}
+=== Stressapptest 加严测试摘要 ===
+测试时间:     $(date)
+stressapptest: ${SAT_BIN}
+CPU核心数:    ${cpu_cores}
+测试内存:     ${mem_test_mb} MB (共 ${mem_total_mb} MB)
+测试时长:     ${TEST_TIME} 秒 (${test_hours} 小时)
+退出码:       ${EXIT_CODE}
+日志目录:     ${LOG_DIR}
 EOF
 echo -e "  test_summary.txt       → 已保存"
 
@@ -181,10 +195,10 @@ echo ""
 echo "快速检查ECC错误:"
 echo -e "  ${CYAN}grep -i ecc ${LOG_DIR}/dmesg.log${NC}"
 echo ""
-echo "查看memtester完整输出:"
-echo -e "  ${CYAN}cat ${LOG_DIR}/memtester_output.log${NC}"
+echo "查看stressapptest完整输出:"
+echo -e "  ${CYAN}cat ${LOG_DIR}/stressapptest_output.log${NC}"
 
 # 若存在内存错误则以非0退出，方便CI/自动化调用
-if [ "${EXIT_CODE}" -ne 0 ] && [ "${EXIT_CODE}" -ne 124 ]; then
+if [ "${EXIT_CODE}" -ne 0 ]; then
     exit "${EXIT_CODE}"
 fi
