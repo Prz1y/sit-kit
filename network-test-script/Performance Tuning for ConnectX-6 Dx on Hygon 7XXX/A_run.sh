@@ -22,7 +22,7 @@ CPUS_NIC2=("${CPUS_ALL[@]:$HALF}")
 echo "NIC1 ($NIC1) IRQ 绑核 CPU: ${CPUS_NIC1[*]}"
 echo "NIC2 ($NIC2) IRQ 绑核 CPU: ${CPUS_NIC2[*]}"
 
-# ★ 跳过最近邻 NUMA (共享 die, 与 IRQ 争抢内存总线), 用第 2、3 近的
+# 跳过最近邻 NUMA (共享 die, 与 IRQ 争抢内存总线), 用第 2、3 近的
 read APP_NUMA1 APP_NUMA2 <<< $(numactl -H | awk "/^ *${NIC_NUMA}:/{print}" | awk '{
     for(i=2;i<=NF;i++){node=i-2; if(node!='"$NIC_NUMA"'){d[node]=$i}}
     b1=-1;b1d=99999; b2=-1;b2d=99999; b3=-1;b3d=99999;
