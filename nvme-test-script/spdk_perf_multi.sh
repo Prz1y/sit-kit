@@ -21,14 +21,16 @@ set -uo pipefail
 SPDK_PERF="/root/spdk2409/spdk/build/bin/spdk_nvme_perf"
 SPDK_SETUP=""  # 留空则自动检测; 如 /root/spdk2409/spdk/scripts/setup.sh
 
-# 如需使用 1GB 大页（极限性能），重启前执行以下命令后修改下方 HUGEPAGE_SIZE="1GB", HUGEPAGES_PER_NUMA_NODE=8:
+#   如需使用 1GB 大页，重启前执行以下命令:
 #   sed -i 's/\(GRUB_CMDLINE_LINUX="[^"]*\)/\1 default_hugepagesz=1G hugepagesz=1G hugepages=64/' /etc/default/grub
 #   *hugepages=64 = 8个/节点 × 8个NUMA节点，对应 HUGEPAGES_PER_NUMA_NODE=8
-#   grub2-mkconfig -o /boot/efi/EFI/$(ls /boot/efi/EFI/)/grub.cfg
+#   grub2-mkconfig -o $(find /boot/efi/EFI -name grub.cfg -not -path "*/BOOT/*" | head -1)
 #   reboot
+#   重启后验证: cat /proc/cmdline | grep hugepages
+
 # 大页配置（极限性能推荐 1GB 但需重启预留，通用场景推荐 2MB）
 HUGEPAGE_SIZE="1GB"            # 可选: "2MB" 或 "1GB" (1GB 需启动时通过 GRUB 预留)
-HUGEPAGES_PER_NUMA_NODE=4096   # 2MB: 每节点 4096 个 (8GB); 1GB: 每节点 8 个 (8GB)
+HUGEPAGES_PER_NUMA_NODE=8      # 1GB: 每节点 8 个 (8GB); 2MB: 每节点 4096 个 (8GB)
 SPDK_SHM_SIZE=1024             # SPDK 共享内存大小 (MB)，对应 -s 参数
 SLEEP_BETWEEN_TESTS=60         # 测试间隔（秒）
 
@@ -176,6 +178,42 @@ setup_hugepages() {
             log_err "请手动执行: mount -t hugetlbfs -o pagesize=${pagesize_mount} nodev /dev/hugepages"
             return 1
         fi
+    fi
+
+    # 验证实际分配结果（sysfs 写入不代表内核真正分配成功）
+    local actual_total
+    actual_total=$(grep -i "^HugePages_Total:" /proc/meminfo | awk '{print $2}')
+    if [ "${actual_total:-0}" -eq 0 ] && [ "$HUGEPAGE_SIZE" = "1GB" ]; then
+        log_warn "1GB 大页实际分配为 0！(sysfs 写入被接受但内核无法分配连续 1GB 内存)"
+        log_warn "1GB 大页需在启动时通过 GRUB 预留，参考脚本顶部注释配置后重启"
+        log_warn "自动回退到 2MB 大页..."
+
+        # 回退: 切换到 2MB 大页
+        HUGEPAGE_SIZE="2MB"
+        HUGEPAGES_PER_NUMA_NODE=4096
+        hp_dir="hugepages-2048kB"
+        pagesize_mount="2M"
+
+        for node in "${all_nodes[@]}"; do
+            local hp2_path="/sys/devices/system/node/node${node}/hugepages/hugepages-2048kB/nr_hugepages"
+            [ -f "$hp2_path" ] || continue
+            local cur2
+            cur2=$(cat "$hp2_path" 2>/dev/null || echo 0)
+            if [ "$cur2" -lt 4096 ]; then
+                echo 4096 > "$hp2_path"
+                log_info "NUMA node $node: 回退 2MB hugepages -> $(cat "$hp2_path")"
+            fi
+        done
+
+        # 重新挂载 hugetlbfs 为 2M 模式
+        if mount | grep -q "/dev/hugepages"; then
+            umount /dev/hugepages 2>/dev/null || true
+        fi
+        mount -t hugetlbfs -o pagesize=2M nodev /dev/hugepages 2>/dev/null && \
+            log_info "hugetlbfs 已重新挂载 (pagesize=2M)" || \
+            log_err "hugetlbfs 2M 回退挂载失败！"
+    else
+        log_info "大页内存验证: HugePages_Total=${actual_total} (${HUGEPAGE_SIZE})"
     fi
 
     log_info "大页内存配置完成"
