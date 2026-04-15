@@ -21,8 +21,9 @@ set -uo pipefail
 SPDK_PERF="/root/spdk2409/spdk/build/bin/spdk_nvme_perf"
 SPDK_SETUP=""  # 留空则自动检测; 如 /root/spdk2409/spdk/scripts/setup.sh
 
-#   如需使用 1GB 大页，重启前执行以下命令:
+#   如需使用 1GB 大页，重启前执行以下命令: 
 #   sed -i 's/\(GRUB_CMDLINE_LINUX="[^"]*\)/\1 default_hugepagesz=1G hugepagesz=1G hugepages=64/' /etc/default/grub
+#   注：hugepages=64根据机器配置可以设置到256
 #   *hugepages=64 = 8个/节点 × 8个NUMA节点，对应 HUGEPAGES_PER_NUMA_NODE=8
 #   grub2-mkconfig -o $(find /boot/efi/EFI -name grub.cfg -not -path "*/BOOT/*" | head -1)
 #   reboot
