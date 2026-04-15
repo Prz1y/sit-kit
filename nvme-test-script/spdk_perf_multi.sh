@@ -1,6 +1,6 @@
 #!/bin/bash
 #***********************************************************
-# Standalone SPDK NVMe Performance Test Suite
+# SPDK NVMe Performance Test for hygon 7493 system
 # Author: Prz1y
 #
 # Features:
