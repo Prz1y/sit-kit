@@ -279,7 +279,7 @@ setup_spdk_driver() {
                 local new_drv
                 new_drv=$(basename "$(readlink "/sys/bus/pci/devices/${bdf}/driver" 2>/dev/null)" 2>/dev/null || echo "未绑定")
                 if [ "$new_drv" = "$target_drv" ]; then
-                    log_info "    $bdf 已成功绑定到 $target_drv ✓"
+                    log_info "    $bdf 已成功绑定到 $target_drv"
                 else
                     log_warn "    $bdf 绑定失败，当前驱动: $new_drv"
                 fi
@@ -310,9 +310,9 @@ setup_spdk_driver() {
             new_nvme_count[$numa]=$((count + 1))
             valid_bdfs+=("$bdf")
             valid_numas+=("$numa")
-            log_info "  $bdf -> 驱动: $drv_name ✓"
+            log_info "  $bdf -> 驱动: $drv_name"
         else
-            log_warn "  $bdf -> 驱动: nvme ✗ (仍绑定内核驱动，已跳过; 如需强制绑定请设置 FORCE_BIND_ALL=true)"
+            log_warn "  $bdf -> 驱动: nvme (仍绑定内核驱动，已跳过; 如需强制绑定请设置 FORCE_BIND_ALL=true)"
         fi
     done
 
