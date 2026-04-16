@@ -34,6 +34,8 @@ HUGEPAGE_SIZE="1GB"            # 可选: "2MB" 或 "1GB" (1GB 需启动时通过
 HUGEPAGES_PER_NUMA_NODE=8      # 1GB: 每节点 8 个 (8GB); 2MB: 每节点 4096 个 (8GB)
 SPDK_SHM_SIZE=1024             # SPDK 共享内存大小 (MB)，对应 -s 参数
 SLEEP_BETWEEN_TESTS=60         # 测试间隔（秒）
+FORCE_BIND_ALL=true            # true: 强制将仍绑内核 nvme 驱动的设备解绑并重绑到用户态驱动
+                               # false: 跳过无法被 setup.sh 绑定的设备（如系统盘）
 
 # ===================== 全局变量 =====================
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -239,6 +241,103 @@ setup_spdk_driver() {
         log_warn "未找到 SPDK setup.sh，请确保已手动执行过驱动绑定"
         log_warn "通常需要运行: \$SPDK_DIR/scripts/setup.sh"
     fi
+
+    # 对仍绑在内核 nvme 驱动的设备尝试强制解绑并重绑到用户态驱动
+    if [ "$FORCE_BIND_ALL" = "true" ]; then
+        # 检测其他设备使用的用户态驱动，优先复用已绑定设备的驱动类型
+        local target_drv="uio_pci_generic"
+        for bdf in "${NVME_BDFS[@]}"; do
+            local drv
+            drv=$(basename "$(readlink "/sys/bus/pci/devices/${bdf}/driver" 2>/dev/null)" 2>/dev/null || true)
+            if [[ "$drv" == "vfio-pci" || "$drv" == "uio_pci_generic" ]]; then
+                target_drv="$drv"
+                break
+            fi
+        done
+        log_info "强制绑定模式: 目标用户态驱动 = $target_drv"
+        modprobe "$target_drv" 2>/dev/null || true
+
+        for bdf in "${NVME_BDFS[@]}"; do
+            local sysfs_drv="/sys/bus/pci/devices/${bdf}/driver"
+            local drv_name=""
+            [ -L "$sysfs_drv" ] && drv_name=$(basename "$(readlink "$sysfs_drv")")
+            if [ "$drv_name" = "nvme" ]; then
+                log_warn "  $bdf 仍绑定 nvme 驱动，尝试强制解绑并绑到 $target_drv ..."
+                echo "$bdf" > "/sys/bus/pci/devices/${bdf}/driver/unbind" 2>/dev/null || {
+                    log_warn "    解绑失败（设备可能正在被挂载使用），跳过"
+                    continue
+                }
+                echo "$target_drv" > "/sys/bus/pci/devices/${bdf}/driver_override" 2>/dev/null || true
+                echo "$bdf" > "/sys/bus/pci/drivers/${target_drv}/bind" 2>/dev/null || {
+                    local vendor device
+                    vendor=$(cat "/sys/bus/pci/devices/${bdf}/vendor" 2>/dev/null || echo "")
+                    device=$(cat "/sys/bus/pci/devices/${bdf}/device" 2>/dev/null || echo "")
+                    if [ -n "$vendor" ] && [ -n "$device" ]; then
+                        echo "${vendor#0x} ${device#0x}" > "/sys/bus/pci/drivers/${target_drv}/new_id" 2>/dev/null || true
+                    fi
+                }
+                local new_drv
+                new_drv=$(basename "$(readlink "/sys/bus/pci/devices/${bdf}/driver" 2>/dev/null)" 2>/dev/null || echo "未绑定")
+                if [ "$new_drv" = "$target_drv" ]; then
+                    log_info "    $bdf 已成功绑定到 $target_drv ✓"
+                else
+                    log_warn "    $bdf 绑定失败，当前驱动: $new_drv"
+                fi
+            fi
+        done
+    fi
+
+    # 验证每个已发现的 NVMe 设备是否成功绑定到用户态驱动
+    # FORCE_BIND_ALL=false 时，仍绑内核 nvme 驱动的设备（如系统盘）会被自动剔除
+    log_info "验证设备驱动绑定状态..."
+    local valid_bdfs=()
+    local valid_numas=()
+    declare -A new_nvme_count=()
+    declare -A new_nvme_idx=()
+
+    for ((i=0; i<${#NVME_BDFS[@]}; i++)); do
+        local bdf=${NVME_BDFS[$i]}
+        local numa=${NVME_NUMA[$i]}
+        local sysfs_path="/sys/bus/pci/devices/${bdf}/driver"
+        local drv_name=""
+        if [ -L "$sysfs_path" ]; then
+            drv_name=$(basename "$(readlink "$sysfs_path")")
+        fi
+
+        if [[ "$drv_name" != "nvme" ]]; then
+            local count=${new_nvme_count[$numa]:-0}
+            new_nvme_idx[$bdf]=$count
+            new_nvme_count[$numa]=$((count + 1))
+            valid_bdfs+=("$bdf")
+            valid_numas+=("$numa")
+            log_info "  $bdf -> 驱动: $drv_name ✓"
+        else
+            log_warn "  $bdf -> 驱动: nvme ✗ (仍绑定内核驱动，已跳过; 如需强制绑定请设置 FORCE_BIND_ALL=true)"
+        fi
+    done
+
+    if [ ${#valid_bdfs[@]} -eq 0 ]; then
+        log_err "没有任何 NVMe 设备成功绑定到用户态驱动！"
+        log_err "请检查 SPDK setup.sh 输出，或手动绑定设备"
+        exit 1
+    fi
+
+    if [ ${#valid_bdfs[@]} -lt ${#NVME_BDFS[@]} ]; then
+        log_warn "已从 ${#NVME_BDFS[@]} 个设备中过滤掉 $(( ${#NVME_BDFS[@]} - ${#valid_bdfs[@]} )) 个未绑定设备"
+        # 更新全局数组
+        NVME_BDFS=("${valid_bdfs[@]}")
+        NVME_NUMA=("${valid_numas[@]}")
+        NUMA_NVME_COUNT=()
+        NUMA_NVME_IDX=()
+        for key in "${!new_nvme_count[@]}"; do
+            NUMA_NVME_COUNT[$key]=${new_nvme_count[$key]}
+        done
+        for key in "${!new_nvme_idx[@]}"; do
+            NUMA_NVME_IDX[$key]=${new_nvme_idx[$key]}
+        done
+        # 清空预计算缓存（设备列表已变）
+        ALLOC_CACHE=()
+    fi
 }
 
 # ===================== 系统性能调优 =====================
@@ -296,7 +395,7 @@ discover_topology() {
     log_step "发现 NVMe 设备和 NUMA 拓扑"
 
     local idx=0
-    for bdf in $(lspci 2>/dev/null | grep -i "Non-Volatile memory controller" | awk '{print $1}'); do
+    for bdf in $(lspci -D 2>/dev/null | grep -i "Non-Volatile memory controller" | awk '{print $1}'); do
         local numa
         numa=$(lspci -s "$bdf" -vvv 2>/dev/null | grep -i "NUMA node" | awk '{print $NF}')
         [ -z "$numa" ] && numa=0
@@ -468,8 +567,9 @@ run_spdk_test() {
         hex_mask=$(echo "$result" | awk '{print $2}')
         actual_count=$(echo "$result" | awk '{print $3}')
 
-        log_info "  $bdf -> cores [$core_csv] (${actual_count}核) mask $hex_mask"
+        log_info "  $bdf -> cores [$core_csv] (${actual_count}核) mask $hex_mask (instance $i)"
 
+        # -i $i: 为每个实例指定唯一的 EAL 共享内存 ID，避免多进程并行时相互冲突
         # 用进程替换确保 $! 捕获的是 SPDK 的 PID（而非 tee 的 PID）
         $SPDK_PERF \
             -q "$iodepth" \
@@ -478,6 +578,7 @@ run_spdk_test() {
             -t "$runtime" \
             -c "$hex_mask" \
             -o "$io_size" \
+            -i "$i" \
             -r "trtype:PCIe traddr:${bdf}" \
             > >(tee -a "$log_file") 2>&1 &
         pids+=($!)
