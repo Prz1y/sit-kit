@@ -17,6 +17,13 @@ log() {
     echo -e "$1" | tee -a "$LOG_FILE"
 }
 
+# --- 检查 root 权限（drop_caches 必需） ---
+if [ "$EUID" -ne 0 ]; then
+    log "错误: 此脚本需要 root 权限执行 (需要 echo 3 > /proc/sys/vm/drop_caches)"
+    log "请使用: sudo bash $0"
+    exit 1
+fi
+
 log "==========================================="
 log "磁盘同盘拷贝测试开始 - $TIMESTAMP"
 log "测试文件大小: $FILE_SIZE"
@@ -25,27 +32,26 @@ log "==========================================="
 # 1. 生成测试文件 (如果不存在)
 if [ ! -f "$TEST_FILE" ]; then
     log "[1/3] 正在生成 $FILE_SIZE 的测试文件..."
-    # 使用 fallocate 快速分配空间，或者 dd 生成真实数据
     dd if=/dev/zero of="$TEST_FILE" bs=1M count=10240 status=progress 2>&1 | tee -a "$LOG_FILE"
     sync
 else
     log "[1/3] 测试文件已存在，跳过创建。"
 fi
 
-# 2. 清除系统缓存 (必须 sudo，否则测试结果不准)
-log "\n[2/3] 正在清除系统缓存 (需要 sudo 权限)..."
-sudo sync && echo 3 | sudo tee /proc/sys/vm/drop_caches > /dev/null
+# 2. 清除系统缓存
+log "[2/3] 正在清除系统缓存..."
+sync && echo 3 > /proc/sys/vm/drop_caches
 log "缓存已清除。"
 
 # 3. 开始拷贝测试并计时
-log "\n[3/3] 开始拷贝文件..."
+log "[3/3] 开始拷贝文件..."
 log "命令: cp $TEST_FILE $COPY_FILE && sync"
 
-# 使用 time 命令记录耗时，注意 time 的输出通常重定向到 stderr
-{ time ( cp "$TEST_FILE" "$COPY_FILE" && sync ) ; } 2>> "$LOG_FILE"
+# time 输出到 stderr，cp stdout 单独捕获
+{ time ( cp "$TEST_FILE" "$COPY_FILE" && sync ) ; } >> "$LOG_FILE" 2>&1
 
 # 4. 计算并输出简要总结
-log "\n-------------------------------------------"
+log "-------------------------------------------"
 log "测试完成！"
 log "详细计时结果已保存至: $LOG_FILE"
 log "运行以下命令删除测试文件:"

@@ -5,8 +5,28 @@ SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
 # 用户配置（直接修改这里）
-SERVER_IP="127.0.0.1"
+SERVER_IP=""                  # 必填: 服务端IP地址，回环地址(127.0.0.1)走内核虚拟网卡，不测物理网卡
 DURATION=14400
+IPERF_FORMAT="m"              # iperf -f 单位: m=Mbps, g=Gbps; 高速网卡(>=10Gbps)建议 g
+
+# 参数校验
+if [ -z "$SERVER_IP" ]; then
+    echo "错误: SERVER_IP 未设置"
+    echo "用法: 编辑脚本，将 SERVER_IP 设为目标服务端IP"
+    echo "注意: 127.0.0.1 为回环接口，测试结果不反映物理网卡性能"
+    exit 1
+fi
+
+if [ "$SERVER_IP" = "127.0.0.1" ] || [ "$SERVER_IP" = "localhost" ]; then
+    echo "警告: SERVER_IP=$SERVER_IP 为回环接口"
+    echo "测试走内核虚拟网卡(lo)，吞吐量反映CPU/内存上限，非物理网卡性能"
+    echo ""
+    read -p "确认继续？(y/N): " confirm
+    if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+        echo "已取消"
+        exit 1
+    fi
+fi
 
 # 日志文件
 RESULT_DIR="$SCRIPT_DIR/iperf_test_${TIMESTAMP}"
@@ -25,6 +45,7 @@ log() {
 
 log "=================================================="
 log "开始执行 iPerf 测试"
+log "服务器: ${SERVER_IP}, 时长: ${DURATION}s, 单位: ${IPERF_FORMAT}"
 log "结果目录: ${RESULT_DIR}"
 log "=================================================="
 
@@ -93,9 +114,9 @@ else
 fi
 
 # 4. 执行 iPerf 测试
-# 参数说明：-c 客户端模式  -t 测试时长  -i 1 每秒输出一次报告  -f m 单位固定为 Mbits/sec
+# 参数说明：-c 客户端模式  -t 测试时长  -i 1 每秒输出一次报告  -f 单位
 log "[4/5] 开始执行 iPerf 测试 (服务器: ${SERVER_IP}, 时长: ${DURATION}s)..."
-iperf -c "$SERVER_IP" -t "$DURATION" -i 1 -f m > "$IPERF_RAW" 2>&1
+iperf -c "$SERVER_IP" -t "$DURATION" -i 1 -f "$IPERF_FORMAT" > "$IPERF_RAW" 2>&1
 if [ $? -ne 0 ]; then
     log "警告: iPerf 测试执行失败或返回非零值，请检查 $IPERF_RAW"
 fi

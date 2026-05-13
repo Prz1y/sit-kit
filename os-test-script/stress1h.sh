@@ -14,7 +14,6 @@ mkdir -p "${OUTDIR}" || { echo "无法创建输出目录 ${OUTDIR}"; exit 1; }
 log() { echo "[$(date +'%F %T')] $*"; }
 
 collect_bmc_logs() {
-	# 收集 BMC 信息，依赖 ipmitool（若不可用则记录缺失）
 	if command -v ipmitool >/dev/null 2>&1; then
 		log "收集 BMC: mc info"
 		ipmitool mc info > "${OUTDIR}/bmc_mc_info.txt" 2>&1 || true
@@ -31,7 +30,6 @@ collect_system_logs() {
 	dmesg -T > "${OUTDIR}/dmesg.txt" 2>&1 || true
 	log "收集 journalctl (本次启动)"
 	journalctl -b --no-pager > "${OUTDIR}/journalctl_boot.txt" 2>&1 || true
-	# 常见日志文件
 	[ -f /var/log/messages ] && cp -a /var/log/messages "${OUTDIR}/messages" || true
 	[ -f /var/log/syslog ] && cp -a /var/log/syslog "${OUTDIR}/syslog" || true
 	[ -f /var/log/kern.log ] && cp -a /var/log/kern.log "${OUTDIR}/kern.log" || true
@@ -61,10 +59,20 @@ trap 'on_exit_collect "SIGINT/SIGTERM/Caught"' INT TERM
 log "测试开始，输出目录: ${OUTDIR}"
 echo "start_time=$(date +%F_%T)" > "${RECORD_FILE}"
 
-# 启动 stress（请根据服务器情况调整参数）
 if ! command -v stress >/dev/null 2>&1; then
 	echo "请先安装 stress，Debian/Ubuntu: apt install stress" > "${OUTDIR}/error_install_stress.txt"
 	save_record "FAIL" "缺少 stress"
+	exit 1
+fi
+
+# 检查 stress --hdd 的工作目录是否在 tmpfs 上；tmpfs 不产生真实磁盘 I/O
+HDD_WORK_DIR="."
+hdd_fstype=$(df -T "$HDD_WORK_DIR" 2>/dev/null | awk 'NR==2 {print $2}')
+if [ "$hdd_fstype" = "tmpfs" ]; then
+	log "警告: 当前工作目录($HDD_WORK_DIR)文件系统为 tmpfs"
+	log "stress --hdd 在 tmpfs 上不产生真实磁盘 I/O，测试无效"
+	log "切换到有真实磁盘的目录执行本脚本，例如 cd /tmp/test_dir && bash $0"
+	save_record "FAIL" "工作目录为 tmpfs，--hdd 测试无效"
 	exit 1
 fi
 
@@ -76,25 +84,35 @@ log "stress PID=${STRESS_PID}"
 
 # 监控循环：每 CHECK_INTERVAL 秒检查本机响应与收集快照日志
 SECONDS_BEFORE=$(cat /proc/uptime | awk '{print $1}')
-end_time=$(( $(date +%s) + 3600 ))  # 1 小时
+end_time=$(( $(date +%s) + 3600 ))
 failed=0
 
 while kill -0 "${STRESS_PID}" 2>/dev/null; do
 	sleep "${CHECK_INTERVAL}"
-	# 简单健康检查：执行一个简单命令
-	if ! whoami >/dev/null 2>&1; then
+
+	# 健康检查：whoami 可能因瞬时 fork 失败而返回错误
+	# 高负载下 fork 失败不代表系统无响应，重试 3 次再判定
+	local whoami_ok=0
+	for _ in 1 2 3; do
+		if whoami >/dev/null 2>&1; then
+			whoami_ok=1
+			break
+		fi
+		sleep 2
+	done
+	if [ "$whoami_ok" -eq 0 ]; then
 		failed=1
-		on_exit_collect "无法执行基本命令，可能系统无响应"
+		on_exit_collect "3次whoami均失败，可能系统无响应"
 		break
 	fi
-	# 检查 /proc/uptime 是否正常增长
+
 	SECONDS_NOW=$(cat /proc/uptime 2>/dev/null | awk '{print $1}')
 	if [ -z "${SECONDS_NOW}" ]; then
 		failed=1
 		on_exit_collect "无法读取 /proc/uptime"
 		break
 	fi
-	# 使用 bc 进行浮点数比较（若无 bc 则用整数比较）
+
 	if command -v bc >/dev/null 2>&1; then
 		diff=$(echo "${SECONDS_NOW} - ${SECONDS_BEFORE}" | bc)
 		if [ "$(echo "${diff} < 30" | bc)" -eq 1 ]; then
@@ -103,7 +121,6 @@ while kill -0 "${STRESS_PID}" 2>/dev/null; do
 			collect_bmc_logs
 		fi
 	else
-		# 整数比较备选方案
 		diff_int=$(( ${SECONDS_NOW%.*} - ${SECONDS_BEFORE%.*} ))
 		if [ "${diff_int}" -lt 30 ]; then
 			log "警告: /proc/uptime 增长缓慢(${diff_int}s)，记录快照"
@@ -111,29 +128,25 @@ while kill -0 "${STRESS_PID}" 2>/dev/null; do
 			collect_bmc_logs
 		fi
 	fi
-	# 定期收集 dmesg 快照
+
 	dmesg -T 2>/dev/null | tail -n 200 > "${OUTDIR}/dmesg_snapshot_$(date +%Y%m%d_%H%M%S).txt" 2>&1 || true
 	SECONDS_BEFORE="${SECONDS_NOW}"
-	# 超时另作判断（容错）
 	if [ "$(date +%s)" -ge "${end_time}" ]; then
 		log "达到预定测试时长"
 		break
 	fi
 done
 
-# 如果循环正常结束且 stress 仍运行，等待其结束
 if kill -0 "${STRESS_PID}" 2>/dev/null; then
 	wait "${STRESS_PID}" || true
 fi
 
-# 检查是否有失败标记
 if [ "${failed}" -eq 1 ]; then
 	log "检测到失败，退出码非零"
 	echo "end_time=$(date +%F_%T)" >> "${RECORD_FILE}"
 	exit 1
 fi
 
-# 收集最终日志并写入记录
 log "测试完成，收集最终日志"
 collect_system_logs
 collect_bmc_logs

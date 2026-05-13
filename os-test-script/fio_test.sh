@@ -7,6 +7,7 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 # 用户配置（直接修改这里）
 TARGET_DEVICE="/dev/sdb"
 DURATION=14400
+FIO_SIZE="100G"               # 测试数据范围 per job；大容量盘建议设为全盘容量或更大
 
 # 日志文件
 REPORT_FILE="$SCRIPT_DIR/fio_test_report_${TIMESTAMP}.log"
@@ -19,6 +20,50 @@ FIO_RESULT="$SCRIPT_DIR/fio_result_${TIMESTAMP}.log"
 DMESG_PID=""
 MESSAGE_PID=""
 BMC_PID=""
+
+check_device_safety() {
+    local dev="$1"
+    local dev_name="${dev##*/}"
+
+    if [ ! -b "$dev" ]; then
+        echo "错误: 设备 $dev 不存在或不是块设备"
+        exit 1
+    fi
+
+    # 检查是否被挂载为根分区
+    local root_dev
+    root_dev=$(findmnt -n -o SOURCE / 2>/dev/null || true)
+    if [ -n "$root_dev" ]; then
+        local root_real dev_real
+        root_real=$(readlink -f "$root_dev" 2>/dev/null || echo "$root_dev")
+        dev_real=$(readlink -f "$dev" 2>/dev/null || echo "$dev")
+        if [ "$root_real" = "$dev_real" ]; then
+            echo "错误: $dev 是系统根分区，无法安全测试"
+            exit 1
+        fi
+    fi
+
+    # 检查设备是否有任何挂载点
+    local mounts
+    mounts=$(lsblk -n -o MOUNTPOINT "$dev" 2>/dev/null | grep -v '^$' || true)
+    if [ -n "$mounts" ]; then
+        echo "警告: $dev 存在挂载点，继续测试将破坏数据："
+        echo "$mounts"
+        echo ""
+        read -p "确认继续？(y/N): " confirm
+        if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+            echo "已取消"
+            exit 1
+        fi
+    fi
+
+    # 获取设备容量信息
+    local dev_size_human
+    dev_size_human=$(lsblk -d -n -o SIZE "$dev" 2>/dev/null | tr -d ' ')
+    echo "设备 $dev 容量: ${dev_size_human:-未知}"
+}
+
+check_device_safety "$TARGET_DEVICE"
 
 start_log_collection() {
     dmesg -w > "$DMESG_LOG" 2>&1 &
@@ -39,7 +84,13 @@ start_log_collection() {
 
 stop_log_collection() {
     local pids=()
-    [ -n "$DMESG_PID" ] && kill "$DMESG_PID" 2>/dev/null && pids+=("$DMESG_PID")
+    # dmesg -w 在旧内核上可能不响应 SIGTERM，先 TERM 再 KILL 兜底
+    if [ -n "$DMESG_PID" ]; then
+        kill "$DMESG_PID" 2>/dev/null
+        sleep 1
+        kill -0 "$DMESG_PID" 2>/dev/null && kill -9 "$DMESG_PID" 2>/dev/null
+        pids+=("$DMESG_PID")
+    fi
     [ -n "$MESSAGE_PID" ] && kill "$MESSAGE_PID" 2>/dev/null && pids+=("$MESSAGE_PID")
     [ -n "$BMC_PID" ] && kill "$BMC_PID" 2>/dev/null && pids+=("$BMC_PID")
     [ ${#pids[@]} -gt 0 ] && wait "${pids[@]}" 2>/dev/null
@@ -56,7 +107,8 @@ stop_log_collection() {
     echo "磁盘信息: $(lsblk -d -n -o NAME,SIZE 2>/dev/null | grep -E "^${TARGET_DEVICE##*/}" || echo 'N/A')"
     echo "------------------------------------------------"
     echo "测试设备: $TARGET_DEVICE"
-    echo "测试时长: 4小时 ($DURATION 秒)"
+    echo "测试数据范围: $FIO_SIZE (每个 job)"
+    echo "测试时长: $(( DURATION / 3600 ))小时 ($DURATION 秒)"
     echo "测试开始时间: $(date '+%Y-%m-%d %H:%M:%S')"
     echo "日志位置: $SCRIPT_DIR"
     echo "------------------------------------------------"
@@ -64,7 +116,7 @@ stop_log_collection() {
 
 start_log_collection
 
-fio --name=rw_test --rw=randrw --rwmixread=70 --bs=4k --size=10G \
+fio --name=rw_test --rw=randrw --rwmixread=70 --bs=4k --size="$FIO_SIZE" \
     --numjobs=4 --runtime="$DURATION" --time_based --group_reporting \
     --filename="$TARGET_DEVICE" --output="$FIO_RESULT" 2>&1 || true
 

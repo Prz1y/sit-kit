@@ -42,9 +42,19 @@ free -h
 echo ""
 cat /proc/meminfo | grep MemAvailable
 
-# 计算可用于测试的内存大小（留出1GB给系统）
+# 计算可用于测试的内存大小
+# 预留至少1GB或总内存的5%（取较大值），防止OOM killer触发
 AVAILABLE_KB=$(grep MemAvailable /proc/meminfo | awk '{print $2}')
-RESERVE_KB=$((1024*1024))  # 1GB reserve
+TOTAL_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+RESERVE_MIN_KB=$((1024*1024))                         # 1GB 最小预留
+RESERVE_PCT_KB=$((TOTAL_KB * 5 / 100))                 # 总内存的 5%
+if [ "$RESERVE_PCT_KB" -gt "$RESERVE_MIN_KB" ]; then
+    RESERVE_KB=$RESERVE_PCT_KB
+else
+    RESERVE_KB=$RESERVE_MIN_KB
+fi
+echo "Reserving $((RESERVE_KB / 1024)) MB for system ($((RESERVE_KB * 100 / TOTAL_KB))% of total)"
+
 TEST_KB=$((AVAILABLE_KB - RESERVE_KB))
 if [ $TEST_KB -lt 524288 ]; then  # 小于512MB
     echo "ERROR: Not enough memory available for testing"
@@ -66,7 +76,6 @@ echo "Step 2: Clear System Log Before Test"
 echo "--------------------------------------------------"
 echo "[Step 2] Clearing system log before test..."
 dmesg -C 2>/dev/null || echo "Unable to clear dmesg (need root)"
-# Don't truncate /var/log/messages directly, just note the start time
 echo "Test started at $(date)" > "$LOG_DIR/test_start_marker.txt"
 
 echo "--------------------------------------------------"
@@ -183,7 +192,6 @@ echo "============================================================"
 echo " Test completed. Result: $TEST_RESULT"
 echo "============================================================"
 
-# 显示日志位置摘要
 echo ""
 echo "Log Files Summary:"
 echo "=================="

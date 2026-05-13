@@ -44,7 +44,7 @@ HAS_STRESS=false
 if command -v stress >/dev/null 2>&1; then
   HAS_STRESS=true
 else
-  echo "提示：未检测到 stress，压力测试将使用 bash busy-loop 代替。"
+  echo "提示：未检测到 stress，压力测试将使用 bash busy-loop 代替（效率低，无法达到100% CPU）。"
   echo "建议安装 stress（apt install stress 或 yum install stress）以获得更准确的负载。"
 fi
 
@@ -105,6 +105,8 @@ restore() {
     fi
   fi
 }
+# 注意：trap EXIT 不响应 SIGKILL(kill -9)，
+# 如果脚本被 force kill，governor 不会自动恢复，需手动重置
 trap restore EXIT
 
 cpu_count() {
@@ -288,7 +290,7 @@ for gov in "${GOVS[@]}"; do
     else
       echo "检查 /sys 获取频率（cpu0）:"
       if [ -r /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq ]; then
-        awk '{print $1/1000 " kHz"}' /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq 2>/dev/null || true
+        awk '{print $1/1000 " MHz"}' /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq 2>/dev/null || true
       fi
     fi
     echo "--- $gov 测试结束 ---"
