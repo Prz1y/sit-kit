@@ -17,12 +17,10 @@ if [ ! -b "$DEV" ]; then
     exit 1
 fi
 
-local root_dev
 root_dev=$(findmnt -n -o SOURCE / 2>/dev/null || true)
 if [ -n "$root_dev" ]; then
-    local root_real dev_real
     root_real=$(readlink -f "$root_dev" 2>/dev/null || echo "$root_dev")
-    dev_real=$(readlink -f "$dev" 2>/dev/null || echo "$dev")
+    dev_real=$(readlink -f "$DEV" 2>/dev/null || echo "$DEV")
     if [ "$root_real" = "$dev_real" ]; then
         echo "错误: $DEV 是系统根分区，无法安全测试"
         exit 1

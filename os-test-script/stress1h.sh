@@ -92,7 +92,7 @@ while kill -0 "${STRESS_PID}" 2>/dev/null; do
 
 	# 健康检查：whoami 可能因瞬时 fork 失败而返回错误
 	# 高负载下 fork 失败不代表系统无响应，重试 3 次再判定
-	local whoami_ok=0
+	whoami_ok=0
 	for _ in 1 2 3; do
 		if whoami >/dev/null 2>&1; then
 			whoami_ok=1
