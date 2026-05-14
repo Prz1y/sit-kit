@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# 设置为中文环境以触发中文报错“未找到命令”
+# 设置为中文环境以触发中文报错"未找到命令"
 export LC_ALL=zh_CN.UTF-8
 export LANG=zh_CN.UTF-8
 
@@ -20,11 +20,8 @@ run_test() {
     shift
     local cmds=("$@")
 
-    # 1. 创建对应的结果文件夹
     mkdir -p "$folder_name"
     local log_file="${folder_name}/execution.log"
-
-    # 清空并初始化日志文件
     : > "$log_file"
 
     echo "正在执行测试并生成日志: ${folder_name}/execution.log ..."
@@ -32,30 +29,35 @@ run_test() {
     echo "系统内核版本 (uname -r): $OS_KERNEL" >> "$log_file"
     echo "==================================================" >> "$log_file"
 
-    # 2. 遍历执行每一个命令
     for cmd in "${cmds[@]}"; do
-        # 记录具体的执行指令
         echo "--------------------------------------------------" >> "$log_file"
         echo "执行指令: $cmd --help" >> "$log_file"
         echo "--------------------------------------------------" >> "$log_file"
 
-        # 执行 [命令名称] --help，将标准输出和标准错误全部追加到日志中
         $cmd --help >> "$log_file" 2>&1
         echo "" >> "$log_file"
     done
 
-    # 3. 自动化测试检查逻辑 (直接检查生成的日志文件)
+    # 自动化检查：搜索"未找到命令"、"command not found"、"Permission denied"
     echo "==================================================" >> "$log_file"
-    # 搜索日志中是否出现“未找到命令”或英文系统的“command not found”
+    local test_failed=0
     if grep -Eiq "未找到命令|command not found" "$log_file"; then
-        echo "自动化测试结论: 测试不通过，检查结果日志中发现了“未找到命令”关键字。" >> "$log_file"
-    else
-        echo "自动化测试：程序成功执行完成，检查结果日志中不包含“未找到命令”关键字" >> "$log_file"
+        echo "自动化测试结论: 测试不通过，日志中发现'未找到命令'或'command not found'。" >> "$log_file"
+        test_failed=1
+    fi
+    if grep -q "Permission denied" "$log_file"; then
+        echo "警告: 日志中发现'Permission denied'，部分命令因权限不足未正常执行（如 fdisk）" >> "$log_file"
+        # 权限问题不影响"命令存在"的判定，仅记录警告
+    fi
+    if [ "$test_failed" -eq 0 ]; then
+        echo "自动化测试：程序成功执行完成，日志中不包含'未找到命令'或'command not found'关键字" >> "$log_file"
     fi
 }
 
 echo "开始执行系统命令探测自动化测试..."
 echo "当前内核版本: $OS_KERNEL"
+echo "说明: 本脚本仅检测命令是否存在(通过--help)，不验证命令实际功能是否正常"
+echo "      权限不足导致的'Permission denied'视为警告，不视为失败"
 echo "--------------------------------------------------"
 
 run_test "01_TestResult_File_And_Disk" "${group1[@]}"

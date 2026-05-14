@@ -35,7 +35,7 @@ def parse_iozone(file_path, label, size_gb):
             
         for line in lines:
             parts = line.split()
-            # Find the line for 16M record size
+            # Find the line for 16M record size (16384 KB)
             if len(parts) >= 8 and parts[1] == '16384':
                 seq_write = float(parts[2]) / 1024
                 seq_read = float(parts[4]) / 1024
@@ -81,6 +81,23 @@ EOF
 echo "Test Group (16M Block),File Size (GB),Seq Read (MB/s),Seq Write (MB/s),Rand Read (MB/s),Rand Write (MB/s)" > "$CSV_FILE"
 
 # 2. Define the Test Execution Function
+get_free_space_gb() {
+    # 兼容 df -BG 可能输出 GB、T 等单位，统一转换为 GB
+    local raw
+    raw=$(df -BG "$TEST_DIR" | awk 'NR==2 {print $4}' | sed 's/G//')
+    # 如果 raw 包含 T（TB 级别），乘以 1024
+    local t_check
+    t_check=$(df -BG "$TEST_DIR" | awk 'NR==2 {print $4}' | grep -o '[Tt]' || true)
+    if [ -n "$t_check" ]; then
+        # 提取数字部分，转换为 GB
+        local tb_val
+        tb_val=$(df -B1G "$TEST_DIR" | awk 'NR==2 {print $4}')
+        echo "${tb_val:-0}"
+    else
+        echo "${raw:-0}"
+    fi
+}
+
 run_test() {
     local label=$1
     local size_gb=$2
@@ -90,8 +107,9 @@ run_test() {
     echo "[START] Preparing test: [$label], File size: ${size_gb} GB"
     
     # Check free disk space in /home
-    local free_space_gb=$(df -BG "$TEST_DIR" | awk 'NR==2 {print $4}' | sed 's/G//')
-    if [ "$free_space_gb" -lt "$size_gb" ]; then
+    local free_space_gb
+    free_space_gb=$(get_free_space_gb)
+    if [ "$free_space_gb" -lt "$size_gb" ] 2>/dev/null; then
         echo "[ERROR] Insufficient disk space! Free: ${free_space_gb} GB, Required: ${size_gb} GB."
         echo "[ERROR] Skipping [$label] test to prevent disk overflow."
         echo "$label,$size_gb,Skipped,Skipped,Skipped,Skipped" >> "$CSV_FILE"
@@ -101,7 +119,7 @@ run_test() {
     echo "[INFO] Disk space is sufficient (${free_space_gb} GB free)."
     echo "[INFO] Running Iozone benchmark. This will take a long time, please wait..."
     
-    # Core Iozone command
+    # Core Iozone command (record size = 16M, same as Python parser expects)
     iozone -r 16m -s ${size_gb}g -i 0 -i 1 -i 2 -e -f "$TEST_FILE" -R > "$raw_log" 2>/dev/null
     
     # Parse results using Python
@@ -141,13 +159,11 @@ fi
 
 # Check if Excel generation was successful
 if [ $? -eq 0 ] && [ -f "$EXCEL_FILE" ]; then
-    # Excel created successfully, safe to delete the CSV backup
     rm -f "$CSV_FILE"
 else
     echo "[WARNING] Excel generation failed. The raw CSV backup has been kept at: $CSV_FILE"
 fi
 
-# Clean up Python scripts
 rm -f "$PYTHON_PARSER" "$PYTHON_EXCEL"
 
 echo -e "\n======================================================================"

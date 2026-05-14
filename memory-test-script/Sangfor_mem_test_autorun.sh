@@ -8,6 +8,36 @@ cd common-all-all-server-hw-eccmem
 LOG_DIR="../test_logs_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$LOG_DIR"
 
+stop_pid() {
+  local name="$1"
+  local pid="$2"
+
+  [ -z "$pid" ] && return 0
+  if ! kill -0 "$pid" 2>/dev/null; then
+    return 0
+  fi
+
+  echo "[$(date)] 停止 ${name}，PID=${pid}"
+  kill "$pid" 2>/dev/null || true
+
+  for _ in 1 2 3; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      return 0
+    fi
+    sleep 1
+  done
+
+  echo "[$(date)] ${name} 未正常退出，执行强制终止"
+  kill -9 "$pid" 2>/dev/null || true
+}
+
+cleanup_processes() {
+  stop_pid "messages 监控" "${MESSAGES_PID:-}"
+  stop_pid "dmesg 监控" "$DMESG_PID"
+  stop_pid "ECC 压测" "$ECCMEM_PID"
+  stop_pid "BMC 采集" "$BMC_PID"
+}
+
 echo "[$(date)] ========== ECC 内存压测开始 =========="
 
 # 1. 配置脚本持续运行
@@ -52,6 +82,14 @@ echo "日志位置: $LOG_DIR"
 echo "运行时间: 3 小时"
 echo ""
 
+on_interrupt() {
+  echo "[$(date)] 收到中断信号，开始清理后台任务"
+  cleanup_processes
+  exit 130
+}
+
+trap on_interrupt INT TERM
+
 # 6. 等待 ECC 压测完成（3小时后 timeout 会自动终止）
 echo "[$(date)] 等待压测完成（3小时）..."
 wait $ECCMEM_PID
@@ -59,17 +97,7 @@ TEST_STATUS=$?
 
 echo "[$(date)] ========== 3 小时压测完成，开始清理 =========="
 
-# 7. 强制关闭所有相关进程
-echo "[$(date)] 关闭 Python 进程..."
-killall -9 python3 2>/dev/null
-
-echo "[$(date)] 关闭 dmesg 进程..."
-killall -9 dmesg 2>/dev/null
-
-echo "[$(date)] 关闭 tail 进程..."
-killall -9 tail 2>/dev/null
-
-sleep 2
+cleanup_processes
 
 # 8. 导出最终日志
 echo "[$(date)] 导出最终日志..."

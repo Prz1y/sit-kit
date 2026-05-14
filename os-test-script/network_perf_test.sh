@@ -4,6 +4,7 @@
 # 功能：测试TCP/UDP吞吐量、响应时间，收集环境信息及系统日志。
 # 依赖：netperf, netserver
 # 用法：./network_perf_test.sh [目标IP] [测试时长(秒)]
+#       IP未提供时跳过测试，仅收集环境信息
 
 export LC_ALL=C
 export LANG=C
@@ -19,21 +20,28 @@ log() {
     echo -e "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "${LOG_FILE}"
 }
 
-run_netperf() {
-    local desc="$1"
-    local outfile="$2"
-    shift 2
-    log "  正在进行 ${desc} 测试..."
-    netperf "$@" > "${outfile}" 2>&1
-    if [ $? -ne 0 ]; then
-        log "  警告: ${desc} 测试执行失败或返回非零值，请检查 ${outfile}"
-    fi
-}
-
 log "=================================================="
 log "开始执行网络性能测试"
 log "结果目录: ${RESULT_DIR}"
 log "=================================================="
+
+# 0. 依赖检查（尽早退出，避免浪费时间采集环境信息后才发现依赖缺失）
+log "[0/5] 检查依赖..."
+MISSING_DEPS=()
+if ! command -v netperf &> /dev/null; then
+    MISSING_DEPS+=("netperf")
+fi
+if ! command -v netserver &> /dev/null; then
+    # netserver 通常和 netperf 同包，但单独检查更明确
+    MISSING_DEPS+=("netserver")
+fi
+if [ ${#MISSING_DEPS[@]} -gt 0 ]; then
+    log "错误: 缺少依赖: ${MISSING_DEPS[*]}"
+    log "请先安装: sudo apt install netperf  或  sudo yum install netperf"
+    exit 1
+fi
+NETPERF_VER=$(netperf -V 2>&1 | head -1)
+log "  netperf 版本: $NETPERF_VER"
 
 # 1. 环境信息收集
 log "[1/5] 收集环境信息..."
@@ -76,11 +84,6 @@ log "  环境信息已保存至 env_info.txt"
 
 # 2. 检查并启动 netserver
 log "[2/5] 检查并启动 netserver..."
-if ! command -v netperf &> /dev/null; then
-    log "错误: 未找到 netperf 命令，请先安装 (例如: sudo apt install netperf)"
-    exit 1
-fi
-
 # 若本地已有 netserver 在监听则跳过
 if ! ss -tlnp | grep -q ":12865"; then
     netserver -p 12865 >> "${LOG_FILE}" 2>&1
@@ -91,34 +94,61 @@ else
 fi
 
 # 3. 执行 netperf 测试
-TARGET_IP=${1:-"127.0.0.1"}
+TARGET_IP="${1:-}"
 TEST_DURATION=${2:-10}
-log "[3/5] 开始执行 netperf 测试 (目标: ${TARGET_IP}, 时长: ${TEST_DURATION}s)..."
 
-# TCP Stream 正向吞吐量
-run_netperf "TCP_STREAM (正向吞吐)" \
-    "${RESULT_DIR}/tcp_stream.txt" \
-    -H "${TARGET_IP}" -l "${TEST_DURATION}" -t TCP_STREAM -P 1 -- -m 1024
+if [ -z "$TARGET_IP" ]; then
+    log "[3/5] 未提供目标IP，跳过netperf测试，仅保留环境信息"
+    SKIP_TESTS=true
+else
+    SKIP_TESTS=false
+    if [ "$TARGET_IP" = "127.0.0.1" ] || [ "$TARGET_IP" = "localhost" ]; then
+        log "[3/5] 警告: 目标IP为回环地址，测试走虚拟网卡(lo)，不反映物理网卡性能"
+    fi
+    log "[3/5] 开始执行 netperf 测试 (目标: ${TARGET_IP}, 时长: ${TEST_DURATION}s)..."
+    # 快速连通性探测
+    if ! ping -c 1 -W 3 "$TARGET_IP" > /dev/null 2>&1; then
+        log "  警告: 无法 ping 通 ${TARGET_IP}，netperf 测试可能会失败"
+    fi
+fi
 
-# TCP Stream 反向吞吐量
-run_netperf "TCP_MAERTS (反向吞吐)" \
-    "${RESULT_DIR}/tcp_maerts.txt" \
-    -H "${TARGET_IP}" -l "${TEST_DURATION}" -t TCP_MAERTS -P 1 -- -m 1024
+run_netperf() {
+    local desc="$1"
+    local outfile="$2"
+    shift 2
+    log "  正在进行 ${desc} 测试..."
+    netperf "$@" > "${outfile}" 2>&1
+    if [ $? -ne 0 ]; then
+        log "  错误: ${desc} 测试执行失败，请检查 ${outfile}"
+    fi
+}
 
-# UDP Stream 吞吐量
-run_netperf "UDP_STREAM (UDP吞吐)" \
-    "${RESULT_DIR}/udp_stream.txt" \
-    -H "${TARGET_IP}" -l "${TEST_DURATION}" -t UDP_STREAM -P 1 -- -m 1024
+if [ "$SKIP_TESTS" != true ]; then
+    # TCP Stream 正向吞吐量
+    run_netperf "TCP_STREAM (正向吞吐)" \
+        "${RESULT_DIR}/tcp_stream.txt" \
+        -H "${TARGET_IP}" -l "${TEST_DURATION}" -t TCP_STREAM -P 1 -- -m 1024
 
-# TCP Request/Response 响应速率与延迟
-run_netperf "TCP_RR (TCP响应时间/速率)" \
-    "${RESULT_DIR}/tcp_rr.txt" \
-    -H "${TARGET_IP}" -l "${TEST_DURATION}" -t TCP_RR -P 1 -- -r 64,64
+    # TCP Stream 反向吞吐量
+    run_netperf "TCP_MAERTS (反向吞吐)" \
+        "${RESULT_DIR}/tcp_maerts.txt" \
+        -H "${TARGET_IP}" -l "${TEST_DURATION}" -t TCP_MAERTS -P 1 -- -m 1024
 
-# UDP Request/Response 响应速率与延迟
-run_netperf "UDP_RR (UDP响应时间/速率)" \
-    "${RESULT_DIR}/udp_rr.txt" \
-    -H "${TARGET_IP}" -l "${TEST_DURATION}" -t UDP_RR -P 1 -- -r 64,64
+    # UDP Stream 吞吐量
+    run_netperf "UDP_STREAM (UDP吞吐)" \
+        "${RESULT_DIR}/udp_stream.txt" \
+        -H "${TARGET_IP}" -l "${TEST_DURATION}" -t UDP_STREAM -P 1 -- -m 1024
+
+    # TCP Request/Response 响应速率与延迟
+    run_netperf "TCP_RR (TCP响应时间/速率)" \
+        "${RESULT_DIR}/tcp_rr.txt" \
+        -H "${TARGET_IP}" -l "${TEST_DURATION}" -t TCP_RR -P 1 -- -r 64,64
+
+    # UDP Request/Response 响应速率与延迟
+    run_netperf "UDP_RR (UDP响应时间/速率)" \
+        "${RESULT_DIR}/udp_rr.txt" \
+        -H "${TARGET_IP}" -l "${TEST_DURATION}" -t UDP_RR -P 1 -- -r 64,64
+fi
 
 # 4. 收集系统日志
 log "[4/5] 收集系统日志..."
@@ -171,7 +201,7 @@ REPORT="${RESULT_DIR}/test_report.txt"
     echo "            网络性能测试报告                      "
     echo "=================================================="
     echo "测试时间   : $(date)"
-    echo "测试目标IP : ${TARGET_IP}"
+    echo "测试目标IP : ${TARGET_IP:-N/A (未执行测试)}"
     echo "单项测试时长: ${TEST_DURATION} 秒"
     echo ""
     echo "--- 环境摘要 ---"
@@ -183,20 +213,25 @@ REPORT="${RESULT_DIR}/test_report.txt"
     echo "总内存     : $(free -h | awk '/Mem:/{print $2}')"
     echo "网卡 (PCI) : $(lspci | grep -i ether | head -n 1)"
     echo ""
-    echo "=================================================="
-    echo "                性能测试结果                      "
-    echo "=================================================="
-    echo ""
-    echo "[ 吞吐量测试 ]"
-    echo "  1. TCP 正向吞吐量 (TCP_STREAM)  : $(parse_throughput "${RESULT_DIR}/tcp_stream.txt") Mbps"
-    echo "  2. TCP 反向吞吐量 (TCP_MAERTS)  : $(parse_throughput "${RESULT_DIR}/tcp_maerts.txt") Mbps"
-    echo "  3. UDP 吞吐量     (UDP_STREAM)  : $(parse_throughput "${RESULT_DIR}/udp_stream.txt") Mbps"
-    echo ""
-    echo "[ 响应时间 / 传输速率测试 (请求包大小 64B) ]"
-    echo "  4. TCP 响应速率  (TCP_RR)       : $(parse_rr_trans "${RESULT_DIR}/tcp_rr.txt") Trans/sec"
-    echo "     TCP 平均延迟  (TCP_RR)       : $(parse_rr_latency "${RESULT_DIR}/tcp_rr.txt") us"
-    echo "  5. UDP 响应速率  (UDP_RR)       : $(parse_rr_trans "${RESULT_DIR}/udp_rr.txt") Trans/sec"
-    echo "     UDP 平均延迟  (UDP_RR)       : $(parse_rr_latency "${RESULT_DIR}/udp_rr.txt") us"
+
+    if [ "$SKIP_TESTS" != true ]; then
+        echo "=================================================="
+        echo "                性能测试结果                      "
+        echo "=================================================="
+        echo ""
+        echo "[ 吞吐量测试 ]"
+        echo "  1. TCP 正向吞吐量 (TCP_STREAM)  : $(parse_throughput "${RESULT_DIR}/tcp_stream.txt") Mbps"
+        echo "  2. TCP 反向吞吐量 (TCP_MAERTS)  : $(parse_throughput "${RESULT_DIR}/tcp_maerts.txt") Mbps"
+        echo "  3. UDP 吞吐量     (UDP_STREAM)  : $(parse_throughput "${RESULT_DIR}/udp_stream.txt") Mbps"
+        echo ""
+        echo "[ 响应时间 / 传输速率测试 (请求包大小 64B) ]"
+        echo "  4. TCP 响应速率  (TCP_RR)       : $(parse_rr_trans "${RESULT_DIR}/tcp_rr.txt") Trans/sec"
+        echo "     TCP 平均延迟  (TCP_RR)       : $(parse_rr_latency "${RESULT_DIR}/tcp_rr.txt") us"
+        echo "  5. UDP 响应速率  (UDP_RR)       : $(parse_rr_trans "${RESULT_DIR}/udp_rr.txt") Trans/sec"
+        echo "     UDP 平均延迟  (UDP_RR)       : $(parse_rr_latency "${RESULT_DIR}/udp_rr.txt") us"
+    else
+        echo "性能测试: 跳过 (未提供目标IP)"
+    fi
     echo ""
     echo "=================================================="
     echo "原始数据文件列表:"
@@ -216,7 +251,7 @@ REPORT="${RESULT_DIR}/test_report.txt"
 cat "${REPORT}" >> "${LOG_FILE}"
 
 # 清理 netserver (仅本地测试时停止)
-if [ "${TARGET_IP}" == "127.0.0.1" ] || [ "${TARGET_IP}" == "localhost" ]; then
+if [ "$TARGET_IP" = "127.0.0.1" ] || [ "$TARGET_IP" = "localhost" ]; then
     pkill netserver > /dev/null 2>&1
     log "  已停止本地 netserver"
 fi
