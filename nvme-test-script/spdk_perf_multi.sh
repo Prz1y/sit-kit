@@ -7,7 +7,10 @@
 #   - 自动发现 NUMA 拓扑和 NVMe 设备
 #   - 自动绑核（同 NUMA 多设备时均分 CCD 核心，默认排除 CPU0）
 #   - 自动配置大页内存（hugepages）
-#   - Ctrl+C 自动清理后台 SPDK 进程
+#   - 系统盘保护（自动检测并跳过承载已挂载分区的 NVMe 设备）
+#   - Ctrl+C / 正常退出 自动清理后台 SPDK 进程并恢复系统状态
+#   - 支持 -d 指定盘符测试、-y 免交互/CI 模式、-l 仅列出拓扑
+#   - 时间估算自动解析运行计划，无需手工维护
 #   - 每设备独立日志文件，测试结束后自动汇总性能表格
 #   - 全部测试项目整合，无外部脚本依赖
 #
@@ -26,7 +29,7 @@
 set -euo pipefail
 
 # ===================== 用户配置区 =====================
-SPDK_PERF="/root/spdk2409/spdk/build/bin/spdk_nvme_perf"
+SPDK_PERF="/root/spdk-24.09-build/spdk/build/bin/spdk_nvme_perf"
 SPDK_SETUP=""  # 留空则自动检测; 如 /root/spdk2409/spdk/scripts/setup.sh
 
 #   如需使用 1GB 大页，重启前执行以下命令: 
@@ -40,12 +43,19 @@ SPDK_SETUP=""  # 留空则自动检测; 如 /root/spdk2409/spdk/scripts/setup.sh
 # 大页配置（极限性能推荐 1GB 但需重启预留，通用场景推荐 2MB）
 HUGEPAGE_SIZE="1GB"            # 可选: "2MB" 或 "1GB" (1GB 需启动时通过 GRUB 预留)
 HUGEPAGES_PER_NUMA_NODE=8      # 1GB: 每节点 8 个 (8GB); 2MB: 每节点 4096 个 (8GB)
-SPDK_SHM_SIZE=1024             # SPDK 共享内存大小 (MB)，对应 -s 参数
+SPDK_SHM_SIZE=1024             # SPDK 共享内存上限 (MB)，实际值按 NUMA 设备数动态分配，不低于 256
 SLEEP_BETWEEN_TESTS=60         # 测试间隔（秒）
 FORCE_BIND_ALL=true            # true: 强制将仍绑内核 nvme 驱动的设备解绑并重绑到用户态驱动
                                # false: 跳过无法被 setup.sh 绑定的设备（如系统盘）
 SKIP_CPU0=true                 # true: CPU0 不参与绑核（避免系统中断干扰延迟测试）
                                # false: 所有核心均可分配（纯带宽/IOPS 场景可开启以榨取全部性能）
+                               # 注: 仅排除 CPU0 无法实现真正的核心隔离，中断/内核线程仍可能在
+                               #   其他测试核心上调度。如需极低延迟/零尖刺，需在 GRUB 启动参数
+                               #   中追加 isolcpus=<测试核心范围> nohz_full=<测试核心范围>，
+                               #   从内核调度器层面彻底剥离测试核心。
+TARGET_BDFS=""                 # 指定要测试的 NVMe 设备 BDF 列表，空格分隔；留空则测试全部
+                               # 示例: TARGET_BDFS="0000:c1:00.0 0000:c2:00.0"
+                               # 也可通过命令行 -d 参数指定，如: ./script.sh -d "0000:c1:00.0"
 
 # ===================== 全局变量 =====================
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -60,6 +70,10 @@ declare -A NUMA_NVME_IDX=()
 declare -A ALLOC_CACHE=()          # 预计算的核心分配缓存: [bdf:num]=csv hex count
 declare -a SPDK_PIDS=()            # 全局：后台 spdk_nvme_perf 进程 PID，用于 Ctrl+C 清理
                                    # 每次 run_spdk_test 结束后自动清空，避免积累已退出 PID
+declare -a SYSTEM_BDFS=()          # 全局：系统盘所在 NVMe 设备的 BDF 列表，严禁解绑
+declare -a BOUND_BDFS=()           # 全局：成功绑定到用户态驱动的设备 BDF 列表，用于退出时恢复
+declare -a SAVED_GOVERNORS=()      # 全局：保存的 CPU governor 状态，用于退出时恢复
+declare -A SAVED_HUGEPAGES=()      # 全局：保存的大页初始值 (key: "node:dir")，退出时原值还原
 
 # ===================== 输出格式 =====================
 RED='\033[0;31m'
@@ -74,28 +88,139 @@ log_warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_err()   { echo -e "${RED}[ERROR]${NC} $*"; }
 log_step()  { echo -e "${CYAN}[====]${NC} ${BOLD}$*${NC}"; }
 
-# ===================== 信号处理：Ctrl+C 清理后台进程 =====================
+# ===================== 信号处理与系统恢复 =====================
+# 将已绑定到用户态驱动的 NVMe 设备恢复为内核 nvme 驱动
+restore_spdk_driver() {
+    if [ ${#BOUND_BDFS[@]} -eq 0 ]; then
+        return 0
+    fi
+    log_info "正在恢复 NVMe 设备到内核 nvme 驱动..."
+    modprobe nvme 2>/dev/null || true   # 确保 nvme 内核模块已加载，防止 bind 路径不存在
+    for bdf in "${BOUND_BDFS[@]}"; do
+        local cur_drv
+        cur_drv=$(basename "$(readlink "/sys/bus/pci/devices/${bdf}/driver" 2>/dev/null)" 2>/dev/null || echo "")
+        if [[ "$cur_drv" == "vfio-pci" || "$cur_drv" == "uio_pci_generic" ]]; then
+            echo "$bdf" > "/sys/bus/pci/devices/${bdf}/driver/unbind" 2>/dev/null || true
+            echo "" > "/sys/bus/pci/devices/${bdf}/driver_override" 2>/dev/null || true
+            echo "$bdf" > "/sys/bus/pci/drivers/nvme/bind" 2>/dev/null || true
+            local restored
+            restored=$(basename "$(readlink "/sys/bus/pci/devices/${bdf}/driver" 2>/dev/null)" 2>/dev/null || echo "")
+            if [ "$restored" = "nvme" ]; then
+                log_info "  $bdf 已恢复到 nvme 驱动"
+            else
+                log_warn "  $bdf 恢复失败，当前驱动: $restored"
+            fi
+        fi
+    done
+    # SPDK setup.sh reset 与上方 BOUND_BDFS 逐设备恢复功能 100% 重叠，
+    # 保留精确的 BDF 恢复逻辑（可控性更强），setup.sh reset 仅作注释保留
+    # if [ -n "${SPDK_SETUP:-}" ] && [ -x "${SPDK_SETUP:-}" ]; then
+    #     "$SPDK_SETUP" reset 2>/dev/null || true
+    #     log_info "已执行 SPDK setup.sh reset"
+    # fi
+}
+
+# 恢复 CPU governor
+restore_governor() {
+    if [ ${#SAVED_GOVERNORS[@]} -eq 0 ]; then
+        return 0
+    fi
+    log_info "正在恢复 CPU governor..."
+    if command -v cpupower &>/dev/null; then
+        # 取第一个保存的 governor 作为代表恢复
+        local first_gov
+        first_gov=$(echo "${SAVED_GOVERNORS[0]}" | cut -d: -f2)
+        cpupower frequency-set -g "$first_gov" &>/dev/null || true
+        log_info "CPU governor 已恢复 (cpupower)"
+    else
+        for entry in "${SAVED_GOVERNORS[@]}"; do
+            local cpu_id gov
+            cpu_id=$(echo "$entry" | cut -d: -f1)
+            gov=$(echo "$entry" | cut -d: -f2)
+            echo "$gov" > "/sys/devices/system/cpu/cpu${cpu_id}/cpufreq/scaling_governor" 2>/dev/null || true
+        done
+        log_info "CPU governor 已恢复 (sysfs)"
+    fi
+}
+
+# 恢复 NMI watchdog (如果之前是启用的)
+RESTORE_NMI=""
+restore_nmi() {
+    if [ "${RESTORE_NMI:-}" = "1" ]; then
+        echo 1 > /proc/sys/kernel/nmi_watchdog 2>/dev/null || true
+        log_info "NMI watchdog 已恢复"
+    fi
+}
+
+# 恢复透明大页
+RESTORE_THP=""
+restore_thp() {
+    if [ -n "${RESTORE_THP:-}" ]; then
+        echo "$RESTORE_THP" > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || true
+        log_info "THP 已恢复"
+    fi
+}
+
+# 还原大页内存至初始状态（非暴力清零，避免破坏其他业务预留的大页）
+restore_hugepages() {
+    if [ ${#SAVED_HUGEPAGES[@]} -eq 0 ]; then
+        return 0
+    fi
+    log_info "正在还原大页内存至初始状态..."
+    for key in "${!SAVED_HUGEPAGES[@]}"; do
+        local node_val="${key%%:*}"
+        local dir_val="${key##*:}"
+        local orig_val="${SAVED_HUGEPAGES[$key]}"
+        local hp_path="/sys/devices/system/node/node${node_val}/hugepages/${dir_val}/nr_hugepages"
+        if [ -f "$hp_path" ]; then
+            echo "$orig_val" > "$hp_path" 2>/dev/null || true
+        fi
+    done
+    log_info "大页内存已还原至脚本执行前状态"
+}
+
+restore_system_state() {
+    echo ""
+    log_warn "================================================================"
+    log_warn "  正在恢复系统状态 (驱动 / 大页 / CPU governor / NMI / THP)..."
+    log_warn "================================================================"
+    restore_spdk_driver || true
+    restore_governor || true
+    restore_nmi || true
+    restore_thp || true
+    restore_hugepages || true
+    log_info "系统状态恢复完成"
+}
+
 cleanup_on_interrupt() {
     echo ""
     log_warn "收到中断信号 (Ctrl+C)，正在清理所有后台 SPDK 进程..."
-    # 先杀脚本启动的进程
-    for pid in "${SPDK_PIDS[@]:-}"; do
-        kill -TERM "$pid" 2>/dev/null || true
-    done
-    # 防止孤儿进程：杀掉所有 spdk_nvme_perf
+    if [ ${#SPDK_PIDS[@]} -gt 0 ]; then
+        for pid in "${SPDK_PIDS[@]}"; do
+            kill -TERM "$pid" 2>/dev/null || true
+        done
+    fi
     pkill -TERM -f spdk_nvme_perf 2>/dev/null || true
     sleep 2
-    # 强制清理
-    for pid in "${SPDK_PIDS[@]:-}"; do
-        kill -KILL "$pid" 2>/dev/null || true
-    done
+    if [ ${#SPDK_PIDS[@]} -gt 0 ]; then
+        for pid in "${SPDK_PIDS[@]}"; do
+            kill -KILL "$pid" 2>/dev/null || true
+        done
+    fi
     pkill -KILL -f spdk_nvme_perf 2>/dev/null || true
-    log_info "清理完成，脚本已退出。"
+    restore_system_state || true
     log_info "部分日志保存在: $LOG_DIR"
+    trap - EXIT                    # 注销 EXIT 陷阱，防止 cleanup_on_exit 二次触发 restore_system_state
     exit 130
 }
 
+# 正常退出时也还原系统状态（子函数内部错误不影响清理流程）
+cleanup_on_exit() {
+    restore_system_state || true
+}
+
 trap cleanup_on_interrupt SIGINT SIGTERM
+trap cleanup_on_exit EXIT
 
 # ===================== 前置检查 =====================
 preflight_check() {
@@ -143,17 +268,28 @@ setup_hugepages() {
     if [ "$HUGEPAGE_SIZE" = "1GB" ]; then
         hp_dir="hugepages-1048576kB"
         pagesize_kb="1048576kB"
-        pagesize_mount="1G"
+        pagesize_mount="1024M"   # 内核 mount 输出使用 1024M 而非 1G
     else
         hp_dir="hugepages-2048kB"
         pagesize_kb="2048kB"
         pagesize_mount="2M"
     fi
 
-    # 遍历系统中所有 NUMA node，统一分配大页，避免 EAL "No free hugepages" 警告
+    # 遍历系统中所有 NUMA node
     local all_nodes
     all_nodes=($(ls -d /sys/devices/system/node/node[0-9]* 2>/dev/null | sed 's/.*node//' | sort -n || true))
 
+    # 统一缓存 1GB 与 2MB 大页初始值（在任何修改之前，保证退出时完整还原）
+    for node in "${all_nodes[@]}"; do
+        for dir_name in hugepages-1048576kB hugepages-2048kB; do
+            local p="/sys/devices/system/node/node${node}/hugepages/${dir_name}/nr_hugepages"
+            if [ -f "$p" ]; then
+                SAVED_HUGEPAGES["${node}:${dir_name}"]=$(cat "$p" 2>/dev/null || echo 0)
+            fi
+        done
+    done
+
+    # 分配目标大页
     for node in "${all_nodes[@]}"; do
         local hp_path="/sys/devices/system/node/node${node}/hugepages/${hp_dir}/nr_hugepages"
         if [ ! -f "$hp_path" ]; then
@@ -177,6 +313,7 @@ setup_hugepages() {
     done
 
     # 清理另一种大页，避免 EAL "N hugepages reserved but no mounted hugetlbfs" 警告
+    # 注: 初始值已在函数头部统一缓存，此处清零不会影响退出时的恢复
     local other_dir
     if [ "$HUGEPAGE_SIZE" = "1GB" ]; then
         other_dir="hugepages-2048kB"
@@ -196,14 +333,15 @@ setup_hugepages() {
     done
 
     # 确保 hugetlbfs 已挂载（DPDK/SPDK 通过此文件系统访问大页）
+    # 使用 /proc/mounts 而非 mount 命令，内核输出 pagesize 格式为 1024M/2M 而非 1G/2M
     local mount_point="/dev/hugepages"
     local mount_pattern="hugetlbfs.*pagesize=${pagesize_mount}"
     
-    if mount | grep -q "$mount_pattern" 2>/dev/null; then
+    if grep -q "$mount_pattern" /proc/mounts 2>/dev/null; then
         log_info "hugetlbfs 已挂载 (pagesize=${pagesize_mount})"
     else
         # 卸载不匹配的挂载
-        if mount | grep -q "$mount_point" 2>/dev/null; then
+        if grep -q " $mount_point " /proc/mounts 2>/dev/null; then
             umount "$mount_point" 2>/dev/null || true
             log_info "已卸载旧的 hugetlbfs 挂载"
         fi
@@ -247,7 +385,7 @@ setup_hugepages() {
         done
 
         # 重新挂载 hugetlbfs 为 2M 模式
-        if mount | grep -q "/dev/hugepages" 2>/dev/null; then
+        if grep -q " /dev/hugepages " /proc/mounts 2>/dev/null; then
             umount /dev/hugepages 2>/dev/null || true
         fi
         if mount -t hugetlbfs -o pagesize=2M nodev /dev/hugepages 2>/dev/null; then
@@ -297,11 +435,26 @@ setup_spdk_driver() {
         log_info "强制绑定模式: 目标用户态驱动 = $target_drv"
         modprobe "$target_drv" 2>/dev/null || true
 
+        BOUND_BDFS=()
         for bdf in "${NVME_BDFS[@]}"; do
             local sysfs_drv="/sys/bus/pci/devices/${bdf}/driver"
             local drv_name=""
-            [ -L "$sysfs_drv" ] && drv_name=$(basename "$(readlink "$sysfs_drv")" 2>/dev/null || true)
+            if [ -L "$sysfs_drv" ]; then
+                drv_name=$(basename "$(readlink "$sysfs_drv")" 2>/dev/null || true)
+            fi
             if [ "$drv_name" = "nvme" ]; then
+                # 系统盘保护: 检查当前 BDF 是否在系统盘列表中
+                local is_system=false
+                for sys_bdf in "${SYSTEM_BDFS[@]}"; do
+                    if [ "$bdf" = "$sys_bdf" ]; then
+                        is_system=true
+                        break
+                    fi
+                done
+                if $is_system; then
+                    log_warn "  $bdf 为系统盘，严禁解绑，跳过"
+                    continue
+                fi
                 log_warn "  $bdf 仍绑定 nvme 驱动，尝试强制解绑并绑到 $target_drv ..."
                 echo "$bdf" > "/sys/bus/pci/devices/${bdf}/driver/unbind" 2>/dev/null || {
                     log_warn "    解绑失败（设备可能正在被挂载使用），跳过"
@@ -321,6 +474,7 @@ setup_spdk_driver() {
                 new_drv=$(basename "$(readlink "/sys/bus/pci/devices/${bdf}/driver" 2>/dev/null)" 2>/dev/null || echo "未绑定")
                 if [ "$new_drv" = "$target_drv" ]; then
                     log_info "    $bdf 已成功绑定到 $target_drv"
+                    BOUND_BDFS+=("$bdf")
                 else
                     log_warn "    $bdf 绑定失败，当前驱动: $new_drv"
                 fi
@@ -352,6 +506,12 @@ setup_spdk_driver() {
             valid_bdfs+=("$bdf")
             valid_numas+=("$numa")
             log_info "  $bdf -> 驱动: $drv_name"
+            # 记录所有成功绑定的设备（用于退出时恢复）
+            local already_tracked=false
+            for t in "${BOUND_BDFS[@]}"; do
+                [ "$t" = "$bdf" ] && already_tracked=true && break
+            done
+            $already_tracked || BOUND_BDFS+=("$bdf")
         else
             log_warn "  $bdf -> 驱动: nvme (仍绑定内核驱动，已跳过; 如需强制绑定请设置 FORCE_BIND_ALL=true)"
         fi
@@ -385,14 +545,28 @@ setup_spdk_driver() {
 tune_system() {
     log_step "系统性能调优"
 
+    SAVED_GOVERNORS=()
+    # 无论后续使用 cpupower 还是 sysfs，先统一备份全量核心原始 governor
+    if [ -d /sys/devices/system/cpu/cpu0/cpufreq ]; then
+        for gov in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+            local cpu_id
+            cpu_id=$(echo "$gov" | grep -oP 'cpu\K\d+')
+            local orig
+            orig=$(cat "$gov" 2>/dev/null || echo "unknown")
+            SAVED_GOVERNORS+=("${cpu_id}:${orig}")
+        done
+    fi
+
     # 1. CPU frequency governor -> performance
     if command -v cpupower &>/dev/null; then
         cpupower frequency-set -g performance &>/dev/null && \
             log_info "CPU governor -> performance (cpupower)" || \
             log_warn "cpupower frequency-set 失败"
-    elif [ -d /sys/devices/system/cpu/cpu0/cpufreq ]; then
-        for gov in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
-            echo performance > "$gov" 2>/dev/null || true
+    elif [ ${#SAVED_GOVERNORS[@]} -gt 0 ]; then
+        for entry in "${SAVED_GOVERNORS[@]}"; do
+            local cpu_id
+            cpu_id=$(echo "$entry" | cut -d: -f1)
+            echo performance > "/sys/devices/system/cpu/cpu${cpu_id}/cpufreq/scaling_governor" 2>/dev/null || true
         done
         log_info "CPU governor -> performance (sysfs)"
     else
@@ -404,6 +578,7 @@ tune_system() {
         local nmi_val
         nmi_val=$(cat /proc/sys/kernel/nmi_watchdog 2>/dev/null || echo 0)
         if [ "$nmi_val" != "0" ]; then
+            RESTORE_NMI="1"
             echo 0 > /proc/sys/kernel/nmi_watchdog 2>/dev/null || true
             log_info "NMI watchdog 已禁用 (原值: $nmi_val)"
         else
@@ -422,9 +597,11 @@ tune_system() {
         local thp_current
         thp_current=$(cat "$thp_path" 2>/dev/null || echo "")
         if [[ "$thp_current" != *"[never]"* ]]; then
+            # 提取当前启用的模式 (被 [ ] 包裹的那个)
+            RESTORE_THP=$(echo "$thp_current" | grep -oP '\[\K\w+')
             echo never > "$thp_path" 2>/dev/null || true
             echo never > /sys/kernel/mm/transparent_hugepage/defrag 2>/dev/null || true
-            log_info "Transparent Hugepages 已禁用"
+            log_info "Transparent Hugepages 已禁用 (原值: $RESTORE_THP)"
         else
             log_info "Transparent Hugepages 已处于禁用状态"
         fi
@@ -436,9 +613,8 @@ discover_topology() {
     log_step "发现 NVMe 设备和 NUMA 拓扑"
 
     local idx=0
-    # pipefail 安全: grep 未匹配时返回 1，用 || true 防止 set -e 触发
     local nvme_list
-    nvme_list=$(lspci -D 2>/dev/null | { grep -i "Non-Volatile memory controller" || true; } | awk '{print $1}')
+    nvme_list=$(lspci -D 2>/dev/null | awk '/Non-Volatile memory controller/ {print $1}')
     if [ -z "$nvme_list" ]; then
         log_err "未发现任何 NVMe 设备！"
         exit 1
@@ -449,7 +625,9 @@ discover_topology() {
         local numa
         numa=$(cat "/sys/bus/pci/devices/${bdf}/numa_node" 2>/dev/null || echo "")
         # sysfs 在无 NUMA 系统上可能返回 -1，统一归入 node 0
-        [[ -z "$numa" || "$numa" == "-1" ]] && numa=0
+        if [[ -z "$numa" || "$numa" == "-1" ]]; then
+            numa=0
+        fi
 
         NVME_BDFS+=("$bdf")
         NVME_NUMA+=("$numa")
@@ -537,6 +715,90 @@ print(' '.join(str(c) for c in cpus))
     } >> "$SUMMARY_LOG"
 }
 
+# ===================== 设备过滤（指定盘符测试） =====================
+# 根据 TARGET_BDFS 配置过滤 NVMe 设备列表，仅保留用户指定的设备
+# 同时重建 NUMA_NVME_COUNT / NUMA_NVME_IDX 并清空 ALLOC_CACHE
+filter_target_devices() {
+    local target_list="${1:-}"
+    if [ -z "$target_list" ]; then
+        return 0
+    fi
+
+    log_step "按指定 BDF 过滤测试设备"
+    log_info "目标设备: $target_list"
+
+    local valid_bdfs=()
+    local valid_numas=()
+    declare -A filtered_count=()
+    declare -A filtered_idx=()
+
+    local target_arr=($target_list)
+    for target in "${target_arr[@]}"; do
+        local found=false
+        for ((i=0; i<${#NVME_BDFS[@]}; i++)); do
+            if [ "${NVME_BDFS[$i]}" = "$target" ]; then
+                local numa=${NVME_NUMA[$i]}
+                local cnt=${filtered_count[$numa]:-0}
+                filtered_idx[$target]=$cnt
+                filtered_count[$numa]=$((cnt + 1))
+                valid_bdfs+=("$target")
+                valid_numas+=("$numa")
+                found=true
+                log_info "  $target -> NUMA $numa (idx ${filtered_idx[$target]})"
+                break
+            fi
+        done
+        if ! $found; then
+            log_warn "  $target 未在发现的 NVMe 设备中找到，已跳过"
+        fi
+    done
+
+    if [ ${#valid_bdfs[@]} -eq 0 ]; then
+        log_err "指定的设备均未找到！可用设备: ${NVME_BDFS[*]}"
+        exit 1
+    fi
+
+    NVME_BDFS=("${valid_bdfs[@]}")
+    NVME_NUMA=("${valid_numas[@]}")
+    NUMA_NVME_COUNT=()
+    NUMA_NVME_IDX=()
+    for key in "${!filtered_count[@]}"; do
+        NUMA_NVME_COUNT[$key]=${filtered_count[$key]}
+    done
+    for key in "${!filtered_idx[@]}"; do
+        NUMA_NVME_IDX[$key]=${filtered_idx[$key]}
+    done
+    ALLOC_CACHE=()
+
+    log_info "过滤后共 ${#NVME_BDFS[@]} 个设备参与测试"
+}
+
+# ===================== 系统盘检测（防误解绑） =====================
+# 遍历已发现的 NVMe 设备，找出其中承载已挂载文件系统（/, /boot 等）的设备
+# 这些设备的 BDF 存入全局变量 SYSTEM_BDFS，setup_spdk_driver 中会跳过
+discover_system_bdfs() {
+    SYSTEM_BDFS=()
+    for bdf in "${NVME_BDFS[@]}"; do
+        local nvme_path="/sys/bus/pci/devices/${bdf}/nvme"
+        [ -d "$nvme_path" ] || continue
+        local found=false
+        for ctrl in "$nvme_path"/nvme*; do
+            [ -d "$ctrl" ] || continue
+            local ctrl_name
+            ctrl_name=$(basename "$ctrl")
+            if lsblk -nlo MOUNTPOINT "/dev/${ctrl_name}" 2>/dev/null | grep -q '[^[:space:]]'; then
+                SYSTEM_BDFS+=("$bdf")
+                log_warn "  $bdf (${ctrl_name}) 承载已挂载分区，标记为系统盘，严禁解绑"
+                found=true
+                break
+            fi
+        done
+    done
+    if [ ${#SYSTEM_BDFS[@]} -gt 0 ]; then
+        log_info "共发现 ${#SYSTEM_BDFS[@]} 个系统盘 NVMe 设备，将在驱动绑定时自动跳过"
+    fi
+}
+
 # ===================== 核心分配 =====================
 # 参数: $1=BDF, $2=请求核心数
 # 输出: "core1,core2,...,coreN hex_mask actual_count"
@@ -575,9 +837,20 @@ allocate_cores() {
     fi
 
     local total=${#all_cores[@]}
+
+    if [ "$total" -lt "$dev_count" ] || [ "$dev_count" -le 0 ]; then
+        log_err "$bdf: NUMA node $numa 可用核心数($total) < 设备数($dev_count)，无法分配"
+        return 1
+    fi
+
     local partition_size=$((total / dev_count))
     local start=$((dev_idx * partition_size))
     local actual=$((num_requested < partition_size ? num_requested : partition_size))
+
+    if [ "$actual" -lt 1 ]; then
+        log_err "$bdf: 分区大小为 0，无法分配核心"
+        return 1
+    fi
 
     if [ "$actual" -lt "$num_requested" ]; then
         log_warn "$bdf: 请求 $num_requested 核，分区仅有 $partition_size 核，实际使用 $actual 核"
@@ -642,6 +915,9 @@ run_spdk_test() {
     echo "================================================================"
 
     local pids=()
+    local page_mb
+    if [ "$HUGEPAGE_SIZE" = "1GB" ]; then page_mb=1024; else page_mb=2; fi
+
     for ((i=0; i<${#NVME_BDFS[@]}; i++)); do
         local bdf=${NVME_BDFS[$i]}
         local result
@@ -659,20 +935,28 @@ run_spdk_test() {
         local bdf_sanitized="${bdf//:/_}"
         local dev_log="${LOG_DIR}/${test_name}_dev${i}_${bdf_sanitized}.log"
 
-        log_info "  $bdf -> cores [$core_csv] (${actual_count}核) mask $hex_mask (dev $i) -> $dev_log"
+        # 动态 SHM: 每 NUMA 节点的总大页 / 该节点设备数，上限 SPDK_SHM_SIZE，下限 256MB
+        local numa=${NVME_NUMA[$i]}
+        local devs_on_node=${NUMA_NVME_COUNT[$numa]}
+        local hp_total=$((HUGEPAGES_PER_NUMA_NODE * page_mb))
+        local dyn_shm=$((hp_total / devs_on_node))
+        [ "$dyn_shm" -gt "$SPDK_SHM_SIZE" ] && dyn_shm=$SPDK_SHM_SIZE
+        [ "$dyn_shm" -lt 256 ] && dyn_shm=256
+
+        log_info "  $bdf -> cores [$core_csv] (${actual_count}核) mask $hex_mask shm=${dyn_shm}MB (dev $i) -> $dev_log"
 
         # -i $i: 为每个实例指定唯一的 EAL 共享内存 ID，避免多进程并行时相互冲突
-        # 用进程替换确保 $! 捕获的是 SPDK 的 PID（而非 tee 的 PID）
-        $SPDK_PERF \
+        # 使用 { ... } & 包裹确保 $! 始终捕获 SPDK 进程 PID，不受子 shell 影响
+        { $SPDK_PERF \
             -q "$iodepth" \
-            -s "$SPDK_SHM_SIZE" \
+            -s "$dyn_shm" \
             -w "$workload" \
             -t "$runtime" \
             -c "$hex_mask" \
             -o "$io_size" \
             -i "$i" \
             -r "trtype:PCIe traddr:${bdf}" \
-            > >(tee -a "$dev_log") 2>&1 &
+            2>&1 | tee -a "$dev_log"; } &
         SPDK_PIDS+=($!)
         pids+=($!)
     done
@@ -918,31 +1202,87 @@ run_all_tests() {
     run_spdk_test "14_4k_8cores_randwrite_iops" 8 4096 randwrite 1024 3600
 }
 
-# ===================== 时间估算 =====================
-# !!! 警告: 以下为手工估算，修改 run_all_tests 中的测试项后必须同步更新 !!!
+# ===================== 时间估算（自动解析 run_all_tests） =====================
 print_time_estimate() {
     log_step "预估总运行时间"
 
-    # Active tests (uncommented):
-    # 01: 14400s  02: 3600s  03: 3600s  04: 28800s
-    # 07: 3600s   08: 3600s
-    # 11: 3600s   12: 3600s
-    # 13: 3600s   14: 3600s
-    # Total test time: 14400+3600+3600+28800+3600*6 = 72000s
-    # Sleep between: ~11 * 60s = 660s
-    local total_sec=$((14400 + 3600 + 3600 + 28800 + 3600*6 + 11*SLEEP_BETWEEN_TESTS))
+    # 从 run_all_tests 函数体中提取所有未被注释的 run_spdk_test 调用的第7个参数（时长）
+    local active_secs
+    local script_file="${BASH_SOURCE[0]}"
+    active_secs=$(awk '/^run_all_tests\(\)/,/^}/ {
+        if ($1 == "run_spdk_test") print $7
+    }' "$script_file" 2>/dev/null || true)
+
+    local total_test_sec=0
+    local test_count=0
+    for t in $active_secs; do
+        total_test_sec=$((total_test_sec + t))
+        test_count=$((test_count + 1))
+    done
+
+    if [ "$test_count" -eq 0 ]; then
+        log_warn "未能从 run_all_tests 中自动解析测试项，请检查函数定义"
+        echo ""
+        return 0
+    fi
+
+    local total_sleep=$(( (test_count - 1) * SLEEP_BETWEEN_TESTS ))
+    local total_sec=$((total_test_sec + total_sleep))
     local hours=$((total_sec / 3600))
     local mins=$(( (total_sec % 3600) / 60 ))
 
-    log_info "活跃测试项: 10 项"
-    log_info "注释测试项: 4 项 (延迟测试 + 2核IOPS测试)"
-    log_info "预估总时长: 约 ${hours} 小时 ${mins} 分钟"
-    log_warn "注意: 此时间为手工估算，如需修改测试项请同步更新 print_time_estimate()"
+    log_info "活跃测试项: ${test_count} 项"
+    log_info "测试设备数: ${#NVME_BDFS[@]} 个"
+    log_info "预估总时长: 约 ${hours} 小时 ${mins} 分钟（自动解析，每测试项所有设备并行执行）"
     echo ""
 }
 
 # ===================== Main =====================
 main() {
+    local target_bdfs="$TARGET_BDFS"
+    local list_only=false
+    local force_run=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -d|--devices)
+                target_bdfs="${2:-}"
+                if [ -z "$target_bdfs" ]; then
+                    echo "用法: $0 -d \"BDF1 BDF2 ...\"  指定要测试的 NVMe 设备"
+                    echo "示例: $0 -d \"0000:c1:00.0 0000:c2:00.0\""
+                    exit 1
+                fi
+                shift 2
+                ;;
+            -l|--list)
+                list_only=true
+                shift
+                ;;
+            -y|--yes)
+                force_run=true
+                shift
+                ;;
+            -h|--help)
+                echo "用法: $0 [选项]"
+                echo ""
+                echo "选项:"
+                echo "  -d, --devices <BDF列表>  指定要测试的 NVMe 设备 BDF，空格分隔"
+                echo "                            示例: -d \"0000:c1:00.0 0000:c2:00.0\""
+                echo "  -l, --list               仅列出发现的 NVMe 设备及拓扑，不执行测试"
+                echo "  -y, --yes                跳过确认提示，直接执行 (适用于 CI/后台无人值守)"
+                echo "  -h, --help               显示此帮助信息"
+                echo ""
+                echo "配置: 编辑脚本顶部 '用户配置区' 可修改 TARGET_BDFS 等默认值"
+                exit 0
+                ;;
+            *)
+                log_err "未知参数: $1"
+                echo "使用 -h 查看帮助"
+                exit 1
+                ;;
+        esac
+    done
+
     echo ""
     echo "========================================================"
     echo "  SPDK NVMe Performance Test Suite (All-in-One)"
@@ -952,6 +1292,24 @@ main() {
 
     preflight_check
     discover_topology
+
+    if [ -n "$target_bdfs" ]; then
+        filter_target_devices "$target_bdfs"
+    fi
+
+    # 系统盘检测：在驱动绑定之前标记承载已挂载分区的 NVMe 设备
+    discover_system_bdfs
+
+    if $list_only; then
+        log_info "仅列出模式 (-l)，不执行实际测试。"
+        echo ""
+        log_info "设备列表:"
+        for ((i=0; i<${#NVME_BDFS[@]}; i++)); do
+            echo "  [${i}] ${NVME_BDFS[$i]} (NUMA ${NVME_NUMA[$i]})"
+        done
+        exit 0
+    fi
+
     print_time_estimate
 
     # ---- 人工确认：以下操作将修改系统状态 ----
@@ -963,12 +1321,16 @@ main() {
     log_warn "  3. 修改 CPU governor 为 performance"
     log_warn "  4. 禁用 NMI watchdog / THP"
     log_warn "  5. 开始全自动性能测试（时长见上方估算）"
-    log_warn "  按 Ctrl+C 可随时中断测试并自动清理后台进程"
+    log_warn "  按 Ctrl+C 可随时中断测试并自动清理后台进程并恢复系统状态"
     log_warn "================================================================"
-    read -r -p "  确认继续? [y/N]: " confirm
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-        log_info "用户取消，脚本退出。"
-        exit 0
+    if [ "$force_run" != "true" ]; then
+        read -r -p "  确认继续? [y/N]: " confirm
+        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+            log_info "用户取消，脚本退出。"
+            exit 0
+        fi
+    else
+        log_info "免交互模式 (-y)，跳过确认，直接开始。"
     fi
     echo ""
 
@@ -989,7 +1351,8 @@ main() {
 
     local end_ts
     end_ts=$(date +%s)
-    local elapsed_min=$(( (end_ts - start_ts) / 60 ))
+    local elapsed_min
+    elapsed_min=$(awk "BEGIN {printf \"%.1f\", ($end_ts - $start_ts) / 60}")
 
     echo ""
     echo "========================================================"
