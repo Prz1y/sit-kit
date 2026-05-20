@@ -122,7 +122,7 @@ restore_spdk_driver() {
 
 # 恢复 CPU governor
 restore_governor() {
-    if [ ${#SAVED_GOVERNORS[@]:-0} -eq 0 ]; then
+    if [ ${#SAVED_GOVERNORS[@]} -eq 0 ]; then
         return 0
     fi
     log_info "正在恢复 CPU governor..."
@@ -184,11 +184,11 @@ restore_system_state() {
     log_warn "================================================================"
     log_warn "  正在恢复系统状态 (驱动 / 大页 / CPU governor / NMI / THP)..."
     log_warn "================================================================"
-    restore_spdk_driver
-    restore_governor
-    restore_nmi
-    restore_thp
-    restore_hugepages
+    restore_spdk_driver || true
+    restore_governor || true
+    restore_nmi || true
+    restore_thp || true
+    restore_hugepages || true
     log_info "系统状态恢复完成"
 }
 
@@ -208,15 +208,15 @@ cleanup_on_interrupt() {
         done
     fi
     pkill -KILL -f spdk_nvme_perf 2>/dev/null || true
-    restore_system_state
+    restore_system_state || true
     log_info "部分日志保存在: $LOG_DIR"
     trap - EXIT                    # 注销 EXIT 陷阱，防止 cleanup_on_exit 二次触发 restore_system_state
     exit 130
 }
 
-# 正常退出时也还原系统状态
+# 正常退出时也还原系统状态（子函数内部错误不影响清理流程）
 cleanup_on_exit() {
-    restore_system_state
+    restore_system_state || true
 }
 
 trap cleanup_on_interrupt SIGINT SIGTERM
@@ -1208,18 +1208,25 @@ print_time_estimate() {
 
     # 从 run_all_tests 函数体中提取所有未被注释的 run_spdk_test 调用的第7个参数（时长）
     local active_secs
+    local script_file="${BASH_SOURCE[0]}"
     active_secs=$(awk '/^run_all_tests\(\)/,/^}/ {
         if ($1 == "run_spdk_test") print $7
-    }' "$0")
+    }' "$script_file" 2>/dev/null || true)
 
     local total_test_sec=0
     local test_count=0
     for t in $active_secs; do
         total_test_sec=$((total_test_sec + t))
-        ((test_count++))
+        test_count=$((test_count + 1))
     done
 
-    local total_sleep=$(( (test_count > 0 ? test_count - 1 : 0) * SLEEP_BETWEEN_TESTS ))
+    if [ "$test_count" -eq 0 ]; then
+        log_warn "未能从 run_all_tests 中自动解析测试项，请检查函数定义"
+        echo ""
+        return 0
+    fi
+
+    local total_sleep=$(( (test_count - 1) * SLEEP_BETWEEN_TESTS ))
     local total_sec=$((total_test_sec + total_sleep))
     local hours=$((total_sec / 3600))
     local mins=$(( (total_sec % 3600) / 60 ))
