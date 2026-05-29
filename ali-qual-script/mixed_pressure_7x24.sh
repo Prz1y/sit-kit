@@ -59,6 +59,7 @@ load_config() {
 
     if [ -f "$CONF_FILE" ]; then
         log_info "加载配置文件: ${CONF_FILE}"
+        # shellcheck source=/dev/null
         source "$CONF_FILE"
     fi
 
@@ -258,7 +259,7 @@ detect_system_disk() {
     fi
 
     local slaves
-    slaves=$(lsblk -nlo NAME,TYPE / 2>/dev/null | grep -v "disk\|part" | while read -r n t; do
+    slaves=$(lsblk -nlo NAME,TYPE / 2>/dev/null | grep -v "disk\|part" | while read -r n _; do
         lsblk -s -nlo NAME,TYPE "/dev/${n}" 2>/dev/null | grep disk | awk '{print "/dev/" $1}'
     done | sort -u || true)
 
@@ -541,7 +542,8 @@ start_csv_monitor() {
     log_info "启动 OS 内存指标监控 (间隔 ${interval}s, 持续 ${duration}s)"
 
     {
-        local start_ts=$(date '+%s')
+        local start_ts
+        start_ts=$(date '+%s')
         echo "timestamp,mem_total_kb,mem_free_kb,mem_avail_kb,mem_used_pct,swap_total_kb,swap_used_kb,cached_kb,buffer_kb" > "$PMON_CSV"
         local end_ts=$(( start_ts + duration ))
         while [ "$(date '+%s')" -lt "$end_ts" ]; do
@@ -880,7 +882,7 @@ do_start() {
     [ "$swap_total" = "0" ] && log_info "swap 已成功关闭" || log_warn "swap 可能未完全关闭, 当前 swap 总量: ${swap_total}MB"
 
     log_info "Step 7: 启动监控..."
-    > "$PID_IPMI_MON"
+    : > "$PID_IPMI_MON"
 
     start_csv_monitor "$CSV_MON_INTERVAL" "$TOTAL_DURATION_SEC"
 
@@ -900,7 +902,7 @@ do_start() {
 
     local fio_mode
     local disk_index=0
-    > "$PID_FIO_LIST"
+    : > "$PID_FIO_LIST"
     : > "$FIO_MOUNT_LIST_FILE"
 
     if [ -n "$data_disks" ]; then
@@ -1019,7 +1021,11 @@ do_start() {
     echo "    CPU:    ${STRESS_CMD} --cpu (${cpu_cores} 核)"
     echo "    内存:   ${STRESS_CMD} --vm 2 --vm-bytes ${target_mem_mb}M (mode=${MEM_ACCESS_MODE})"
     echo "    硬盘:   fio 3.13 (50%读 50%写, 模式: ${fio_mode})"
-    echo "    监控:   ipmitool BMC 硬件监控 (每${IPMI_MON_INTERVAL}s) / OS内存 (每${CSV_MON_INTERVAL}s)"$( [ "${SKIP_IPMI:-false}" = "true" ] && echo " [跳过]" || echo "")
+    local monitor_suffix=""
+    if [ "${SKIP_IPMI:-false}" = "true" ]; then
+        monitor_suffix=" [跳过]"
+    fi
+    echo "    监控:   ipmitool BMC 硬件监控 (每${IPMI_MON_INTERVAL}s) / OS内存 (每${CSV_MON_INTERVAL}s)${monitor_suffix}"
     echo "----------------------------------------------"
     echo "  注意事项:"
     echo "  1. ${end_time} 后会自动执行 stop 进行收尾"
@@ -1196,7 +1202,9 @@ do_status() {
     else
         echo "  状态: 未运行"
         if [ -f "${LOG_DIR}/.end_timestamp" ]; then
-            echo "  上次结束: $(date -d @$(cat "${LOG_DIR}/.end_timestamp") '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo 'N/A')"
+            local end_ts_text
+            end_ts_text=$(cat "${LOG_DIR}/.end_timestamp")
+            echo "  上次结束: $(date -d "@${end_ts_text}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo 'N/A')"
         fi
         if [ -f "$REPORT_FILE" ]; then
             echo "  报告文件: ${REPORT_FILE}"
