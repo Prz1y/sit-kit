@@ -82,7 +82,7 @@ echo "--------------------------------------------------"
 echo "Step 3: Start memtester (Run for 4 Hours)"
 echo "--------------------------------------------------"
 echo "[Step 3] Starting memtester for 4 hours..."
-echo "  Command: timeout "$DURATION" memtester "$MEM_SIZE" 0"
+echo "  Command: timeout $DURATION memtester $MEM_SIZE 0"
 timeout "$DURATION" memtester "$MEM_SIZE" 0 > "$MEMTESTER_LOG" 2>&1 &
 MEMTESTER_PID=$!
 echo "  memtester PID: $MEMTESTER_PID"
@@ -121,7 +121,7 @@ if [ -f /var/log/messages ]; then
 else
     echo "No /var/log/messages found" > "$LOG_DIR/messages_missing.txt"
 fi
-journalctl --since "$(cat $LOG_DIR/test_start_marker.txt | cut -d' ' -f4-)" > "$LOG_DIR/journalctl_$TIMESTAMP.log" 2>&1 || echo "journalctl failed" > "$LOG_DIR/journalctl_error.txt"
+journalctl --since "$(cut -d' ' -f4- "$LOG_DIR/test_start_marker.txt")" > "$LOG_DIR/journalctl_$TIMESTAMP.log" 2>&1 || echo "journalctl failed" > "$LOG_DIR/journalctl_error.txt"
 
 echo "  Checking ECC errors in dmesg..."
 ECC_ERRORS=$(dmesg | grep -i "ecc\|edac\|memory error\|corrected\|uncorrected" || true)

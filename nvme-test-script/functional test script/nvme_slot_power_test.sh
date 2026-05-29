@@ -76,7 +76,7 @@ test_drive() {
         # F. 步骤 7: 验证识别与读写
         echo "Waiting for device to reappear..."
         local found=false
-        for i in {1..30}; do
+        for _ in {1..30}; do
             [ -e "$dev_path" ] && { found=true; break; }
             sleep 1
         done
@@ -103,12 +103,12 @@ test_drive() {
 
 # --- 3. 主流程控制 ---
 drives=$(ls /dev/nvme*n1 | sort -V)
-log "Found $(echo $drives | wc -w) drives. Starting parallel physical power cycle..."
+log "Found $(wc -w <<< \"$drives\") drives. Starting parallel physical power cycle..."
 
 pids=()
 for d in $drives; do
     test_drive "$d" &
-    pids+=($!)
+    pids+=("$!")
 done
 
 log "All threads launched. Waiting for completion..."

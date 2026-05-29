@@ -62,7 +62,7 @@ echo " RDMA 服务端测试"
 echo "============================================"
 
 SUMMARY_FILE="${RESULT_DIR}/_summary.txt"
-> "$SUMMARY_FILE"
+: > "$SUMMARY_FILE"
 
 for cfg in "${TEST_PORTS[@]}"; do
     read -r IFACE LOCAL_CIDR <<< "$cfg"

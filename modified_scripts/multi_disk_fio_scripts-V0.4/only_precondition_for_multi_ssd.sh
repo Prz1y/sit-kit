@@ -11,7 +11,6 @@ if [[ -z "$path_to_fio" ]];then
 fi
 
 IO_ENGINE="libaio"
-FILE_SIZE="100%"
 
 move_glob()
 {
@@ -24,16 +23,13 @@ move_glob()
     fi
 }
 
-PARA_LINE="-end_fsync=0 -group_reporting -direct=1 -ioengine=${IO_ENGINE} -thread -time_based -buffer_compress_percentage=0 -invalidate=1 \
--norandommap -randrepeat=0 -exitall -size=${FILE_SIZE}"
-
 PARA_LINE1="-end_fsync=0 -group_reporting -direct=1 -ioengine=${IO_ENGINE} -thread -buffer_compress_percentage=0 -invalidate=1 \
 -norandommap -randrepeat=0 -exitall"
 
 filter_ssd_hdd_nvme_set()
 {
     rm -f ssd_symbol_set hdd_symbol_set nvme_symbol_set raid_symbol_set
-    os_disk_symbol=$(echo $(lsblk |grep -B1 -E "part|boot" |grep -E "^sd[a-z]+|^nvme|^vd[a-z]+" |awk '{print $1}') |sed 's/ /|/')
+    os_disk_symbol=$(lsblk | grep -B1 -E "part|boot" | grep -E "^sd[a-z]+|^nvme|^vd[a-z]+" | awk '{print $1}' | xargs | sed 's/ /|/g')
     non_os_disk_set=$(lsscsi -g |grep -E "ATA|TOSHIBA" |awk '{print $(NF-1)}' |grep -Ewv -- "$os_disk_symbol")
     if [[ -n $non_os_disk_set ]];then
         for i in $(echo "$non_os_disk_set")
@@ -80,7 +76,7 @@ sata_ssd_precondition()
     # multi sata ssd precondition
     if [ -s ssd_symbol_set ];then
         if [ -d sata_precondition_log ];then
-            mv sata_precondition_log sata_precondition_log_$(date +%Y%m%d%H%M%S)
+            mv sata_precondition_log "sata_precondition_log_$(date +%Y%m%d%H%M%S)"
             mkdir -p sata_precondition_log
         else
             mkdir -p sata_precondition_log
@@ -126,7 +122,7 @@ nvme_ssd_precondition()
     if [ -s nvme_symbol_set ];then
         nvme_format
         if [ -d nvme_precondition_log ];then
-            mv nvme_precondition_log nvme_precondition_log_$(date +%Y%m%d%H%M%S)
+            mv nvme_precondition_log "nvme_precondition_log_$(date +%Y%m%d%H%M%S)"
             mkdir -p nvme_precondition_log
         else
             mkdir -p nvme_precondition_log
@@ -134,14 +130,14 @@ nvme_ssd_precondition()
         # sequential precondition
         for dev in $(cat nvme_symbol_set)
         do
-            ssd_fragment_sequence "$dev" &>"sata_precondition_log/${dev}_fragment1.log" &
+            ssd_fragment_sequence "$dev" &>"nvme_precondition_log/${dev}_fragment1.log" &
         done
         wait
         sleep 30
         # random precondition
         for dev in $(cat nvme_symbol_set)
         do
-            ssd_fragment_random "$dev" &>"sata_precondition_log/${dev}_fragment2.log" &
+            ssd_fragment_random "$dev" &>"nvme_precondition_log/${dev}_fragment2.log" &
         done
         wait
         sleep 30
