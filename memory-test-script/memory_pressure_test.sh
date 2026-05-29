@@ -8,6 +8,7 @@ START_FLAG="${LOG_DIR}/.test_running"
 START_TIME_FILE="${LOG_DIR}/pressure_start_time.log"
 END_TIME_FILE="${LOG_DIR}/pressure_end_time.log"
 MEMTESTER_LOG="${LOG_DIR}/memtester.log"
+MEMTESTER_RAW_LOG="${LOG_DIR}/memtester_raw.log"
 NMON_PID_FILE="${LOG_DIR}/.nmon_pid"
 MEMTESTER_PID_FILE="${LOG_DIR}/.memtester_pid"
 
@@ -32,9 +33,18 @@ check_prerequisites() {
     echo "[INFO]  $(date '+%Y-%m-%d %H:%M:%S')  所有依赖检查通过 (memtester / nmon / bc / dmidecode)"
 }
 
+is_memtester_pid() {
+    local pid="$1"
+    [ -n "$pid" ] || return 1
+    [ -d "/proc/$pid" ] || return 1
+    grep -aqE "(memtester|timeout).*memtester|memtester" "/proc/$pid/cmdline" 2>/dev/null
+}
+
 check_test_running() {
-    if [ -f "$START_FLAG" ]; then
-        if pgrep -f "memtester" > /dev/null 2>&1; then
+    local pid
+    if [ -f "$START_FLAG" ] && [ -f "$MEMTESTER_PID_FILE" ]; then
+        pid=$(cat "$MEMTESTER_PID_FILE" 2>/dev/null || true)
+        if is_memtester_pid "$pid" && kill -0 "$pid" 2>/dev/null; then
             return 0
         fi
     fi
@@ -56,6 +66,7 @@ do_start() {
     exec &> >(tee -a "${LOG_DIR}/console_output.log")
 
     echo "[INFO]  $(date '+%Y-%m-%d %H:%M:%S')  Step 1: 清除历史日志..."
+    dmesg > "${LOG_DIR}/dmesg_before_clear.log" 2>/dev/null || true
     dmesg -C
     echo "" > /var/log/messages 2>/dev/null || true
     echo "[INFO]  $(date '+%Y-%m-%d %H:%M:%S')  dmesg / messages 日志已清除"
@@ -90,7 +101,9 @@ do_start() {
     fi
 
     echo "[INFO]  $(date '+%Y-%m-%d %H:%M:%S')  Step 5: 关闭 swap..."
-    swapoff -a 2>/dev/null || true
+    if ! swapoff -a 2>/dev/null; then
+        echo "[WARN]  $(date '+%Y-%m-%d %H:%M:%S')  swap 关闭失败，测试结果可能不准确" >&2
+    fi
     local swap_status
     swap_status=$(free -m | awk '/Swap/{print $2}')
     if [ "$swap_status" = "0" ]; then
@@ -114,10 +127,11 @@ do_start() {
     echo "[INFO]  $(date '+%Y-%m-%d %H:%M:%S')  nmon 已启动, PID: $nmon_pid"
 
     echo "[INFO]  $(date '+%Y-%m-%d %H:%M:%S')  Step 8: 启动 memtester 压力测试 (48H 超时自动停止)..."
-    nohup timeout 172800 memtester "${test_mb}M" 2>&1 | tr -d '\b' | grep -vE 'setting|testing' > "$MEMTESTER_LOG" &
+    setsid timeout 172800 memtester "${test_mb}M" > "$MEMTESTER_RAW_LOG" 2>&1 &
     local memtester_pid=$!
     echo "$memtester_pid" > "$MEMTESTER_PID_FILE"
-    echo "[INFO]  $(date '+%Y-%m-%d %H:%M:%S')  memtester 已启动, 管道 PID: $memtester_pid (172800s 后自动停止)"
+    ln -sf "$(basename "$MEMTESTER_RAW_LOG")" "$MEMTESTER_LOG" 2>/dev/null || cp "$MEMTESTER_RAW_LOG" "$MEMTESTER_LOG" 2>/dev/null || true
+    echo "[INFO]  $(date '+%Y-%m-%d %H:%M:%S')  memtester 已启动, PID: $memtester_pid (172800s 后自动停止)"
 
     touch "$START_FLAG"
 
@@ -157,11 +171,15 @@ do_stop() {
     if [ -f "$MEMTESTER_PID_FILE" ]; then
         local pid
         pid=$(cat "$MEMTESTER_PID_FILE")
-        if kill -0 "$pid" 2>/dev/null; then
-            echo "[INFO]  $(date '+%Y-%m-%d %H:%M:%S')  停止 memtester (PID: $pid)..."
+        if is_memtester_pid "$pid" && kill -0 "$pid" 2>/dev/null; then
+            echo "[INFO]  $(date '+%Y-%m-%d %H:%M:%S')  停止 memtester 进程组 (PID: $pid)..."
+            kill -- -"$pid" 2>/dev/null || true
             kill "$pid" 2>/dev/null || true
             sleep 2
-            kill -9 "$pid" 2>/dev/null || true
+            if is_memtester_pid "$pid" && kill -0 "$pid" 2>/dev/null; then
+                kill -9 -- -"$pid" 2>/dev/null || true
+                kill -9 "$pid" 2>/dev/null || true
+            fi
             echo "[INFO]  $(date '+%Y-%m-%d %H:%M:%S')  memtester 已停止"
         else
             echo "[INFO]  $(date '+%Y-%m-%d %H:%M:%S')  memtester 已自行结束"
@@ -180,7 +198,6 @@ do_stop() {
         fi
     fi
 
-    pkill -f "memtester" 2>/dev/null || true
 
     echo "[INFO]  $(date '+%Y-%m-%d %H:%M:%S')  记录测试结束时间..."
     date '+%Y-%m-%d %H:%M:%S' | tee "$END_TIME_FILE"
@@ -244,7 +261,7 @@ do_stop() {
     fi
 
     local dmesg_err
-    dmesg_err=$(grep -ciE "error|fail|warn|BUG|Call Trace|Oops" "${LOG_DIR}/dmesg_pressure.log" 2>/dev/null; true)
+    dmesg_err=$(grep -ciE "error|fail|warning|WARN|BUG|Call Trace|Oops" "${LOG_DIR}/dmesg_pressure.log" 2>/dev/null; true)
     dmesg_err=$(echo "$dmesg_err" | tr -d '[:space:]')
     if [ -z "$dmesg_err" ] || [ "$dmesg_err" = "0" ]; then
         echo "  dmesg 异常计数: 0 OK"

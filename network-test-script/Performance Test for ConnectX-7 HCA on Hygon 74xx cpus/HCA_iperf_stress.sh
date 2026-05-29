@@ -41,6 +41,13 @@ usage() {
 }
 
 # 终极侦测硬件 NUMA 节点逻辑 (优先使用 lspci)
+validate_config() {
+    if [[ "$PORT1_DEV" == *"这里"* ]] || [[ "$PORT2_DEV" == *"这里"* ]]; then
+        echo "请先修改 PORT1_DEV/PORT2_DEV 为实际网卡名" >&2
+        exit 1
+    fi
+}
+
 get_hw_numa() {
     local dev="$1"
     local pci_id=""
@@ -48,7 +55,7 @@ get_hw_numa() {
 
     # 1. 解析设备的 PCI ID
     if [ -e "/sys/class/net/$dev/device" ]; then
-        pci_id=$(basename $(readlink /sys/class/net/$dev/device))
+        pci_id=$(basename "$(readlink "/sys/class/net/$dev/device")")
     elif [ -e "/sys/class/infiniband/$dev/device" ]; then
         pci_id=$(basename $(readlink /sys/class/infiniband/$dev/device))
     fi
@@ -118,18 +125,19 @@ run_cmd() {
         fi
     fi
 
-    cmd="numactl -N $app_numa -m $app_numa $cmd"
-    echo ">>> [设备: $dev] 执行命令: $cmd"
-    nohup $cmd > "$log_file" 2>&1 &
+    read -r -a cmd_parts <<< "$cmd"
+    local -a full_cmd=(numactl -N "$app_numa" -m "$app_numa" "${cmd_parts[@]}")
+    echo ">>> [设备: $dev] 执行命令: ${full_cmd[*]}"
+    nohup "${full_cmd[@]}" > "$log_file" 2>&1 &
     echo ">>> 进程 PID: $! | 日志: $log_file"
     echo "------------------------------------------------------"
 }
 
 check_env() {
     for pkg in iperf numactl pciutils; do
-        if ! command -v $pkg &> /dev/null; then
+        if ! command -v "$pkg" &> /dev/null; then
             yum install epel-release -y &>/dev/null
-            yum install $pkg -y
+            yum install "$pkg" -y
         fi
     done
     if ! command -v ib_write_bw &> /dev/null; then
@@ -139,17 +147,17 @@ check_env() {
 
 setup_ip() {
     local role=$1
-    ip addr flush dev $PORT1_DEV 2>/dev/null
-    ip addr flush dev $PORT2_DEV 2>/dev/null
+    ip addr flush dev "$PORT1_DEV" 2>/dev/null
+    ip addr flush dev "$PORT2_DEV" 2>/dev/null
     if [ "$role" == "server" ]; then
-        ip addr add $PORT1_SERVER_IP/24 dev $PORT1_DEV
-        ip addr add $PORT2_SERVER_IP/24 dev $PORT2_DEV
+        ip addr add "$PORT1_SERVER_IP"/24 dev "$PORT1_DEV"
+        ip addr add "$PORT2_SERVER_IP"/24 dev "$PORT2_DEV"
     elif [ "$role" == "client" ]; then
-        ip addr add $PORT1_CLIENT_IP/24 dev $PORT1_DEV
-        ip addr add $PORT2_CLIENT_IP/24 dev $PORT2_DEV
+        ip addr add "$PORT1_CLIENT_IP"/24 dev "$PORT1_DEV"
+        ip addr add "$PORT2_CLIENT_IP"/24 dev "$PORT2_DEV"
     fi
-    ip link set dev $PORT1_DEV up
-    ip link set dev $PORT2_DEV up
+    ip link set dev "$PORT1_DEV" up
+    ip link set dev "$PORT2_DEV" up
 }
 
 run_iperf_server() {
@@ -192,6 +200,8 @@ while [[ "$#" -gt 0 ]]; do
         *) usage ;;
     esac
 done
+
+validate_config
 
 case "$ACTION" in
     env) check_env ;;

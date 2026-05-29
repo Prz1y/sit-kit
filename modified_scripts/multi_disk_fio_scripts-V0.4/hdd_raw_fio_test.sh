@@ -12,8 +12,8 @@ fi
 devname="$1"
 #Sequence write/read test of HDD
 "$SCRIPT_DIR/raw_disk_fio_test.sh" -v -d "$devname"
-sleep 30s
+sleep 30
 
 #Random write/read test of HDD
 "$SCRIPT_DIR/raw_disk_fio_test.sh" -V -d "$devname"
-sleep 30s
+sleep 30

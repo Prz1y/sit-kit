@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-set -o pipefail
+set -euo pipefail
 
 CPWD="$(cd -- "$(dirname -- "$0")" && pwd)"
-cd "$CPWD"
+cd "$CPWD" || exit 1
 
 path_to_fio="$(command -v fio 2>/dev/null || true)"
 if [[ -z "$path_to_fio" ]];then
@@ -53,7 +53,7 @@ filter_ssd_hdd_nvme_set()
     if [[ -n $is_os_nvme ]];then
         os_nvme_symbol=$(echo "$is_os_nvme" |grep -Eo "nvme[0-9]+n1")
     else
-        os_nvme_symbol=null
+        os_nvme_symbol='^$'
     fi
     nvme_info_set=$(nvme list |grep -E "nvme[0-9]+n1" |grep -v -- "$os_nvme_symbol")
     if [[ -n $nvme_info_set ]];then
@@ -88,22 +88,22 @@ sata_ssd_precondition()
 	# sequential precondition
         for dev in $(cat ssd_symbol_set)
         do
-            ssd_fragment_sequence "$dev" &>/dev/null &
+            ssd_fragment_sequence "$dev" &>"sata_precondition_log/${dev}_fragment1.log" &
         done
         wait
-        sleep 30s
+        sleep 30
         # random precondition
         for dev in $(cat ssd_symbol_set)
 	do
-            ssd_fragment_random "$dev" &>/dev/null &
+            ssd_fragment_random "$dev" &>"sata_precondition_log/${dev}_fragment2.log" &
         done
         wait
-        sleep 30s
+        sleep 30
 
         move_glob "ssd_*_fragment1.log" "sata_precondition_log"
         move_glob "ssd_*_fragment2.log" "sata_precondition_log"
     fi
-    cd "$CPWD"
+    cd "$CPWD" || exit 1
 }
 
 nvme_format()
@@ -114,9 +114,10 @@ nvme_format()
     fi
     for dev in $(cat nvme_symbol_set)
     do
+        echo "[$(date '+%F %T')] nvme format /dev/$dev" >> "$CPWD/nvme_format_audit.log"
         nvme format "/dev/$dev"
     done
-    cd "$CPWD"
+    cd "$CPWD" || exit 1
 }
 
 nvme_ssd_precondition()
@@ -133,21 +134,21 @@ nvme_ssd_precondition()
         # sequential precondition
         for dev in $(cat nvme_symbol_set)
         do
-            ssd_fragment_sequence "$dev" &>/dev/null &
+            ssd_fragment_sequence "$dev" &>"sata_precondition_log/${dev}_fragment1.log" &
         done
         wait
-        sleep 30s
+        sleep 30
         # random precondition
         for dev in $(cat nvme_symbol_set)
         do
-            ssd_fragment_random "$dev" &>/dev/null &
+            ssd_fragment_random "$dev" &>"sata_precondition_log/${dev}_fragment2.log" &
         done
         wait
-        sleep 30s
+        sleep 30
         move_glob "ssd_*_fragment1.log" "nvme_precondition_log"
         move_glob "ssd_*_fragment2.log" "nvme_precondition_log"
     fi
-    cd "$CPWD"
+    cd "$CPWD" || exit 1
 }
 
 filter_ssd_hdd_nvme_set

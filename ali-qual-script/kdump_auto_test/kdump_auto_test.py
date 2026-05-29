@@ -76,20 +76,27 @@ PASS 标准:
 """
 
 import argparse
+import ipaddress
 import subprocess
 import time
 import sys
 import os
 import shutil
 import logging
+import tempfile
 from datetime import datetime
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
-)
 logger = logging.getLogger("kdump_test")
+logger.setLevel(logging.INFO)
+logger.handlers.clear()
+logger.propagate = False
+_log_format = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+_stream_handler = logging.StreamHandler(sys.stdout)
+_stream_handler.setFormatter(_log_format)
+_file_handler = logging.FileHandler("kdump_test.log", encoding="utf-8")
+_file_handler.setFormatter(_log_format)
+logger.addHandler(_stream_handler)
+logger.addHandler(_file_handler)
 
 
 class KdumpAutoTest:
@@ -105,6 +112,7 @@ class KdumpAutoTest:
         sol_log_file="./sol_output.log",
         reboot_timeout=1200,
         crash_timeout=1800,
+        crashkernel_size="512M",
     ):
         self.sut_ip = sut_ip
         self.bmc_ip = bmc_ip
@@ -116,8 +124,10 @@ class KdumpAutoTest:
         self.sol_log_file = sol_log_file
         self.reboot_timeout = reboot_timeout
         self.crash_timeout = crash_timeout
+        self.crashkernel_size = crashkernel_size
 
         self.sol_process = None
+        self.ipmi_pass_file = None
         self.test_result = {"vmcore_found": False, "crash_kernel_booted": False, "details": ""}
 
     # ==================== SSH 工具方法 ====================
@@ -125,7 +135,7 @@ class KdumpAutoTest:
     def ssh_cmd(self, command, timeout=60):
         """在 SUT 上通过 SSH 执行命令，返回 (returncode, stdout, stderr)"""
         full_cmd = [
-            "sshpass", "-p", self.ssh_pass,
+            "sshpass", "-e",
             "ssh",
             "-o", "StrictHostKeyChecking=no",
             "-o", "UserKnownHostsFile=/dev/null",
@@ -135,12 +145,15 @@ class KdumpAutoTest:
             command,
         ]
         logger.info(f"[SSH] 执行: {command}")
+        env = os.environ.copy()
+        env["SSHPASS"] = self.ssh_pass
         try:
             proc = subprocess.run(
                 full_cmd,
                 capture_output=True,
                 text=True,
                 timeout=timeout,
+                env=env,
             )
             return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
         except subprocess.TimeoutExpired:
@@ -172,16 +185,30 @@ class KdumpAutoTest:
 
     # ==================== BMC / SOL 工具方法 ====================
 
-    def ipmitool(self, command, timeout=30):
+    def _ensure_ipmi_password_file(self):
+        if self.ipmi_pass_file and os.path.exists(self.ipmi_pass_file):
+            return self.ipmi_pass_file
+
+        fd, path = tempfile.mkstemp(prefix="kdump_ipmi_", text=True)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(self.bmc_pass)
+        os.chmod(path, 0o600)
+        self.ipmi_pass_file = path
+        return path
+
+    def ipmitool(self, args_list, timeout=30):
         """执行 ipmitool 命令"""
+        if isinstance(args_list, str):
+            raise TypeError("args_list must be a list of ipmitool arguments")
+
         base = [
             "ipmitool", "-I", "lanplus",
             "-H", self.bmc_ip,
             "-U", self.bmc_user,
-            "-P", self.bmc_pass,
+            "-f", self._ensure_ipmi_password_file(),
         ]
-        full_cmd = base + command.split()
-        logger.info(f"[IPMI] 执行: {' '.join(command.split())}")
+        full_cmd = base + list(args_list)
+        logger.info(f"[IPMI] 执行: {' '.join(args_list)}")
         try:
             proc = subprocess.run(
                 full_cmd,
@@ -201,7 +228,7 @@ class KdumpAutoTest:
             "ipmitool", "-I", "lanplus",
             "-H", self.bmc_ip,
             "-U", self.bmc_user,
-            "-P", self.bmc_pass,
+            "-f", self._ensure_ipmi_password_file(),
             "sol", "activate",
         ]
         logger.info(f"[SOL] 启动串口会话，输出到: {self.sol_log_file}")
@@ -309,7 +336,8 @@ class KdumpAutoTest:
         logger.info(f"[Step 1] kdump 状态:\n{out}")
 
         if ret != 0 and "active" not in out.lower():
-            logger.warning("[Step 1] kdump 服务可能未正常启动，继续尝试...")
+            logger.error("[Step 1] kdump 服务启动失败")
+            return False
 
         return True
 
@@ -320,7 +348,7 @@ class KdumpAutoTest:
         logger.info("=" * 60)
 
         # 先测试 BMC 连通性
-        ret, out, err = self.ipmitool("power status")
+        ret, out, err = self.ipmitool(["power", "status"])
         if ret != 0:
             logger.error(f"[Step 2] BMC 不可达: {err}")
             return False
@@ -371,7 +399,7 @@ class KdumpAutoTest:
     def step4_configure_crashkernel(self):
         """配置 crashkernel=512M 并重启"""
         logger.info("=" * 60)
-        logger.info("[Step 4] 配置 crashkernel=512M")
+        logger.info(f"[Step 4] 配置 crashkernel={self.crashkernel_size}")
         logger.info("=" * 60)
 
         # 检测 grub 类型
@@ -393,7 +421,7 @@ class KdumpAutoTest:
             self.ssh_cmd(
                 "sed -i 's/crashkernel=[^ \"]*//g' /etc/default/grub"
             )
-            # 重新添加 crashkernel=512M
+            # 重新添加 crashkernel 参数
             self.ssh_cmd(
                 'sed -i \'s/GRUB_CMDLINE_LINUX="/GRUB_CMDLINE_LINUX="crashkernel=512M /\''
                 ' /etc/default/grub'
@@ -446,8 +474,8 @@ class KdumpAutoTest:
         # 验证 crashkernel 参数
         ret, out, _ = self.ssh_cmd("cat /proc/cmdline")
         logger.info(f"[Step 4] /proc/cmdline: {out}")
-        if "crashkernel=512M" in out:
-            logger.info("[Step 4] crashkernel=512M 配置验证通过 [PASS]")
+        if f"crashkernel={self.crashkernel_size}" in out:
+            logger.info(f"[Step 4] crashkernel={self.crashkernel_size} 配置验证通过 [PASS]")
             return True
         else:
             logger.error(f"[Step 4] crashkernel 配置验证失败！当前 cmdline: {out}")
@@ -492,8 +520,11 @@ class KdumpAutoTest:
                 self.start_sol_session()
                 time.sleep(2)
 
-            ret, out, err = self.ipmitool("chassis power diag", timeout=30)
+            ret, out, err = self.ipmitool(["chassis", "power", "diag"], timeout=30)
             logger.info(f"[Step 5] ipmitool chassis power diag: ret={ret}, out={out}, err={err}")
+            if ret != 0:
+                logger.error(f"[Step 5] 带外触发失败: {err}")
+                return False
 
         # 等待 crash 过程（SOL 中观察）
         logger.info(f"[Step 5] 等待 crash dump 过程（{self.crash_timeout}s 超时）...")
@@ -525,6 +556,15 @@ class KdumpAutoTest:
                     pass
 
         return True
+
+    def cleanup(self):
+        self.stop_sol_session()
+        if self.ipmi_pass_file and os.path.exists(self.ipmi_pass_file):
+            try:
+                os.remove(self.ipmi_pass_file)
+            except OSError:
+                pass
+            self.ipmi_pass_file = None
 
     def step6_verify_vmcore(self):
         """检查 /var/crash 目录下是否有 vmcore 文件"""
@@ -573,71 +613,73 @@ class KdumpAutoTest:
         logger.info(f"     Crash 方法: {crash_methods}")
         logger.info("=" * 70)
 
-        # Step 1: 确保 kdump 服务
-        if not self.step1_ensure_kdump_service():
-            logger.error("Step 1 失败，终止测试")
-            return False
-
-        # Step 2: 打开 SOL
-        if not self.step2_open_sol():
-            logger.error("Step 2 失败，终止测试")
-            return False
-
-        # Step 3: 配置 sysctl
-        if not self.step3_configure_sysctl():
-            logger.warning("Step 3 可能未完全成功，继续...")
-
-        # Step 4: 配置 crashkernel + 重启
-        if not self.step4_configure_crashkernel():
-            logger.error("Step 4 失败，终止测试")
-            self.stop_sol_session()
-            return False
-
-        # 重启后需要重新打开 SOL
-        self.stop_sol_session()
-        time.sleep(5)
-        self.start_sol_session()
-        time.sleep(3)
-
         all_passed = True
 
-        for method in crash_methods:
-            logger.info(f"\n{'#' * 60}")
-            logger.info(f"# 开始 {method.upper()} crash 测试")
-            logger.info(f"{'#' * 60}")
+        try:
+            # Step 1: 确保 kdump 服务
+            if not self.step1_ensure_kdump_service():
+                logger.error("Step 1 失败，终止测试")
+                return False
 
-            # Step 5: 触发 crash
-            self.step5_trigger_crash(method=method)
+            # Step 2: 打开 SOL
+            if not self.step2_open_sol():
+                logger.error("Step 2 失败，终止测试")
+                return False
 
-            # 分析 SOL 日志
-            kdump_ok = self.analyze_sol_log()
-            self.test_result["crash_kernel_booted"] = kdump_ok
+            # Step 3: 配置 sysctl
+            if not self.step3_configure_sysctl():
+                logger.warning("Step 3 可能未完全成功，继续...")
 
-            # 等待系统重启恢复
-            logger.info("[MAIN] 等待 SUT crash 后重启恢复...")
-            if not self.wait_ssh_ready(timeout=self.reboot_timeout):
-                logger.error(f"[MAIN] {method} crash 后 SUT 未能恢复")
-                all_passed = False
-                continue
+            # Step 4: 配置 crashkernel + 重启
+            if not self.step4_configure_crashkernel():
+                logger.error("Step 4 失败，终止测试")
+                return False
 
-            # 重启后重新打开 SOL（为下一次测试准备）
+            # 重启后需要重新打开 SOL
             self.stop_sol_session()
-            time.sleep(3)
+            time.sleep(5)
             self.start_sol_session()
             time.sleep(3)
 
-            # Step 6: 验证 vmcore
-            if not self.step6_verify_vmcore():
-                logger.error(f"[MAIN] {method} 测试: vmcore 验证失败 [FAIL]")
-                all_passed = False
-            else:
-                logger.info(f"[MAIN] {method} 测试: 通过 [PASS]")
+            for method in crash_methods:
+                logger.info(f"\n{'#' * 60}")
+                logger.info(f"# 开始 {method.upper()} crash 测试")
+                logger.info(f"{'#' * 60}")
 
-            # 清理 vmcore（可选，为下一次测试腾空间）
-            # self.ssh_cmd("rm -rf /var/crash/*")
+                # Step 5: 触发 crash
+                if not self.step5_trigger_crash(method=method):
+                    all_passed = False
+                    continue
 
-        # 清理
-        self.stop_sol_session()
+                # 分析 SOL 日志
+                kdump_ok = self.analyze_sol_log()
+                self.test_result["crash_kernel_booted"] = kdump_ok
+
+                # 等待系统重启恢复
+                logger.info("[MAIN] 等待 SUT crash 后重启恢复...")
+                if not self.wait_ssh_ready(timeout=self.reboot_timeout):
+                    logger.error(f"[MAIN] {method} crash 后 SUT 未能恢复")
+                    all_passed = False
+                    continue
+
+                # 重启后重新打开 SOL（为下一次测试准备）
+                self.stop_sol_session()
+                time.sleep(3)
+                self.start_sol_session()
+                time.sleep(3)
+
+                # Step 6: 验证 vmcore
+                if not self.step6_verify_vmcore():
+                    logger.error(f"[MAIN] {method} 测试: vmcore 验证失败 [FAIL]")
+                    all_passed = False
+                else:
+                    logger.info(f"[MAIN] {method} 测试: 通过 [PASS]")
+
+                # 清理 vmcore（可选，为下一次测试腾空间）
+                # self.ssh_cmd("rm -rf /var/crash/*")
+
+        finally:
+            self.cleanup()
 
         logger.info("\n" + "=" * 70)
         logger.info(f"     测试结果: {'[PASS] 全部通过' if all_passed else '[FAIL] 存在失败'}")
@@ -656,6 +698,7 @@ def main():
     parser.add_argument("--ssh-user", required=True, help="SSH 用户名")
     parser.add_argument("--ssh-pass", required=True, help="SSH 密码")
     parser.add_argument("--ssh-port", type=int, default=22, help="SSH 端口")
+    parser.add_argument("--crashkernel-size", default="512M", help="crashkernel 参数值，默认 512M")
     parser.add_argument("--crash-method", default="both",
                         choices=["inband", "outband", "both"],
                         help="Crash 触发方式")
@@ -669,6 +712,13 @@ def main():
                         help="跳过环境配置（Step 1-4），仅执行 crash 和验证")
 
     args = parser.parse_args()
+
+    for ip_value, label in ((args.sut_ip, "sut-ip"), (args.bmc_ip, "bmc-ip")):
+        try:
+            ipaddress.ip_address(ip_value)
+        except ValueError:
+            logger.error(f"无效的 {label}: {ip_value}")
+            sys.exit(1)
 
     # 检查依赖
     for dep in ["sshpass", "ipmitool"]:
@@ -689,19 +739,25 @@ def main():
         sol_log_file=args.sol_log,
         reboot_timeout=args.reboot_timeout,
         crash_timeout=args.crash_timeout,
+        crashkernel_size=args.crashkernel_size,
     )
 
     if args.skip_config:
-        # 跳过配置，直接测试
+        all_passed = True
         logger.info("[SKIP] 跳过环境配置步骤")
-        tester.start_sol_session()
-        time.sleep(3)
-        for method in methods:
-            tester.step5_trigger_crash(method=method)
-            tester.analyze_sol_log()
-            tester.wait_ssh_ready()
-            tester.step6_verify_vmcore()
-        tester.stop_sol_session()
+        try:
+            tester.start_sol_session()
+            time.sleep(3)
+            for method in methods:
+                if not tester.step5_trigger_crash(method=method):
+                    all_passed = False
+                    continue
+                all_passed = tester.analyze_sol_log() and all_passed
+                all_passed = tester.wait_ssh_ready() and all_passed
+                all_passed = tester.step6_verify_vmcore() and all_passed
+        finally:
+            tester.cleanup()
+        sys.exit(0 if all_passed else 1)
     else:
         success = tester.run_full_test(crash_methods=methods)
         sys.exit(0 if success else 1)

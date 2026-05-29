@@ -3,7 +3,7 @@
 # ==========================================
 # 1. 基础配置
 # ==========================================
-DEV="/dev/sdb"               # 盘符
+DEV="${1:-/dev/sdb}"               # 盘符
 RESULT_DIR="fio_results_$(date +%Y%m%d_%H%M%S)"
 SIZE="1G"                    # 测试数据范围；USB设备1G足够，NVMe/SATA SSD建议加大
 RAMP="10"                    # 10秒预热
@@ -52,15 +52,15 @@ run_fio() {
     # 执行fio并将结果保存到文件
     fio --name="$name" \
         --filename="$DEV" \
-        --ioengine=$ENGINE \
-        --direct=$DIRECT \
+        --ioengine="$ENGINE" \
+        --direct="$DIRECT" \
         --rw="$rw" \
         --bs="$bs" \
         --iodepth="$qd" \
         --numjobs="$nj" \
-        --size=$SIZE \
-        --ramp_time=$RAMP \
-        --runtime=$RUN \
+        --size="$SIZE" \
+        --ramp_time="$RAMP" \
+        --runtime="$RUN" \
         --time_based \
         --group_reporting \
         --output="$output_file"

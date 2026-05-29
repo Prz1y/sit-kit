@@ -1,4 +1,7 @@
 #!/bin/bash
+
+set -euo pipefail
+shopt -s nullglob
 # ==============================================================================
 # NVMe Hotplug Test 
 # 功能: 物理热插拔测试 (暴力拔盘)，不通知操作系统下电
@@ -42,8 +45,9 @@ log() {
 }
 
 get_bdf() {
-    local dev_name=$(basename $1)
-    local sys_link=$(readlink -f /sys/class/block/$dev_name/device/device) 2>/dev/null
+    local dev_name=$(basename "$1")
+    local sys_link
+    sys_link=$(readlink -f "/sys/class/block/$dev_name/device/device" 2>/dev/null)
     if [[ -z "$sys_link" ]]; then
         sys_link=$(readlink -f /sys/class/block/$dev_name/device)
     fi
@@ -66,8 +70,8 @@ bg_io_control() {
 
     if [[ "$action" == "start" ]]; then
         log "Starting Background IO on other NVMe drives..."
-        local all_devs=$(ls /dev/nvme*n1 2>/dev/null)
-        for dev in $all_devs; do
+        local all_devs=(/dev/nvme*n1)
+        for dev in "${all_devs[@]}"; do
             if [[ "$dev" != "$target_dev" ]]; then
                 fio --name=bg_stress_${dev##*/} --filename=$dev \
                     --ioengine=libaio --direct=1 --rw=read --bs=1024k \
@@ -111,7 +115,7 @@ run_cycle() {
     
     # --- 强力清理旧挂载和分区 (同步自新逻辑) ---
     umount -R "$MOUNT_DIR" 2>/dev/null
-    for part in ${current_dev}* ; do umount "$part" 2>/dev/null; done
+    for part in "${current_dev}"* ; do umount "$part" 2>/dev/null || true; done
     wipefs -a -q "$current_dev" >/dev/null 2>&1
     partprobe "$current_dev" 2>/dev/null
     udevadm settle
@@ -160,8 +164,14 @@ run_cycle() {
     log "Step 3: Waiting for physical removal..."
     
     # 循环检查直到设备消失
+    local waited=0
     while [ -b "$current_dev" ]; do
         sleep 1
+        waited=$((waited + 1))
+        if [ "$waited" -gt 300 ]; then
+            log "${RED}FAIL: Timed out waiting for device removal${NC}"
+            return 1
+        fi
     done
     
     log "${GREEN}PASS: Device node removed (Surprise).${NC}"
