@@ -57,7 +57,7 @@ get_hw_numa() {
     if [ -e "/sys/class/net/$dev/device" ]; then
         pci_id=$(basename "$(readlink "/sys/class/net/$dev/device")")
     elif [ -e "/sys/class/infiniband/$dev/device" ]; then
-        pci_id=$(basename $(readlink /sys/class/infiniband/$dev/device))
+        pci_id=$(basename "$(readlink "/sys/class/infiniband/$dev/device")")
     fi
 
     # 2. 用 lspci 抓取最准确的 NUMA 节点
@@ -81,7 +81,8 @@ get_hw_numa() {
 # 寻找相邻且可用的 NUMA 节点 (分离策略)
 get_adjacent_numa() {
     local hw_numa=$1
-    local available_nodes=($(ls -d /sys/devices/system/node/node[0-9]* 2>/dev/null | grep -o '[0-9]\+' | sort -n))
+    local available_nodes
+    mapfile -t available_nodes < <(for npath in /sys/devices/system/node/node[0-9]*; do [ -d "$npath" ] && echo "${npath##*node}"; done | sort -n)
     local target="-1"
 
     for n in "${available_nodes[@]}"; do

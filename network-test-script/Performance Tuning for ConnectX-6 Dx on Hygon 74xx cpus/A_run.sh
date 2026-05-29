@@ -11,7 +11,7 @@ NIC_NUMA=$(cat "/sys/class/net/${NIC1}/device/numa_node")
 echo "NIC NUMA 节点: $NIC_NUMA"
 
 # 获取该 NUMA 的 CPU 列表
-CPUS_ALL=($(numactl -H | grep "node $NIC_NUMA cpus:" | sed 's/.*cpus: //'))
+read -r -a CPUS_ALL <<< "$(numactl -H | grep "node $NIC_NUMA cpus:" | sed 's/.*cpus: //')"
 echo "NUMA $NIC_NUMA CPU 列表: ${CPUS_ALL[*]}"
 TOTAL=${#CPUS_ALL[@]}
 HALF=$((TOTAL / 2))

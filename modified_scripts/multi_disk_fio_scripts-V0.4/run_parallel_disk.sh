@@ -147,7 +147,7 @@ ssd_cap_set()
     if [[ -n $nvme_info_set ]];then
         for i in $(nvme list -o json |awk -F":" '/PhysicalSize/{print $2}' |sed -e 's/,//' -e 's/"//g' -e 's/^\s*//')
         do
-            nvmeCapDigit=$(echo $(echo "scale=2;$i/1000/1000/1000/1000" |bc))
+            nvmeCapDigit=$(echo "scale=2;$i/1000/1000/1000/1000" | bc)
             if [[ -n $(echo "$nvmeCapDigit" |grep "\.") ]];then
                 mnvmeCapDigit=$(echo "$nvmeCapDigit" |sed -e 's/\0$//' -e 's/\0$//' -e 's/\.$//')
                 echo "$mnvmeCapDigit" >> nvme_cap
@@ -191,8 +191,12 @@ get_cpu_numa_nvme_topo()
     rm -f numanode_nvme_map
     for dev in $(nvme list |awk '/nvme[0-9]*n1/{print $1}' |awk -F"/" '{print $3}' |sed 's/n1$//g')
     do
-        local busInfo=$(ls -l /sys/class/nvme | grep -w -- "$dev" |awk '{print $NF}' |awk -F"/" '{print $(NF-2)}')
-        local numaNode=$(cat /sys/bus/pci/devices/$busInfo/numa_node 2>/dev/null)
+        local dev_path
+        dev_path=$(readlink -f "/sys/class/nvme/${dev}/device" 2>/dev/null || true)
+        local busInfo
+        busInfo=$(basename "$dev_path")
+        local numaNode
+        numaNode=$(cat "/sys/bus/pci/devices/${busInfo}/numa_node" 2>/dev/null)
         # numa_node=-1 means NUMA info unavailable, treat as node 0
         if [[ -z $numaNode ]] || [[ $numaNode -lt 0 ]]; then
             numaNode=0
@@ -204,14 +208,14 @@ get_cpu_numa_nvme_topo()
     rm -f socket_numa_nvme_map
     for node in $(awk '{print $2}' cpu_numanode_map 2>/dev/null)
     do
-        if grep -q $node numanode_nvme_map 2>/dev/null; then
-            local socket=$(grep $node cpu_numanode_map |awk '{print $1}')
-            for label in $(grep $node numanode_nvme_map |awk '{print $2}')
+        if grep -qF -- "$node" numanode_nvme_map 2>/dev/null; then
+            local socket=$(grep -F -- "$node" cpu_numanode_map |awk '{print $1}')
+            for label in $(grep -F -- "$node" numanode_nvme_map |awk '{print $2}')
             do
                 echo -e "$socket $node $label" >> socket_numa_nvme_map
             done
         else
-            local socket=$(grep $node cpu_numanode_map |awk '{print $1}')
+            local socket=$(grep -F -- "$node" cpu_numanode_map |awk '{print $1}')
             echo -e "$socket $node nvme_label=NA" >> socket_numa_nvme_map
         fi
     done
@@ -244,7 +248,7 @@ nvme_parallel_fio_test()
     if [ -s nvme_symbol_set ];then
         nvme_format
         if [ -d nvme_fio_log ];then
-            mv nvme_fio_log nvme_fio_log_$(date +%Y%m%d%H%M%S)
+            mv nvme_fio_log "nvme_fio_log_$(date +%Y%m%d%H%M%S)"
             mkdir -p nvme_fio_log
         else
             mkdir -p nvme_fio_log
@@ -273,7 +277,7 @@ nvme_parallel_fio_test_with_cpusbind()
 	get_cpu_numa_nvme_topo
         nvme_format
         if [ -d cpusbind_nvme_fio_log ];then
-            mv cpusbind_nvme_fio_log cpusbind_nvme_fio_log_$(date +%Y%m%d%H%M%S)
+            mv cpusbind_nvme_fio_log "cpusbind_nvme_fio_log_$(date +%Y%m%d%H%M%S)"
             mkdir -p cpusbind_nvme_fio_log
         else
             mkdir -p cpusbind_nvme_fio_log
@@ -301,7 +305,7 @@ nvme_parallel_fio_stress_test()
     # multi nvme ssd fio test
     if [ -s nvme_symbol_set ];then
         if [ -d nvme_fio_stress_log ];then
-            mv nvme_fio_stress_log nvme_fio_stress_log_$(date +%Y%m%d%H%M%S)
+            mv nvme_fio_stress_log "nvme_fio_stress_log_$(date +%Y%m%d%H%M%S)"
             mkdir -p nvme_fio_stress_log
         else
             mkdir -p nvme_fio_stress_log
@@ -325,7 +329,7 @@ raid_parallel_fio_test()
     # multi raids combined with sata ssd fio test
     if [ -s raid_symbol_set ];then
         if [ -d ssd_raid_fio_log ];then
-            mv ssd_raid_fio_log ssd_raid_fio_log_$(date +%Y%m%d%H%M%S)
+            mv ssd_raid_fio_log "ssd_raid_fio_log_$(date +%Y%m%d%H%M%S)"
 	        mkdir -p ssd_raid_fio_log
         else
             mkdir -p ssd_raid_fio_log
@@ -353,7 +357,7 @@ ssd_parallel_fio_test()
     # multi sata ssd fio test
     if [ -s ssd_symbol_set ];then
         if [ -d ssd_fio_log ];then
-            mv ssd_fio_log ssd_fio_log_$(date +%Y%m%d%H%M%S)
+            mv ssd_fio_log "ssd_fio_log_$(date +%Y%m%d%H%M%S)"
             mkdir -p ssd_fio_log
         else
             mkdir -p ssd_fio_log
@@ -381,7 +385,7 @@ ssd_parallel_fio_stress_test()
     # multi sata/sas ssd fio test
     if [ -s ssd_symbol_set ];then
         if [ -d ssd_fio_stress_log ];then
-            mv ssd_fio_stress_log ssd_fio_stress_log_$(date +%Y%m%d%H%M%S)
+            mv ssd_fio_stress_log "ssd_fio_stress_log_$(date +%Y%m%d%H%M%S)"
             mkdir -p ssd_fio_stress_log
         else
             mkdir -p ssd_fio_stress_log
@@ -405,7 +409,7 @@ hdd_parallel_fio_test()
     # multi hdd fio test
     if [ -s hdd_symbol_set ];then
         if [ -d hdd_fio_log ];then
-            mv hdd_fio_log hdd_fio_log_$(date +%Y%m%d%H%M%S)
+            mv hdd_fio_log "hdd_fio_log_$(date +%Y%m%d%H%M%S)"
             mkdir -p hdd_fio_log
         else
             mkdir -p hdd_fio_log
@@ -433,7 +437,7 @@ hdd_parallel_fio_stress_test()
     # multi sata/sas hdd fio stress test
     if [ -s hdd_symbol_set ];then
         if [ -d hdd_fio_stress_log ];then
-            mv hdd_fio_stress_log hdd_fio_stress_log_$(date +%Y%m%d%H%M%S)
+            mv hdd_fio_stress_log "hdd_fio_stress_log_$(date +%Y%m%d%H%M%S)"
             mkdir -p hdd_fio_stress_log
         else
             mkdir -p hdd_fio_stress_log

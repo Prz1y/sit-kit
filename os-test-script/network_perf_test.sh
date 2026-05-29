@@ -9,7 +9,7 @@
 export LC_ALL=C
 export LANG=C
 
-SCRIPT_DIR=$(cd "$(dirname "$0")"; pwd)
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TIMESTAMP=$(date "+%Y%m%d_%H%M%S")
 RESULT_DIR="${SCRIPT_DIR}/network_test_${TIMESTAMP}"
 LOG_FILE="${RESULT_DIR}/test_execution.log"

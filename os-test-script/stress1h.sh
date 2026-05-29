@@ -7,7 +7,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUTDIR="${SCRIPT_DIR}/stress-test-${TIMESTAMP}"
 RECORD_FILE="${OUTDIR}/test_record.txt"
 CHECK_INTERVAL=60
-STRESS_TIMEOUT=3600s
+STRESS_SECONDS=3600
+STRESS_TIMEOUT="${STRESS_SECONDS}s"
 RECORD_SAVED=0
 
 mkdir -p "${OUTDIR}" || { echo "无法创建输出目录 ${OUTDIR}"; exit 1; }
@@ -82,14 +83,14 @@ if [ "$hdd_fstype" = "tmpfs" ]; then
 fi
 
 log "启动 stress，持续时间 1小时"
-stress --cpu "$(nproc)" --io 4 --vm 2 --vm-bytes 128M --hdd 2 --hdd-bytes 1G --timeout 3600s --verbose > "${OUTDIR}/stress_out.txt" 2>&1 &
+stress --cpu "$(nproc)" --io 4 --vm 2 --vm-bytes 128M --hdd 2 --hdd-bytes 1G --timeout "$STRESS_TIMEOUT" --verbose > "${OUTDIR}/stress_out.txt" 2>&1 &
 STRESS_PID=$!
 
 log "stress PID=${STRESS_PID}"
 
 # 监控循环：每 CHECK_INTERVAL 秒检查本机响应与收集快照日志
 SECONDS_BEFORE=$(awk '{print $1}' /proc/uptime)
-end_time=$(( $(date +%s) + 3600 ))
+end_time=$(( $(date +%s) + STRESS_SECONDS ))
 failed=0
 
 while kill -0 "${STRESS_PID}" 2>/dev/null; do
@@ -111,7 +112,7 @@ while kill -0 "${STRESS_PID}" 2>/dev/null; do
 		break
 	fi
 
-	SECONDS_NOW=$(cat /proc/uptime 2>/dev/null | awk '{print $1}')
+	SECONDS_NOW=$(awk '{print $1}' /proc/uptime 2>/dev/null)
 	if [ -z "${SECONDS_NOW}" ]; then
 		failed=1
 		on_exit_collect "无法读取 /proc/uptime"

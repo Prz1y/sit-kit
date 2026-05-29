@@ -124,14 +124,13 @@ cpu_stress() {
 
   # 启动压力负载
   local STRESS_PIDS=()
-  local i
   if [ "$HAS_STRESS" = true ]; then
     echo "工具: stress --cpu $n --timeout ${dur}s"
     stress --cpu "$n" --timeout "${dur}s" >/dev/null 2>&1 &
     STRESS_PIDS+=("$!")
   else
     echo "工具: bash busy-loop（$n 线程）"
-    for i in $(seq 1 "$n"); do
+    for _ in $(seq 1 "$n"); do
       ( while :; do :; done ) &
       STRESS_PIDS+=("$!")
     done
@@ -215,7 +214,7 @@ SYSINFO_FILE="${RESULT_ROOT}/system_info_${TIMESTAMP}.txt"
 echo "系统信息已保存至: $SYSINFO_FILE"
 
 for gov in "${GOVS[@]}"; do
-  if [[ -n "$available" && ! " $available " =~ " $gov " ]]; then
+  if [[ -n "$available" && ! " $available " =~ [[:space:]]${gov}[[:space:]] ]]; then
     echo "跳过 $gov（不可用）"
     continue
   fi
