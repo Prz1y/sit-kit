@@ -1,8 +1,13 @@
 #!/bin/bash
 
 # 设置为中文环境
-export LC_ALL=zh_CN.UTF-8
-export LANG=zh_CN.UTF-8
+if locale -a 2>/dev/null | grep -q "zh_CN.utf8\|zh_CN.UTF-8"; then
+  export LC_ALL=zh_CN.UTF-8
+  export LANG=zh_CN.UTF-8
+else
+  export LC_ALL=C
+  export LANG=C
+fi
 
 echo "=================================================="
 echo "开始执行操作系统功能专项测试 (共9项)..."
