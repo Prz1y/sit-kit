@@ -1,0 +1,4443 @@
+===== FILE: ali-qual-script/kdump_auto_test/kdump_auto_test.py =====
+diff --git a/ali-qual-script/kdump_auto_test/kdump_auto_test.py b/ali-qual-script/kdump_auto_test/kdump_auto_test.py
+index c1ff7ac..14a8b40 100644
+--- a/ali-qual-script/kdump_auto_test/kdump_auto_test.py
++++ b/ali-qual-script/kdump_auto_test/kdump_auto_test.py
+@@ -76,20 +76,27 @@ PASS 标准:
+ """
+ 
+ import argparse
++import ipaddress
+ import subprocess
+ import time
+ import sys
+ import os
+ import shutil
+ import logging
++import tempfile
+ from datetime import datetime
+ 
+-logging.basicConfig(
+-    level=logging.INFO,
+-    format="%(asctime)s [%(levelname)s] %(message)s",
+-    handlers=[logging.StreamHandler(sys.stdout)],
+-)
+ logger = logging.getLogger("kdump_test")
++logger.setLevel(logging.INFO)
++logger.handlers.clear()
++logger.propagate = False
++_log_format = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
++_stream_handler = logging.StreamHandler(sys.stdout)
++_stream_handler.setFormatter(_log_format)
++_file_handler = logging.FileHandler("kdump_test.log", encoding="utf-8")
++_file_handler.setFormatter(_log_format)
++logger.addHandler(_stream_handler)
++logger.addHandler(_file_handler)
+ 
+ 
+ class KdumpAutoTest:
+@@ -105,6 +112,7 @@ class KdumpAutoTest:
+         sol_log_file="./sol_output.log",
+         reboot_timeout=1200,
+         crash_timeout=1800,
++        crashkernel_size="512M",
+     ):
+         self.sut_ip = sut_ip
+         self.bmc_ip = bmc_ip
+@@ -116,8 +124,10 @@ class KdumpAutoTest:
+         self.sol_log_file = sol_log_file
+         self.reboot_timeout = reboot_timeout
+         self.crash_timeout = crash_timeout
++        self.crashkernel_size = crashkernel_size
+ 
+         self.sol_process = None
++        self.ipmi_pass_file = None
+         self.test_result = {"vmcore_found": False, "crash_kernel_booted": False, "details": ""}
+ 
+     # ==================== SSH 工具方法 ====================
+@@ -125,7 +135,7 @@ class KdumpAutoTest:
+     def ssh_cmd(self, command, timeout=60):
+         """在 SUT 上通过 SSH 执行命令，返回 (returncode, stdout, stderr)"""
+         full_cmd = [
+-            "sshpass", "-p", self.ssh_pass,
++            "sshpass", "-e",
+             "ssh",
+             "-o", "StrictHostKeyChecking=no",
+             "-o", "UserKnownHostsFile=/dev/null",
+@@ -135,12 +145,15 @@ class KdumpAutoTest:
+             command,
+         ]
+         logger.info(f"[SSH] 执行: {command}")
++        env = os.environ.copy()
++        env["SSHPASS"] = self.ssh_pass
+         try:
+             proc = subprocess.run(
+                 full_cmd,
+                 capture_output=True,
+                 text=True,
+                 timeout=timeout,
++                env=env,
+             )
+             return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
+         except subprocess.TimeoutExpired:
+@@ -172,16 +185,30 @@ class KdumpAutoTest:
+ 
+     # ==================== BMC / SOL 工具方法 ====================
+ 
+-    def ipmitool(self, command, timeout=30):
++    def _ensure_ipmi_password_file(self):
++        if self.ipmi_pass_file and os.path.exists(self.ipmi_pass_file):
++            return self.ipmi_pass_file
++
++        fd, path = tempfile.mkstemp(prefix="kdump_ipmi_", text=True)
++        with os.fdopen(fd, "w", encoding="utf-8") as handle:
++            handle.write(self.bmc_pass)
++        os.chmod(path, 0o600)
++        self.ipmi_pass_file = path
++        return path
++
++    def ipmitool(self, args_list, timeout=30):
+         """执行 ipmitool 命令"""
++        if isinstance(args_list, str):
++            raise TypeError("args_list must be a list of ipmitool arguments")
++
+         base = [
+             "ipmitool", "-I", "lanplus",
+             "-H", self.bmc_ip,
+             "-U", self.bmc_user,
+-            "-P", self.bmc_pass,
++            "-f", self._ensure_ipmi_password_file(),
+         ]
+-        full_cmd = base + command.split()
+-        logger.info(f"[IPMI] 执行: {' '.join(command.split())}")
++        full_cmd = base + list(args_list)
++        logger.info(f"[IPMI] 执行: {' '.join(args_list)}")
+         try:
+             proc = subprocess.run(
+                 full_cmd,
+@@ -201,7 +228,7 @@ class KdumpAutoTest:
+             "ipmitool", "-I", "lanplus",
+             "-H", self.bmc_ip,
+             "-U", self.bmc_user,
+-            "-P", self.bmc_pass,
++            "-f", self._ensure_ipmi_password_file(),
+             "sol", "activate",
+         ]
+         logger.info(f"[SOL] 启动串口会话，输出到: {self.sol_log_file}")
+@@ -309,7 +336,8 @@ class KdumpAutoTest:
+         logger.info(f"[Step 1] kdump 状态:\n{out}")
+ 
+         if ret != 0 and "active" not in out.lower():
+-            logger.warning("[Step 1] kdump 服务可能未正常启动，继续尝试...")
++            logger.error("[Step 1] kdump 服务启动失败")
++            return False
+ 
+         return True
+ 
+@@ -320,7 +348,7 @@ class KdumpAutoTest:
+         logger.info("=" * 60)
+ 
+         # 先测试 BMC 连通性
+-        ret, out, err = self.ipmitool("power status")
++        ret, out, err = self.ipmitool(["power", "status"])
+         if ret != 0:
+             logger.error(f"[Step 2] BMC 不可达: {err}")
+             return False
+@@ -371,7 +399,7 @@ class KdumpAutoTest:
+     def step4_configure_crashkernel(self):
+         """配置 crashkernel=512M 并重启"""
+         logger.info("=" * 60)
+-        logger.info("[Step 4] 配置 crashkernel=512M")
++        logger.info(f"[Step 4] 配置 crashkernel={self.crashkernel_size}")
+         logger.info("=" * 60)
+ 
+         # 检测 grub 类型
+@@ -393,7 +421,7 @@ class KdumpAutoTest:
+             self.ssh_cmd(
+                 "sed -i 's/crashkernel=[^ \"]*//g' /etc/default/grub"
+             )
+-            # 重新添加 crashkernel=512M
++            # 重新添加 crashkernel 参数
+             self.ssh_cmd(
+                 'sed -i \'s/GRUB_CMDLINE_LINUX="/GRUB_CMDLINE_LINUX="crashkernel=512M /\''
+                 ' /etc/default/grub'
+@@ -446,8 +474,8 @@ class KdumpAutoTest:
+         # 验证 crashkernel 参数
+         ret, out, _ = self.ssh_cmd("cat /proc/cmdline")
+         logger.info(f"[Step 4] /proc/cmdline: {out}")
+-        if "crashkernel=512M" in out:
+-            logger.info("[Step 4] crashkernel=512M 配置验证通过 [PASS]")
++        if f"crashkernel={self.crashkernel_size}" in out:
++            logger.info(f"[Step 4] crashkernel={self.crashkernel_size} 配置验证通过 [PASS]")
+             return True
+         else:
+             logger.error(f"[Step 4] crashkernel 配置验证失败！当前 cmdline: {out}")
+@@ -492,8 +520,11 @@ class KdumpAutoTest:
+                 self.start_sol_session()
+                 time.sleep(2)
+ 
+-            ret, out, err = self.ipmitool("chassis power diag", timeout=30)
++            ret, out, err = self.ipmitool(["chassis", "power", "diag"], timeout=30)
+             logger.info(f"[Step 5] ipmitool chassis power diag: ret={ret}, out={out}, err={err}")
++            if ret != 0:
++                logger.error(f"[Step 5] 带外触发失败: {err}")
++                return False
+ 
+         # 等待 crash 过程（SOL 中观察）
+         logger.info(f"[Step 5] 等待 crash dump 过程（{self.crash_timeout}s 超时）...")
+@@ -526,6 +557,15 @@ class KdumpAutoTest:
+ 
+         return True
+ 
++    def cleanup(self):
++        self.stop_sol_session()
++        if self.ipmi_pass_file and os.path.exists(self.ipmi_pass_file):
++            try:
++                os.remove(self.ipmi_pass_file)
++            except OSError:
++                pass
++            self.ipmi_pass_file = None
++
+     def step6_verify_vmcore(self):
+         """检查 /var/crash 目录下是否有 vmcore 文件"""
+         logger.info("=" * 60)
+@@ -573,71 +613,73 @@ class KdumpAutoTest:
+         logger.info(f"     Crash 方法: {crash_methods}")
+         logger.info("=" * 70)
+ 
+-        # Step 1: 确保 kdump 服务
+-        if not self.step1_ensure_kdump_service():
+-            logger.error("Step 1 失败，终止测试")
+-            return False
+-
+-        # Step 2: 打开 SOL
+-        if not self.step2_open_sol():
+-            logger.error("Step 2 失败，终止测试")
+-            return False
+-
+-        # Step 3: 配置 sysctl
+-        if not self.step3_configure_sysctl():
+-            logger.warning("Step 3 可能未完全成功，继续...")
+-
+-        # Step 4: 配置 crashkernel + 重启
+-        if not self.step4_configure_crashkernel():
+-            logger.error("Step 4 失败，终止测试")
+-            self.stop_sol_session()
+-            return False
+-
+-        # 重启后需要重新打开 SOL
+-        self.stop_sol_session()
+-        time.sleep(5)
+-        self.start_sol_session()
+-        time.sleep(3)
+-
+         all_passed = True
+ 
+-        for method in crash_methods:
+-            logger.info(f"\n{'#' * 60}")
+-            logger.info(f"# 开始 {method.upper()} crash 测试")
+-            logger.info(f"{'#' * 60}")
+-
+-            # Step 5: 触发 crash
+-            self.step5_trigger_crash(method=method)
+-
+-            # 分析 SOL 日志
+-            kdump_ok = self.analyze_sol_log()
+-            self.test_result["crash_kernel_booted"] = kdump_ok
+-
+-            # 等待系统重启恢复
+-            logger.info("[MAIN] 等待 SUT crash 后重启恢复...")
+-            if not self.wait_ssh_ready(timeout=self.reboot_timeout):
+-                logger.error(f"[MAIN] {method} crash 后 SUT 未能恢复")
+-                all_passed = False
+-                continue
+-
+-            # 重启后重新打开 SOL（为下一次测试准备）
++        try:
++            # Step 1: 确保 kdump 服务
++            if not self.step1_ensure_kdump_service():
++                logger.error("Step 1 失败，终止测试")
++                return False
++
++            # Step 2: 打开 SOL
++            if not self.step2_open_sol():
++                logger.error("Step 2 失败，终止测试")
++                return False
++
++            # Step 3: 配置 sysctl
++            if not self.step3_configure_sysctl():
++                logger.warning("Step 3 可能未完全成功，继续...")
++
++            # Step 4: 配置 crashkernel + 重启
++            if not self.step4_configure_crashkernel():
++                logger.error("Step 4 失败，终止测试")
++                return False
++
++            # 重启后需要重新打开 SOL
+             self.stop_sol_session()
+-            time.sleep(3)
++            time.sleep(5)
+             self.start_sol_session()
+             time.sleep(3)
+ 
+-            # Step 6: 验证 vmcore
+-            if not self.step6_verify_vmcore():
+-                logger.error(f"[MAIN] {method} 测试: vmcore 验证失败 [FAIL]")
+-                all_passed = False
+-            else:
+-                logger.info(f"[MAIN] {method} 测试: 通过 [PASS]")
++            for method in crash_methods:
++                logger.info(f"\n{'#' * 60}")
++                logger.info(f"# 开始 {method.upper()} crash 测试")
++                logger.info(f"{'#' * 60}")
++
++                # Step 5: 触发 crash
++                if not self.step5_trigger_crash(method=method):
++                    all_passed = False
++                    continue
++
++                # 分析 SOL 日志
++                kdump_ok = self.analyze_sol_log()
++                self.test_result["crash_kernel_booted"] = kdump_ok
++
++                # 等待系统重启恢复
++                logger.info("[MAIN] 等待 SUT crash 后重启恢复...")
++                if not self.wait_ssh_ready(timeout=self.reboot_timeout):
++                    logger.error(f"[MAIN] {method} crash 后 SUT 未能恢复")
++                    all_passed = False
++                    continue
++
++                # 重启后重新打开 SOL（为下一次测试准备）
++                self.stop_sol_session()
++                time.sleep(3)
++                self.start_sol_session()
++                time.sleep(3)
+ 
+-            # 清理 vmcore（可选，为下一次测试腾空间）
+-            # self.ssh_cmd("rm -rf /var/crash/*")
++                # Step 6: 验证 vmcore
++                if not self.step6_verify_vmcore():
++                    logger.error(f"[MAIN] {method} 测试: vmcore 验证失败 [FAIL]")
++                    all_passed = False
++                else:
++                    logger.info(f"[MAIN] {method} 测试: 通过 [PASS]")
+ 
+-        # 清理
+-        self.stop_sol_session()
++                # 清理 vmcore（可选，为下一次测试腾空间）
++                # self.ssh_cmd("rm -rf /var/crash/*")
++
++        finally:
++            self.cleanup()
+ 
+         logger.info("\n" + "=" * 70)
+         logger.info(f"     测试结果: {'[PASS] 全部通过' if all_passed else '[FAIL] 存在失败'}")
+@@ -656,6 +698,7 @@ def main():
+     parser.add_argument("--ssh-user", required=True, help="SSH 用户名")
+     parser.add_argument("--ssh-pass", required=True, help="SSH 密码")
+     parser.add_argument("--ssh-port", type=int, default=22, help="SSH 端口")
++    parser.add_argument("--crashkernel-size", default="512M", help="crashkernel 参数值，默认 512M")
+     parser.add_argument("--crash-method", default="both",
+                         choices=["inband", "outband", "both"],
+                         help="Crash 触发方式")
+@@ -670,6 +713,13 @@ def main():
+ 
+     args = parser.parse_args()
+ 
++    for ip_value, label in ((args.sut_ip, "sut-ip"), (args.bmc_ip, "bmc-ip")):
++        try:
++            ipaddress.ip_address(ip_value)
++        except ValueError:
++            logger.error(f"无效的 {label}: {ip_value}")
++            sys.exit(1)
++
+     # 检查依赖
+     for dep in ["sshpass", "ipmitool"]:
+         if shutil.which(dep) is None:
+@@ -689,19 +739,25 @@ def main():
+         sol_log_file=args.sol_log,
+         reboot_timeout=args.reboot_timeout,
+         crash_timeout=args.crash_timeout,
++        crashkernel_size=args.crashkernel_size,
+     )
+ 
+     if args.skip_config:
+-        # 跳过配置，直接测试
++        all_passed = True
+         logger.info("[SKIP] 跳过环境配置步骤")
+-        tester.start_sol_session()
+-        time.sleep(3)
+-        for method in methods:
+-            tester.step5_trigger_crash(method=method)
+-            tester.analyze_sol_log()
+-            tester.wait_ssh_ready()
+-            tester.step6_verify_vmcore()
+-        tester.stop_sol_session()
++        try:
++            tester.start_sol_session()
++            time.sleep(3)
++            for method in methods:
++                if not tester.step5_trigger_crash(method=method):
++                    all_passed = False
++                    continue
++                all_passed = tester.analyze_sol_log() and all_passed
++                all_passed = tester.wait_ssh_ready() and all_passed
++                all_passed = tester.step6_verify_vmcore() and all_passed
++        finally:
++            tester.cleanup()
++        sys.exit(0 if all_passed else 1)
+     else:
+         success = tester.run_full_test(crash_methods=methods)
+         sys.exit(0 if success else 1)
+
+
+===== FILE: ali-qual-script/mixed_pressure_7x24.sh =====
+diff --git a/ali-qual-script/mixed_pressure_7x24.sh b/ali-qual-script/mixed_pressure_7x24.sh
+index 2821667..842b482 100644
+--- a/ali-qual-script/mixed_pressure_7x24.sh
++++ b/ali-qual-script/mixed_pressure_7x24.sh
+@@ -59,6 +59,7 @@ load_config() {
+ 
+     if [ -f "$CONF_FILE" ]; then
+         log_info "加载配置文件: ${CONF_FILE}"
++        # shellcheck source=/dev/null
+         source "$CONF_FILE"
+     fi
+ 
+@@ -258,7 +259,7 @@ detect_system_disk() {
+     fi
+ 
+     local slaves
+-    slaves=$(lsblk -nlo NAME,TYPE / 2>/dev/null | grep -v "disk\|part" | while read -r n t; do
++    slaves=$(lsblk -nlo NAME,TYPE / 2>/dev/null | grep -v "disk\|part" | while read -r n _; do
+         lsblk -s -nlo NAME,TYPE "/dev/${n}" 2>/dev/null | grep disk | awk '{print "/dev/" $1}'
+     done | sort -u || true)
+ 
+@@ -541,7 +542,8 @@ start_csv_monitor() {
+     log_info "启动 OS 内存指标监控 (间隔 ${interval}s, 持续 ${duration}s)"
+ 
+     {
+-        local start_ts=$(date '+%s')
++        local start_ts
++        start_ts=$(date '+%s')
+         echo "timestamp,mem_total_kb,mem_free_kb,mem_avail_kb,mem_used_pct,swap_total_kb,swap_used_kb,cached_kb,buffer_kb" > "$PMON_CSV"
+         local end_ts=$(( start_ts + duration ))
+         while [ "$(date '+%s')" -lt "$end_ts" ]; do
+@@ -880,7 +882,7 @@ do_start() {
+     [ "$swap_total" = "0" ] && log_info "swap 已成功关闭" || log_warn "swap 可能未完全关闭, 当前 swap 总量: ${swap_total}MB"
+ 
+     log_info "Step 7: 启动监控..."
+-    > "$PID_IPMI_MON"
++    : > "$PID_IPMI_MON"
+ 
+     start_csv_monitor "$CSV_MON_INTERVAL" "$TOTAL_DURATION_SEC"
+ 
+@@ -900,7 +902,7 @@ do_start() {
+ 
+     local fio_mode
+     local disk_index=0
+-    > "$PID_FIO_LIST"
++    : > "$PID_FIO_LIST"
+     : > "$FIO_MOUNT_LIST_FILE"
+ 
+     if [ -n "$data_disks" ]; then
+@@ -1019,7 +1021,11 @@ do_start() {
+     echo "    CPU:    ${STRESS_CMD} --cpu (${cpu_cores} 核)"
+     echo "    内存:   ${STRESS_CMD} --vm 2 --vm-bytes ${target_mem_mb}M (mode=${MEM_ACCESS_MODE})"
+     echo "    硬盘:   fio 3.13 (50%读 50%写, 模式: ${fio_mode})"
+-    echo "    监控:   ipmitool BMC 硬件监控 (每${IPMI_MON_INTERVAL}s) / OS内存 (每${CSV_MON_INTERVAL}s)"$( [ "${SKIP_IPMI:-false}" = "true" ] && echo " [跳过]" || echo "")
++    local monitor_suffix=""
++    if [ "${SKIP_IPMI:-false}" = "true" ]; then
++        monitor_suffix=" [跳过]"
++    fi
++    echo "    监控:   ipmitool BMC 硬件监控 (每${IPMI_MON_INTERVAL}s) / OS内存 (每${CSV_MON_INTERVAL}s)${monitor_suffix}"
+     echo "----------------------------------------------"
+     echo "  注意事项:"
+     echo "  1. ${end_time} 后会自动执行 stop 进行收尾"
+@@ -1196,7 +1202,9 @@ do_status() {
+     else
+         echo "  状态: 未运行"
+         if [ -f "${LOG_DIR}/.end_timestamp" ]; then
+-            echo "  上次结束: $(date -d @$(cat "${LOG_DIR}/.end_timestamp") '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo 'N/A')"
++            local end_ts_text
++            end_ts_text=$(cat "${LOG_DIR}/.end_timestamp")
++            echo "  上次结束: $(date -d "@${end_ts_text}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo 'N/A')"
+         fi
+         if [ -f "$REPORT_FILE" ]; then
+             echo "  报告文件: ${REPORT_FILE}"
+
+
+===== FILE: ali-qual-script/nvme_storage_perf.sh =====
+diff --git a/ali-qual-script/nvme_storage_perf.sh b/ali-qual-script/nvme_storage_perf.sh
+index f9498db..44f3a72 100644
+--- a/ali-qual-script/nvme_storage_perf.sh
++++ b/ali-qual-script/nvme_storage_perf.sh
+@@ -58,11 +58,21 @@ PERF_DIR="${BASE_DIR}/perf_data"
+ MON_DIR="${BASE_DIR}/monitor"
+ SEL_DIR="${BASE_DIR}/sel_logs"
+ RUN_LOG="${LOG_DIR}/run.log"
++PIDS=()
+ # 注: 目录创建移至 main() 中 require_root 之后，避免非 root 时在受保护路径上报错
+ log_info()  { echo "[INFO]  $(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "$RUN_LOG"; }
+ log_warn()  { echo "[WARN]  $(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "$RUN_LOG" >&2; }
+ log_error() { echo "[ERROR] $(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "$RUN_LOG" >&2; }
+ 
++cleanup() {
++    if [[ ${#PIDS[@]} -gt 0 ]]; then
++        kill "${PIDS[@]}" 2>/dev/null || true
++        for pid in "${PIDS[@]}"; do
++            wait "$pid" 2>/dev/null || true
++        done
++    fi
++}
++
+ require_root() {
+     if [[ $EUID -ne 0 ]]; then
+         log_error "请以 root 身份运行此脚本 (sudo bash $0)"
+@@ -131,7 +141,7 @@ os_log_clean() {
+     dmesg -C 2>/dev/null || log_warn "dmesg -C 失败"
+ 
+     echo "$(date '+%Y-%m-%d %H:%M:%S')" > "${LOG_DIR}/os_log_clean_marker.txt"
+-    log_info "OS 日志已清除，标记时间: $(cat ${LOG_DIR}/os_log_clean_marker.txt)"
++    log_info "OS 日志已清除，标记时间: $(cat "${LOG_DIR}/os_log_clean_marker.txt")"
+ }
+ 
+ sel_log_clean() {
+@@ -171,8 +181,9 @@ run_fio() {
+     local first_dev="${fio_filename%%:*}"
+     iostat -xmt 10 "$first_dev" > "$mon_out" 2>&1 &
+     local iostat_pid=$!
++    PIDS+=("$iostat_pid")
+ 
+-    fio --name="${job_name}" --filename="${fio_filename}" \
++    if ! fio --name="${job_name}" --filename="${fio_filename}" \
+         --rw="${rw}" --bs="${bs}" \
+         --iodepth="${iodepth}" --numjobs="${numjobs}" \
+         --direct=1 --ioengine=libaio --thread=1 \
+@@ -182,7 +193,13 @@ run_fio() {
+         --output-format=json --output="${json_out}" \
+         --end_fsync=0 --buffer_compress_percentage=0 \
+         --invalidate=1 --refill_buffers --exitall \
+-        ${extra_flags:+$extra_flags} 2>&1 || log_warn "fio 退出码非0，请检查日志: ${json_out}"
++        ${extra_flags:+$extra_flags} 2>&1; then
++        local rc=$?
++        log_error "fio 失败 (退出码: ${rc}): ${json_out}"
++        kill "$iostat_pid" 2>/dev/null || true
++        wait "$iostat_pid" 2>/dev/null || true
++        return "$rc"
++    fi
+ 
+     kill "$iostat_pid" 2>/dev/null || true
+     wait "$iostat_pid" 2>/dev/null || true
+@@ -358,6 +375,7 @@ smart_standard2_collect() {
+ 
+ main() {
+     require_root
++    trap cleanup EXIT INT TERM
+     mkdir -p "$LOG_DIR" "$SMART_DIR" "$PERF_DIR" "$MON_DIR" "$SEL_DIR"
+     check_deps
+     device_check
+
+
+===== FILE: memory-test-script/Sangfor_mem_test_autorun.sh =====
+diff --git a/memory-test-script/Sangfor_mem_test_autorun.sh b/memory-test-script/Sangfor_mem_test_autorun.sh
+index 7c6ab2b..b60e1a6 100644
+--- a/memory-test-script/Sangfor_mem_test_autorun.sh
++++ b/memory-test-script/Sangfor_mem_test_autorun.sh
+@@ -1,10 +1,13 @@
+ #!/bin/bash
+ 
++set -euo pipefail
++
+ # ECC 内存 3 小时压测脚本
+ # Author : Prz1y
+ # 功能：启动 ECC 内存扫描、监控系统日志、BMC 日志，3 小时后自动关闭
+ 
+-cd common-all-all-server-hw-eccmem
++SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
++cd "${SCRIPT_DIR}/common-all-all-server-hw-eccmem" || { echo "ERROR: 无法进入工作目录" >&2; exit 1; }
+ LOG_DIR="../test_logs_$(date +%Y%m%d_%H%M%S)"
+ mkdir -p "$LOG_DIR"
+ 
+@@ -33,20 +36,31 @@ stop_pid() {
+ 
+ cleanup_processes() {
+   stop_pid "messages 监控" "${MESSAGES_PID:-}"
+-  stop_pid "dmesg 监控" "$DMESG_PID"
+-  stop_pid "ECC 压测" "$ECCMEM_PID"
+-  stop_pid "BMC 采集" "$BMC_PID"
++  stop_pid "dmesg 监控" "${DMESG_PID:-}"
++  stop_pid "ECC 压测" "${ECCMEM_PID:-}"
++  stop_pid "BMC 采集" "${BMC_PID:-}"
++  if [ -f eccmem.conf.bak ]; then
++    cp -f eccmem.conf.bak eccmem.conf 2>/dev/null || true
++  fi
+ }
+ 
++on_interrupt() {
++  echo "[$(date)] 收到中断信号，开始清理后台任务"
++  cleanup_processes
++  exit 130
++}
++
++trap on_interrupt INT TERM EXIT
++
+ echo "[$(date)] ========== ECC 内存压测开始 =========="
+ 
+ # 1. 配置脚本持续运行
+ echo "[$(date)] 配置脚本参数..."
+-sed -i 's/scan_time = [0-9]*/scan_time = 0/' eccmem.conf
++sed -i.bak 's/scan_time = [0-9]*/scan_time = 0/' eccmem.conf
+ 
+ # 2. 启动 ECC 内存扫描（3小时）
+ echo "[$(date)] 启动 ECC 内存扫描..."
+-timeout 3h python3 run.py --always True > "$LOG_DIR/eccmem_output.log" 2>&1 &
++timeout 10800 python3 run.py --always True > "$LOG_DIR/eccmem_output.log" 2>&1 &
+ ECCMEM_PID=$!
+ 
+ # 3. 实时监控 dmesg（ECC 错误会显示在这里）
+@@ -76,23 +90,15 @@ BMC_PID=$!
+ echo "[$(date)] ========== 压测进程信息 =========="
+ echo "ECC 扫描 PID: $ECCMEM_PID"
+ echo "dmesg 监控 PID: $DMESG_PID"
+-echo "messages 监控 PID: $MESSAGES_PID"
++echo "messages 监控 PID: ${MESSAGES_PID:-未启动}"
+ echo "BMC 采集 PID: $BMC_PID"
+ echo "日志位置: $LOG_DIR"
+ echo "运行时间: 3 小时"
+ echo ""
+ 
+-on_interrupt() {
+-  echo "[$(date)] 收到中断信号，开始清理后台任务"
+-  cleanup_processes
+-  exit 130
+-}
+-
+-trap on_interrupt INT TERM
+-
+ # 6. 等待 ECC 压测完成（3小时后 timeout 会自动终止）
+ echo "[$(date)] 等待压测完成（3小时）..."
+-wait $ECCMEM_PID
++wait "$ECCMEM_PID"
+ TEST_STATUS=$?
+ 
+ echo "[$(date)] ========== 3 小时压测完成，开始清理 =========="
+@@ -103,7 +109,10 @@ cleanup_processes
+ echo "[$(date)] 导出最终日志..."
+ dmesg > "$LOG_DIR/dmesg_final.log" 2>/dev/null
+ cp /var/log/messages "$LOG_DIR/messages_final.log" 2>/dev/null
+-cp log/*.log "$LOG_DIR/" 2>/dev/null
++if compgen -G "log/*.log" > /dev/null; then
++  cp log/*.log "$LOG_DIR/" 2>/dev/null || true
++fi
++trap - EXIT
+ 
+ echo "[$(date)] ========== 测试完成 =========="
+ echo "返回码: $TEST_STATUS"
+
+
+===== FILE: memory-test-script/memory_pressure_test.sh =====
+diff --git a/memory-test-script/memory_pressure_test.sh b/memory-test-script/memory_pressure_test.sh
+index 916c0ca..598619f 100644
+--- a/memory-test-script/memory_pressure_test.sh
++++ b/memory-test-script/memory_pressure_test.sh
+@@ -8,6 +8,7 @@ START_FLAG="${LOG_DIR}/.test_running"
+ START_TIME_FILE="${LOG_DIR}/pressure_start_time.log"
+ END_TIME_FILE="${LOG_DIR}/pressure_end_time.log"
+ MEMTESTER_LOG="${LOG_DIR}/memtester.log"
++MEMTESTER_RAW_LOG="${LOG_DIR}/memtester_raw.log"
+ NMON_PID_FILE="${LOG_DIR}/.nmon_pid"
+ MEMTESTER_PID_FILE="${LOG_DIR}/.memtester_pid"
+ 
+@@ -32,9 +33,18 @@ check_prerequisites() {
+     echo "[INFO]  $(date '+%Y-%m-%d %H:%M:%S')  所有依赖检查通过 (memtester / nmon / bc / dmidecode)"
+ }
+ 
++is_memtester_pid() {
++    local pid="$1"
++    [ -n "$pid" ] || return 1
++    [ -d "/proc/$pid" ] || return 1
++    grep -aqE "(memtester|timeout).*memtester|memtester" "/proc/$pid/cmdline" 2>/dev/null
++}
++
+ check_test_running() {
+-    if [ -f "$START_FLAG" ]; then
+-        if pgrep -f "memtester" > /dev/null 2>&1; then
++    local pid
++    if [ -f "$START_FLAG" ] && [ -f "$MEMTESTER_PID_FILE" ]; then
++        pid=$(cat "$MEMTESTER_PID_FILE" 2>/dev/null || true)
++        if is_memtester_pid "$pid" && kill -0 "$pid" 2>/dev/null; then
+             return 0
+         fi
+     fi
+@@ -56,6 +66,7 @@ do_start() {
+     exec &> >(tee -a "${LOG_DIR}/console_output.log")
+ 
+     echo "[INFO]  $(date '+%Y-%m-%d %H:%M:%S')  Step 1: 清除历史日志..."
++    dmesg > "${LOG_DIR}/dmesg_before_clear.log" 2>/dev/null || true
+     dmesg -C
+     echo "" > /var/log/messages 2>/dev/null || true
+     echo "[INFO]  $(date '+%Y-%m-%d %H:%M:%S')  dmesg / messages 日志已清除"
+@@ -90,7 +101,9 @@ do_start() {
+     fi
+ 
+     echo "[INFO]  $(date '+%Y-%m-%d %H:%M:%S')  Step 5: 关闭 swap..."
+-    swapoff -a 2>/dev/null || true
++    if ! swapoff -a 2>/dev/null; then
++        echo "[WARN]  $(date '+%Y-%m-%d %H:%M:%S')  swap 关闭失败，测试结果可能不准确" >&2
++    fi
+     local swap_status
+     swap_status=$(free -m | awk '/Swap/{print $2}')
+     if [ "$swap_status" = "0" ]; then
+@@ -114,10 +127,11 @@ do_start() {
+     echo "[INFO]  $(date '+%Y-%m-%d %H:%M:%S')  nmon 已启动, PID: $nmon_pid"
+ 
+     echo "[INFO]  $(date '+%Y-%m-%d %H:%M:%S')  Step 8: 启动 memtester 压力测试 (48H 超时自动停止)..."
+-    nohup timeout 172800 memtester "${test_mb}M" 2>&1 | tr -d '\b' | grep -vE 'setting|testing' > "$MEMTESTER_LOG" &
++    setsid timeout 172800 memtester "${test_mb}M" > "$MEMTESTER_RAW_LOG" 2>&1 &
+     local memtester_pid=$!
+     echo "$memtester_pid" > "$MEMTESTER_PID_FILE"
+-    echo "[INFO]  $(date '+%Y-%m-%d %H:%M:%S')  memtester 已启动, 管道 PID: $memtester_pid (172800s 后自动停止)"
++    ln -sf "$(basename "$MEMTESTER_RAW_LOG")" "$MEMTESTER_LOG" 2>/dev/null || cp "$MEMTESTER_RAW_LOG" "$MEMTESTER_LOG" 2>/dev/null || true
++    echo "[INFO]  $(date '+%Y-%m-%d %H:%M:%S')  memtester 已启动, PID: $memtester_pid (172800s 后自动停止)"
+ 
+     touch "$START_FLAG"
+ 
+@@ -157,11 +171,15 @@ do_stop() {
+     if [ -f "$MEMTESTER_PID_FILE" ]; then
+         local pid
+         pid=$(cat "$MEMTESTER_PID_FILE")
+-        if kill -0 "$pid" 2>/dev/null; then
+-            echo "[INFO]  $(date '+%Y-%m-%d %H:%M:%S')  停止 memtester (PID: $pid)..."
++        if is_memtester_pid "$pid" && kill -0 "$pid" 2>/dev/null; then
++            echo "[INFO]  $(date '+%Y-%m-%d %H:%M:%S')  停止 memtester 进程组 (PID: $pid)..."
++            kill -- -"$pid" 2>/dev/null || true
+             kill "$pid" 2>/dev/null || true
+             sleep 2
+-            kill -9 "$pid" 2>/dev/null || true
++            if is_memtester_pid "$pid" && kill -0 "$pid" 2>/dev/null; then
++                kill -9 -- -"$pid" 2>/dev/null || true
++                kill -9 "$pid" 2>/dev/null || true
++            fi
+             echo "[INFO]  $(date '+%Y-%m-%d %H:%M:%S')  memtester 已停止"
+         else
+             echo "[INFO]  $(date '+%Y-%m-%d %H:%M:%S')  memtester 已自行结束"
+@@ -180,7 +198,6 @@ do_stop() {
+         fi
+     fi
+ 
+-    pkill -f "memtester" 2>/dev/null || true
+ 
+     echo "[INFO]  $(date '+%Y-%m-%d %H:%M:%S')  记录测试结束时间..."
+     date '+%Y-%m-%d %H:%M:%S' | tee "$END_TIME_FILE"
+@@ -244,7 +261,7 @@ do_stop() {
+     fi
+ 
+     local dmesg_err
+-    dmesg_err=$(grep -ciE "error|fail|warn|BUG|Call Trace|Oops" "${LOG_DIR}/dmesg_pressure.log" 2>/dev/null; true)
++    dmesg_err=$(grep -ciE "error|fail|warning|WARN|BUG|Call Trace|Oops" "${LOG_DIR}/dmesg_pressure.log" 2>/dev/null; true)
+     dmesg_err=$(echo "$dmesg_err" | tr -d '[:space:]')
+     if [ -z "$dmesg_err" ] || [ "$dmesg_err" = "0" ]; then
+         echo "  dmesg 异常计数: 0 OK"
+
+
+===== FILE: memory-test-script/memtester_stress_ce_disabled.sh =====
+diff --git a/memory-test-script/memtester_stress_ce_disabled.sh b/memory-test-script/memtester_stress_ce_disabled.sh
+index b06d738..f26c18d 100644
+--- a/memory-test-script/memtester_stress_ce_disabled.sh
++++ b/memory-test-script/memtester_stress_ce_disabled.sh
+@@ -36,15 +36,28 @@ set -euo pipefail
+ # ============================================================
+ TEST_TIME=10800       # 测试时长（秒）：3小时=10800，1小时=3600，6小时=21600
+ MEM_RATIO=0.90        # 内存占用比例，默认90%
++AUTO_YES=0
++if [ "${1:-}" = "-y" ]; then
++    AUTO_YES=1
++fi
+ # ============================================================
+ 
+ # 颜色定义
++if [ -t 1 ]; then
+ RED='\033[0;31m'
+ GREEN='\033[0;32m'
+ YELLOW='\033[1;33m'
+ BLUE='\033[0;34m'
+ CYAN='\033[0;36m'
+ NC='\033[0m'
++else
++RED=''
++GREEN=''
++YELLOW=''
++BLUE=''
++CYAN=''
++NC=''
++fi
+ 
+ TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+ LOG_DIR="/tmp/memtester_test_${TIMESTAMP}"
+@@ -89,7 +102,7 @@ check_bios_config() {
+             ce_status="${RED}CE阈值未关闭（dont_log_ce=$dont_log，应为0）${NC}"
+         fi
+     fi
+-    echo -e "  CE阈值:   $(echo -e "$ce_status")"
++    echo -e "  CE阈值:   ${ce_status}"
+ }
+ 
+ # ── 查找 memtester 二进制文件 ─────────────────────────────
+@@ -110,9 +123,12 @@ echo ""
+ 
+ echo -e "${BLUE}检查BIOS配置...${NC}"
+ check_bios_config
+-read -p "确认已完成BIOS配置，按Enter继续..."
++if [ "$AUTO_YES" -ne 1 ]; then
++    read -p "确认已完成BIOS配置，按Enter继续..."
++fi
+ 
+ # ── 清空dmesg缓冲区 ───────────────────────────────────────
++trap 'dmesg > "${LOG_DIR}/dmesg.log" 2>/dev/null || true; exit 130' INT TERM
+ dmesg -C
+ echo -e "${GREEN}dmesg缓冲区已清空${NC}"
+ 
+
+
+===== FILE: memory-test-script/stressapptest_stress_ce_disabled.sh =====
+diff --git a/memory-test-script/stressapptest_stress_ce_disabled.sh b/memory-test-script/stressapptest_stress_ce_disabled.sh
+index c855c75..2ec29ac 100644
+--- a/memory-test-script/stressapptest_stress_ce_disabled.sh
++++ b/memory-test-script/stressapptest_stress_ce_disabled.sh
+@@ -35,15 +35,29 @@ set -euo pipefail
+ # ============================================================
+ TEST_TIME=10800       # 测试时长（秒）：3小时=10800，1小时=3600，6小时=21600
+ MEM_RATIO=0.94        # 内存占用比例，默认94%
++AUTO_YES=0
++if [ "${1:-}" = "-y" ]; then
++    AUTO_YES=1
++fi
++SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ # ============================================================
+ 
+ # 颜色定义
++if [ -t 1 ]; then
+ RED='\033[0;31m'
+ GREEN='\033[0;32m'
+ YELLOW='\033[1;33m'
+ BLUE='\033[0;34m'
+ CYAN='\033[0;36m'
+ NC='\033[0m'
++else
++RED=''
++GREEN=''
++YELLOW=''
++BLUE=''
++CYAN=''
++NC=''
++fi
+ 
+ TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+ LOG_DIR="/tmp/stressapptest_test_${TIMESTAMP}"
+@@ -60,8 +74,8 @@ fi
+ # ── 查找stressapptest二进制文件 ──────────────────────────
+ # 优先使用当前目录，其次在PATH中查找
+ SAT_BIN=""
+-if [ -x "./stressapptest" ]; then
+-    SAT_BIN="./stressapptest"
++if [ -x "${SCRIPT_DIR}/stressapptest" ]; then
++    SAT_BIN="${SCRIPT_DIR}/stressapptest"
+ elif command -v stressapptest &>/dev/null; then
+     SAT_BIN="stressapptest"
+ else
+@@ -113,14 +127,17 @@ check_bios_config() {
+             ce_status="${RED}CE阈值未关闭（dont_log_ce=${dont_log}，应为0）${NC}"
+         fi
+     fi
+-    echo -e "  CE阈值:   $(echo -e "${ce_status}")"
++    echo -e "  CE阈值:   ${ce_status}"
+ }
+ 
+ echo -e "${BLUE}检查BIOS配置...${NC}"
+ check_bios_config
+-read -p "确认已完成BIOS配置，按Enter继续..."
++if [ "$AUTO_YES" -ne 1 ]; then
++    read -p "确认已完成BIOS配置，按Enter继续..."
++fi
+ 
+ # ── 清空dmesg缓冲区 ───────────────────────────────────────
++trap 'dmesg > "${LOG_DIR}/dmesg.log" 2>/dev/null || true; exit 130' INT TERM
+ dmesg -C
+ echo -e "${GREEN}dmesg缓冲区已清空${NC}"
+ 
+
+
+===== FILE: modified_scripts/multi_disk_fio_scripts-V0.4/hdd_raw_fio_test.sh =====
+diff --git a/modified_scripts/multi_disk_fio_scripts-V0.4/hdd_raw_fio_test.sh b/modified_scripts/multi_disk_fio_scripts-V0.4/hdd_raw_fio_test.sh
+index 64f255c..58c3629 100644
+--- a/modified_scripts/multi_disk_fio_scripts-V0.4/hdd_raw_fio_test.sh
++++ b/modified_scripts/multi_disk_fio_scripts-V0.4/hdd_raw_fio_test.sh
+@@ -12,8 +12,8 @@ fi
+ devname="$1"
+ #Sequence write/read test of HDD
+ "$SCRIPT_DIR/raw_disk_fio_test.sh" -v -d "$devname"
+-sleep 30s
++sleep 30
+ 
+ #Random write/read test of HDD
+ "$SCRIPT_DIR/raw_disk_fio_test.sh" -V -d "$devname"
+-sleep 30s
++sleep 30
+
+
+===== FILE: modified_scripts/multi_disk_fio_scripts-V0.4/multi_disk_log_filter.sh =====
+diff --git a/modified_scripts/multi_disk_fio_scripts-V0.4/multi_disk_log_filter.sh b/modified_scripts/multi_disk_fio_scripts-V0.4/multi_disk_log_filter.sh
+index f28aa0e..82b1cd4 100644
+--- a/modified_scripts/multi_disk_fio_scripts-V0.4/multi_disk_log_filter.sh
++++ b/modified_scripts/multi_disk_fio_scripts-V0.4/multi_disk_log_filter.sh
+@@ -1,12 +1,13 @@
+ #!/usr/bin/env bash
+-set -o pipefail
++set -euo pipefail
++shopt -s nullglob
+ # ********************************************************************
+ # Version V0.1
+ # Author: zhouq32@chinatelecom.cn
+ # Filter Results for multi disks fio test according to ctc io pattern
+ # ********************************************************************
+ CPWD="$(cd -- "$(dirname -- "$0")" && pwd)"
+-cd "$CPWD"
++cd "$CPWD" || exit 1
+ #rm -f ssd_symbol_set hdd_symbol_set nvme_symbol_set filter_multi*.csv
+ 
+ IS_NVME_FILTER=false
+@@ -43,7 +44,7 @@ done
+ filter_ssd_hdd_nvme_set()
+ {
+     rm -f ssd_symbol_set hdd_symbol_set nvme_symbol_set
+-    os_disk_symbol=$(echo $(lsblk |grep -B1 -E "part|boot" |grep -E "^sd[a-z]+|^nvme" |awk '{print $1}') |sed 's/ /|/')
++    os_disk_symbol=$(lsblk | grep -B1 -E "part|boot" | grep -E "^sd[a-z]+|^nvme" | awk '{print $1}' | xargs | sed 's/ /|/g')
+     non_os_disk_set=$(lsscsi -g |grep -E "ATA|TOSHIBA" |awk '{print $(NF-1)}' |grep -Ewv -- "$os_disk_symbol")
+     if [[ -n $non_os_disk_set ]];then
+         for i in $(echo "$non_os_disk_set")
+@@ -61,7 +62,7 @@ filter_ssd_hdd_nvme_set()
+     if [[ -n $is_os_nvme ]];then
+         os_nvme_symbol=$(echo "$is_os_nvme" |grep -Eo "nvme[0-9]+n1")
+     else
+-        os_nvme_symbol=null
++        os_nvme_symbol='^$'
+     fi
+     nvme_info_set=$(nvme list |grep -E "nvme[0-9]+n1" |grep -v -- "$os_nvme_symbol")
+     if [[ -n $nvme_info_set ]];then
+@@ -77,7 +78,7 @@ filter_multi_nvme_log()
+     rm -f filter_multi*.csv
+     filter_multi_nvme_sequence_log
+     filter_multi_nvme_random_log
+-    cat filter_multi_nvme_read.csv filter_multi_nvme_write.csv filter_multi_nvme_randread.csv filter_multi_nvme_randwrite.csv > filter_multi_nvme_Result.csv
++    cat filter_multi_nvme_read.csv filter_multi_nvme_write.csv filter_multi_nvme_randread.csv filter_multi_nvme_randwrite.csv 2>/dev/null > filter_multi_nvme_Result.csv
+ }
+ # ***********************************
+ 
+@@ -86,7 +87,7 @@ filter_multi_nvme_sequence_log()
+     for rw in read write
+     do
+         echo "${rw}_test_data" >> filter_multi_nvme_${rw}.csv
+-        echo -e "Model|FW,128k_1_32,,,128k_1_64,,,128k_1_128,,,128k_1_256,,,128k_1_512,,,4k_2_32,,,64k_2_32,,,256k_2_32,,,1m_2_32,,," >> filter_multi_nvme_${rw}.csv
++        printf \'%s\n\' "Model|FW,128k_1_32,,,128k_1_64,,,128k_1_128,,,128k_1_256,,,128k_1_512,,,4k_2_32,,,64k_2_32,,,256k_2_32,,,1m_2_32,,," >> filter_multi_nvme_${rw}.csv
+         echo -n "," >> filter_multi_nvme_${rw}.csv
+         for i in $(seq 1 9)
+         do
+@@ -99,11 +100,11 @@ filter_multi_nvme_sequence_log()
+             echo -n "ssd_${dev}," >> filter_multi_nvme_${rw}.csv
+             for pattern in 128k_1_32 128k_1_64 128k_1_128 128k_1_256 128k_1_512 4k_2_32 64k_2_32 256k_2_32 1m_2_32
+             do
+-                iops=$(cat ssd_${dev}_${rw}.log |grep -A4 "${rw}_${pattern}:\ (groupid=" |grep IOPS |tr -d ' ' |awk -F"," '{print $1}' |awk -F"=" '{print $2}')
+-                bandWidth=$(cat ssd_${dev}_${rw}.log |grep -A4 "${rw}_${pattern}:\ (groupid=" |grep IOPS |grep -Eo "[0-9]+\.?[0-9]*[G|g|M|m|K|k]?B/s" | head -1)
+-                avgLatValue=$(cat ssd_${dev}_${rw}.log |grep -A4 "${rw}_${pattern}:\ (groupid=" |grep -w lat |tr -d ' ' \
++                iops=$(grep -A4 "${rw}_${pattern}:\ (groupid=" |grep IOPS |tr -d ' ' |awk -F"," '{print $1}' |awk -F"=" '{print $2}')
++                bandWidth=$(grep -A4 "${rw}_${pattern}:\ (groupid=" |grep IOPS |grep -Eo "[0-9]+\.?[0-9]*[G|g|M|m|K|k]?B/s" | head -1)
++                avgLatValue=$(grep -A4 "${rw}_${pattern}:\ (groupid=" |grep -w lat |tr -d ' ' \
+ 				|awk -F"," '{print $(NF-1)}' |awk -F"=" '{print $2}')
+-                avgLatUnit=$(cat ssd_${dev}_${rw}.log |grep -A4 "${rw}_${pattern}:\ (groupid=" |grep -w lat |tr -d ' ' \
++                avgLatUnit=$(grep -A4 "${rw}_${pattern}:\ (groupid=" |grep -w lat |tr -d ' ' \
+ 				|awk -F"," '{print $1}' |grep -Eo "[u|m|n]?sec")
+                 avgLat=${avgLatValue}${avgLatUnit}
+                 echo -n "${iops},${bandWidth},${avgLat}," >> filter_multi_nvme_${rw}.csv
+@@ -119,7 +120,7 @@ filter_multi_nvme_random_log()
+     for rw in randread randwrite
+     do
+         echo "${rw}_test_data" >> filter_multi_nvme_${rw}.csv  
+-        echo -e "Model|FW,4k_1_1,,,4k_1_32,,,4k_2_32,,,4k_2_256,,,4k_4_32,,,4k_4_64,,,4k_8_1,,,4k_8_32,,,4k_8_64,,,4k_8_256,,,4k_16_64,,,\
++        printf \'%s\n\' "Model|FW,4k_1_1,,,4k_1_32,,,4k_2_32,,,4k_2_256,,,4k_4_32,,,4k_4_64,,,4k_8_1,,,4k_8_32,,,4k_8_64,,,4k_8_256,,,4k_16_64,,,\
+ 	8k_1_32,,,8k_4_64,,,8k_8_1,,,8k_8_32,,,8k_8_64,,,64k_2_32,,,128k_2_64,,,256k_2_32,,,1m_2_32,,," >> filter_multi_nvme_${rw}.csv
+         echo -n "," >> filter_multi_nvme_${rw}.csv
+         for i in $(seq 1 20)
+@@ -134,11 +135,11 @@ filter_multi_nvme_random_log()
+             for pattern in 4k_1_1 4k_1_32 4k_2_32 4k_2_256 4k_4_32 4k_4_64 4k_8_1 4k_8_32 4k_8_64 4k_8_256 4k_16_64 \
+ 		8k_1_32 8k_4_64 8k_8_1 8k_8_32 8k_8_64 64k_2_32 128k_2_64 256k_2_32 1m_2_32
+             do  
+-                iops=$(cat ssd_${dev}_${rw}.log |grep -A4 "${rw}_${pattern}:\ (groupid=" |grep IOPS |tr -d ' ' |awk -F"," '{print $1}' |awk -F"=" '{print $2}')
+-                bandWidth=$(cat ssd_${dev}_${rw}.log |grep -A4 "${rw}_${pattern}:\ (groupid=" |grep IOPS |grep -Eo "[0-9]+\.?[0-9]*[G|g|M|m|K|k]?B/s" | head -1)
+-                avgLatValue=$(cat ssd_${dev}_${rw}.log |grep -A4 "${rw}_${pattern}:\ (groupid=" |grep -w lat |tr -d ' ' \
++                iops=$(grep -A4 "${rw}_${pattern}:\ (groupid=" |grep IOPS |tr -d ' ' |awk -F"," '{print $1}' |awk -F"=" '{print $2}')
++                bandWidth=$(grep -A4 "${rw}_${pattern}:\ (groupid=" |grep IOPS |grep -Eo "[0-9]+\.?[0-9]*[G|g|M|m|K|k]?B/s" | head -1)
++                avgLatValue=$(grep -A4 "${rw}_${pattern}:\ (groupid=" |grep -w lat |tr -d ' ' \
+                 |awk -F"," '{print $(NF-1)}' |awk -F"=" '{print $2}')
+-                avgLatUnit=$(cat ssd_${dev}_${rw}.log |grep -A4 "${rw}_${pattern}:\ (groupid=" |grep -w lat |tr -d ' ' \
++                avgLatUnit=$(grep -A4 "${rw}_${pattern}:\ (groupid=" |grep -w lat |tr -d ' ' \
+                 |awk -F"," '{print $1}' |grep -Eo "[u|m|n]?sec")
+                 avgLat=${avgLatValue}${avgLatUnit}
+                 echo -n "${iops},${bandWidth},${avgLat}," >> filter_multi_nvme_${rw}.csv
+@@ -157,7 +158,7 @@ filter_multi_ssd_log()
+     rm -f filter_multi*.csv
+     filter_multi_ssd_sequence_log
+     filter_multi_ssd_random_log
+-    cat filter_multi_ssd_read.csv filter_multi_ssd_write.csv filter_multi_ssd_randread.csv filter_multi_ssd_randwrite.csv > filter_multi_ssd_Result.csv
++    cat filter_multi_ssd_read.csv filter_multi_ssd_write.csv filter_multi_ssd_randread.csv filter_multi_ssd_randwrite.csv 2>/dev/null > filter_multi_ssd_Result.csv
+ }
+ # ***********************************
+ 
+@@ -166,7 +167,7 @@ filter_multi_ssd_sequence_log()
+     for rw in read write
+     do
+         echo "${rw}_test_data" >> filter_multi_ssd_${rw}.csv
+-        echo -e "Model|FW,128k_1_32,,,128k_1_64,,,128k_1_128,,,128k_1_256,,,128k_1_512,,,4k_2_32,,,64k_2_32,,,256k_2_32,,,1m_2_32,,," >> filter_multi_ssd_${rw}.csv
++        printf \'%s\n\' "Model|FW,128k_1_32,,,128k_1_64,,,128k_1_128,,,128k_1_256,,,128k_1_512,,,4k_2_32,,,64k_2_32,,,256k_2_32,,,1m_2_32,,," >> filter_multi_ssd_${rw}.csv
+         echo -n "," >> filter_multi_ssd_${rw}.csv
+         for i in $(seq 1 9)
+         do
+@@ -179,11 +180,11 @@ filter_multi_ssd_sequence_log()
+             echo -n "ssd_${dev}," >> filter_multi_ssd_${rw}.csv
+             for pattern in 128k_1_32 128k_1_64 128k_1_128 128k_1_256 128k_1_512 4k_2_32 64k_2_32 256k_2_32 1m_2_32
+             do  
+-                iops=$(cat ssd_${dev}_${rw}.log |grep -A4 "${rw}_${pattern}:\ (groupid=" |grep IOPS |tr -d ' ' |awk -F"," '{print $1}' |awk -F"=" '{print $2}')
+-                bandWidth=$(cat ssd_${dev}_${rw}.log |grep -A4 "${rw}_${pattern}:\ (groupid=" |grep IOPS |grep -Eo "[0-9]+\.?[0-9]*[G|g|M|m|K|k]?B/s" | head -1)
+-                avgLatValue=$(cat ssd_${dev}_${rw}.log |grep -A4 "${rw}_${pattern}:\ (groupid=" |grep -w lat |tr -d ' ' \
++                iops=$(grep -A4 "${rw}_${pattern}:\ (groupid=" |grep IOPS |tr -d ' ' |awk -F"," '{print $1}' |awk -F"=" '{print $2}')
++                bandWidth=$(grep -A4 "${rw}_${pattern}:\ (groupid=" |grep IOPS |grep -Eo "[0-9]+\.?[0-9]*[G|g|M|m|K|k]?B/s" | head -1)
++                avgLatValue=$(grep -A4 "${rw}_${pattern}:\ (groupid=" |grep -w lat |tr -d ' ' \
+                 |awk -F"," '{print $(NF-1)}' |awk -F"=" '{print $2}')
+-                avgLatUnit=$(cat ssd_${dev}_${rw}.log |grep -A4 "${rw}_${pattern}:\ (groupid=" |grep -w lat |tr -d ' ' \
++                avgLatUnit=$(grep -A4 "${rw}_${pattern}:\ (groupid=" |grep -w lat |tr -d ' ' \
+                 |awk -F"," '{print $1}' |grep -Eo "[u|m|n]?sec")
+                 avgLat=${avgLatValue}${avgLatUnit}
+                 echo -n "${iops},${bandWidth},${avgLat}," >> filter_multi_ssd_${rw}.csv
+@@ -199,7 +200,7 @@ filter_multi_ssd_random_log()
+     for rw in randread randwrite
+     do
+         echo "${rw}_test_data" >> filter_multi_ssd_${rw}.csv        
+-        echo -e "Model|FW,4k_1_1,,,4k_1_32,,,4k_2_32,,,4k_2_256,,,4k_4_32,,,4k_4_64,,,4k_8_1,,,4k_8_32,,,4k_8_64,,,4k_8_256,,,4k_16_64,,,\
++        printf \'%s\n\' "Model|FW,4k_1_1,,,4k_1_32,,,4k_2_32,,,4k_2_256,,,4k_4_32,,,4k_4_64,,,4k_8_1,,,4k_8_32,,,4k_8_64,,,4k_8_256,,,4k_16_64,,,\
+         8k_1_32,,,8k_4_64,,,8k_8_1,,,8k_8_32,,,8k_8_64,,,64k_2_32,,,128k_2_64,,,256k_2_32,,,1m_2_32,,," >> filter_multi_ssd_${rw}.csv
+         echo -n "," >> filter_multi_ssd_${rw}.csv
+         for i in $(seq 1 20)
+@@ -214,11 +215,11 @@ filter_multi_ssd_random_log()
+             for pattern in 4k_1_1 4k_1_32 4k_2_32 4k_2_256 4k_4_32 4k_4_64 4k_8_1 4k_8_32 4k_8_64 4k_8_256 4k_16_64 \
+                 8k_1_32 8k_4_64 8k_8_1 8k_8_32 8k_8_64 64k_2_32 128k_2_64 256k_2_32 1m_2_32
+             do  
+-                iops=$(cat ssd_${dev}_${rw}.log |grep -A4 "${rw}_${pattern}:\ (groupid=" |grep IOPS |tr -d ' ' |awk -F"," '{print $1}' |awk -F"=" '{print $2}')
+-                bandWidth=$(cat ssd_${dev}_${rw}.log |grep -A4 "${rw}_${pattern}:\ (groupid=" |grep IOPS |grep -Eo "[0-9]+\.?[0-9]*[G|g|M|m|K|k]?B/s" | head -1)
+-                avgLatValue=$(cat ssd_${dev}_${rw}.log |grep -A4 "${rw}_${pattern}:\ (groupid=" |grep -w lat |tr -d ' ' \
++                iops=$(grep -A4 "${rw}_${pattern}:\ (groupid=" |grep IOPS |tr -d ' ' |awk -F"," '{print $1}' |awk -F"=" '{print $2}')
++                bandWidth=$(grep -A4 "${rw}_${pattern}:\ (groupid=" |grep IOPS |grep -Eo "[0-9]+\.?[0-9]*[G|g|M|m|K|k]?B/s" | head -1)
++                avgLatValue=$(grep -A4 "${rw}_${pattern}:\ (groupid=" |grep -w lat |tr -d ' ' \
+                 |awk -F"," '{print $(NF-1)}' |awk -F"=" '{print $2}')
+-                avgLatUnit=$(cat ssd_${dev}_${rw}.log |grep -A4 "${rw}_${pattern}:\ (groupid=" |grep -w lat |tr -d ' ' \
++                avgLatUnit=$(grep -A4 "${rw}_${pattern}:\ (groupid=" |grep -w lat |tr -d ' ' \
+                 |awk -F"," '{print $1}' |grep -Eo "[u|m|n]?sec")
+                 avgLat=${avgLatValue}${avgLatUnit}
+                 echo -n "${iops},${bandWidth},${avgLat}," >> filter_multi_ssd_${rw}.csv
+@@ -237,7 +238,7 @@ filter_multi_hdd_log()
+     rm -f filter_multi*.csv
+     filter_multi_hdd_sequence_log
+     filter_multi_hdd_random_log
+-    cat filter_multi_hdd_read.csv filter_multi_hdd_write.csv filter_multi_hdd_randread.csv filter_multi_hdd_randwrite.csv > filter_multi_hdd_Result.csv
++    cat filter_multi_hdd_read.csv filter_multi_hdd_write.csv filter_multi_hdd_randread.csv filter_multi_hdd_randwrite.csv 2>/dev/null > filter_multi_hdd_Result.csv
+ }
+ # ***********************************
+ 
+@@ -246,7 +247,7 @@ filter_multi_hdd_sequence_log()
+     for rw in read write
+     do
+         echo "${rw}_test_data" >> filter_multi_hdd_${rw}.csv
+-        echo -e "Model|FW,4k_2_32,,,64k_2_32,,,256k_2_32,,,1m_1_32,,,1m_2_32,,," >> filter_multi_hdd_${rw}.csv
++        printf \'%s\n\' "Model|FW,4k_2_32,,,64k_2_32,,,256k_2_32,,,1m_1_32,,,1m_2_32,,," >> filter_multi_hdd_${rw}.csv
+         echo -n "," >> filter_multi_hdd_${rw}.csv
+         for i in $(seq 1 5)
+         do
+@@ -259,11 +260,11 @@ filter_multi_hdd_sequence_log()
+             echo -n "hdd_${dev}," >> filter_multi_hdd_${rw}.csv
+             for pattern in 4k_2_32 64k_2_32 256k_2_32 1m_1_32 1m_2_32
+             do
+-                iops=$(cat hdd_${dev}_${rw}.log |grep -A4 "${rw}_${pattern}:\ (groupid=" |grep IOPS |tr -d ' ' |awk -F"," '{print $1}' |awk -F"=" '{print $2}')
+-                bandWidth=$(cat hdd_${dev}_${rw}.log |grep -A4 "${rw}_${pattern}:\ (groupid=" |grep IOPS |grep -Eo "[0-9]+\.?[0-9]*[G|g|M|m|K|k]?B/s" | head -1)
+-                avgLatValue=$(cat hdd_${dev}_${rw}.log |grep -A4 "${rw}_${pattern}:\ (groupid=" |grep -w lat |tr -d ' ' \
++                iops=$(grep -A4 "${rw}_${pattern}:\ (groupid=" |grep IOPS |tr -d ' ' |awk -F"," '{print $1}' |awk -F"=" '{print $2}')
++                bandWidth=$(grep -A4 "${rw}_${pattern}:\ (groupid=" |grep IOPS |grep -Eo "[0-9]+\.?[0-9]*[G|g|M|m|K|k]?B/s" | head -1)
++                avgLatValue=$(grep -A4 "${rw}_${pattern}:\ (groupid=" |grep -w lat |tr -d ' ' \
+                 |awk -F"," '{print $(NF-1)}' |awk -F"=" '{print $2}')
+-                avgLatUnit=$(cat hdd_${dev}_${rw}.log |grep -A4 "${rw}_${pattern}:\ (groupid=" |grep -w lat |tr -d ' ' \
++                avgLatUnit=$(grep -A4 "${rw}_${pattern}:\ (groupid=" |grep -w lat |tr -d ' ' \
+                 |awk -F"," '{print $1}' |grep -Eo "[u|m|n]?sec")
+                 avgLat=${avgLatValue}${avgLatUnit}
+                 echo -n "${iops},${bandWidth},${avgLat}," >> filter_multi_hdd_${rw}.csv
+@@ -278,7 +279,7 @@ filter_multi_hdd_random_log()
+ {
+     # filter multi hdd randread result
+     echo "randread_test_data" >> filter_multi_hdd_randread.csv
+-    echo -e "Model|FW,4k_1_1,,,4k_1_4,,,4k_1_8,,,4k_1_16,,,8k_1_1_,,,8k_1_32,,,4k_1_32,,,4k_2_32,,,64k_2_32,,,256k_2_32,,,1m_2_32,,," >> filter_multi_hdd_randread.csv
++    printf \'%s\n\' "Model|FW,4k_1_1,,,4k_1_4,,,4k_1_8,,,4k_1_16,,,8k_1_1,,,8k_1_32,,,4k_1_32,,,4k_2_32,,,64k_2_32,,,256k_2_32,,,1m_2_32,,," >> filter_multi_hdd_randread.csv
+     echo -n "," >> filter_multi_hdd_randread.csv
+     for i in $(seq 1 11)
+     do
+@@ -291,11 +292,11 @@ filter_multi_hdd_random_log()
+         echo -n "hdd_${dev}," >> filter_multi_hdd_randread.csv
+         for pattern in 4k_1_1 4k_1_4 4k_1_8 4k_1_16 8k_1_1 8k_1_32 4k_1_32 4k_2_32 64k_2_32 256k_2_32 1m_2_32
+         do
+-            iops=$(cat hdd_${dev}_randread.log |grep -A4 "randread_${pattern}:\ (groupid=" |grep IOPS |tr -d ' ' |awk -F"," '{print $1}' |awk -F"=" '{print $2}')
+-            bandWidth=$(cat hdd_${dev}_randread.log |grep -A4 "randread_${pattern}:\ (groupid=" |grep IOPS |grep -Eo "[0-9]+\.?[0-9]*[G|g|M|m|K|k]?B/s" | head -1)
+-            avgLatValue=$(cat hdd_${dev}_randread.log |grep -A4 "randread_${pattern}:\ (groupid=" |grep -w lat |tr -d ' ' \
++            iops=$(grep -A4 "randread_${pattern}:\ (groupid=" |grep IOPS |tr -d ' ' |awk -F"," '{print $1}' |awk -F"=" '{print $2}')
++            bandWidth=$(grep -A4 "randread_${pattern}:\ (groupid=" |grep IOPS |grep -Eo "[0-9]+\.?[0-9]*[G|g|M|m|K|k]?B/s" | head -1)
++            avgLatValue=$(grep -A4 "randread_${pattern}:\ (groupid=" |grep -w lat |tr -d ' ' \
+             |awk -F"," '{print $(NF-1)}' |awk -F"=" '{print $2}')
+-            avgLatUnit=$(cat hdd_${dev}_randread.log |grep -A4 "randread_${pattern}:\ (groupid=" |grep -w lat |tr -d ' ' \
++            avgLatUnit=$(grep -A4 "randread_${pattern}:\ (groupid=" |grep -w lat |tr -d ' ' \
+             |awk -F"," '{print $1}' |grep -Eo "[u|m|n]?sec")
+             avgLat=${avgLatValue}${avgLatUnit}
+             echo -n "${iops},${bandWidth},${avgLat}," >> filter_multi_hdd_randread.csv
+@@ -306,7 +307,7 @@ filter_multi_hdd_random_log()
+ 
+     # filter multi hdd randwrite result
+     echo "randwrite_test_data" >> filter_multi_hdd_randwrite.csv
+-    echo -e "Model|FW,4k_1_1,,,4k_2_32,,,64k_2_32,,,256k_2_32,,,1m_2_32,,," >> filter_multi_hdd_randwrite.csv
++    printf \'%s\n\' "Model|FW,4k_1_1,,,4k_2_32,,,64k_2_32,,,256k_2_32,,,1m_2_32,,," >> filter_multi_hdd_randwrite.csv
+     echo -n "," >> filter_multi_hdd_randwrite.csv
+     for i in $(seq 1 5)
+     do
+@@ -319,11 +320,11 @@ filter_multi_hdd_random_log()
+         echo -n "hdd_${dev}," >> filter_multi_hdd_randwrite.csv
+         for pattern in 4k_1_1 4k_2_32 64k_2_32 256k_2_32 1m_2_32
+         do
+-            iops=$(cat hdd_${dev}_randwrite.log |grep -A4 "randwrite_${pattern}:\ (groupid=" |grep IOPS |tr -d ' ' |awk -F"," '{print $1}' |awk -F"=" '{print $2}')
+-            bandWidth=$(cat hdd_${dev}_randwrite.log |grep -A4 "randwrite_${pattern}:\ (groupid=" |grep IOPS |grep -Eo "[0-9]+\.?[0-9]*[G|g|M|m|K|k]?B/s" | head -1)
+-            avgLatValue=$(cat hdd_${dev}_randwrite.log |grep -A4 "randwrite_${pattern}:\ (groupid=" |grep -w lat |tr -d ' ' \
++            iops=$(grep -A4 "randwrite_${pattern}:\ (groupid=" |grep IOPS |tr -d ' ' |awk -F"," '{print $1}' |awk -F"=" '{print $2}')
++            bandWidth=$(grep -A4 "randwrite_${pattern}:\ (groupid=" |grep IOPS |grep -Eo "[0-9]+\.?[0-9]*[G|g|M|m|K|k]?B/s" | head -1)
++            avgLatValue=$(grep -A4 "randwrite_${pattern}:\ (groupid=" |grep -w lat |tr -d ' ' \
+             |awk -F"," '{print $(NF-1)}' |awk -F"=" '{print $2}')
+-            avgLatUnit=$(cat hdd_${dev}_randwrite.log |grep -A4 "randwrite_${pattern}:\ (groupid=" |grep -w lat |tr -d ' ' \
++            avgLatUnit=$(grep -A4 "randwrite_${pattern}:\ (groupid=" |grep -w lat |tr -d ' ' \
+             |awk -F"," '{print $1}' |grep -Eo "[u|m|n]?sec")
+             avgLat=${avgLatValue}${avgLatUnit}
+             echo -n "${iops},${bandWidth},${avgLat}," >> filter_multi_hdd_randwrite.csv
+
+
+===== FILE: modified_scripts/multi_disk_fio_scripts-V0.4/only_precondition_for_multi_ssd.sh =====
+diff --git a/modified_scripts/multi_disk_fio_scripts-V0.4/only_precondition_for_multi_ssd.sh b/modified_scripts/multi_disk_fio_scripts-V0.4/only_precondition_for_multi_ssd.sh
+index adcef4d..55954b1 100644
+--- a/modified_scripts/multi_disk_fio_scripts-V0.4/only_precondition_for_multi_ssd.sh
++++ b/modified_scripts/multi_disk_fio_scripts-V0.4/only_precondition_for_multi_ssd.sh
+@@ -1,8 +1,8 @@
+ #!/usr/bin/env bash
+-set -o pipefail
++set -euo pipefail
+ 
+ CPWD="$(cd -- "$(dirname -- "$0")" && pwd)"
+-cd "$CPWD"
++cd "$CPWD" || exit 1
+ 
+ path_to_fio="$(command -v fio 2>/dev/null || true)"
+ if [[ -z "$path_to_fio" ]];then
+@@ -53,7 +53,7 @@ filter_ssd_hdd_nvme_set()
+     if [[ -n $is_os_nvme ]];then
+         os_nvme_symbol=$(echo "$is_os_nvme" |grep -Eo "nvme[0-9]+n1")
+     else
+-        os_nvme_symbol=null
++        os_nvme_symbol='^$'
+     fi
+     nvme_info_set=$(nvme list |grep -E "nvme[0-9]+n1" |grep -v -- "$os_nvme_symbol")
+     if [[ -n $nvme_info_set ]];then
+@@ -88,22 +88,22 @@ sata_ssd_precondition()
+ 	# sequential precondition
+         for dev in $(cat ssd_symbol_set)
+         do
+-            ssd_fragment_sequence "$dev" &>/dev/null &
++            ssd_fragment_sequence "$dev" &>"sata_precondition_log/${dev}_fragment1.log" &
+         done
+         wait
+-        sleep 30s
++        sleep 30
+         # random precondition
+         for dev in $(cat ssd_symbol_set)
+ 	do
+-            ssd_fragment_random "$dev" &>/dev/null &
++            ssd_fragment_random "$dev" &>"sata_precondition_log/${dev}_fragment2.log" &
+         done
+         wait
+-        sleep 30s
++        sleep 30
+ 
+         move_glob "ssd_*_fragment1.log" "sata_precondition_log"
+         move_glob "ssd_*_fragment2.log" "sata_precondition_log"
+     fi
+-    cd "$CPWD"
++    cd "$CPWD" || exit 1
+ }
+ 
+ nvme_format()
+@@ -114,9 +114,10 @@ nvme_format()
+     fi
+     for dev in $(cat nvme_symbol_set)
+     do
++        echo "[$(date '+%F %T')] nvme format /dev/$dev" >> "$CPWD/nvme_format_audit.log"
+         nvme format "/dev/$dev"
+     done
+-    cd "$CPWD"
++    cd "$CPWD" || exit 1
+ }
+ 
+ nvme_ssd_precondition()
+@@ -133,21 +134,21 @@ nvme_ssd_precondition()
+         # sequential precondition
+         for dev in $(cat nvme_symbol_set)
+         do
+-            ssd_fragment_sequence "$dev" &>/dev/null &
++            ssd_fragment_sequence "$dev" &>"sata_precondition_log/${dev}_fragment1.log" &
+         done
+         wait
+-        sleep 30s
++        sleep 30
+         # random precondition
+         for dev in $(cat nvme_symbol_set)
+         do
+-            ssd_fragment_random "$dev" &>/dev/null &
++            ssd_fragment_random "$dev" &>"sata_precondition_log/${dev}_fragment2.log" &
+         done
+         wait
+-        sleep 30s
++        sleep 30
+         move_glob "ssd_*_fragment1.log" "nvme_precondition_log"
+         move_glob "ssd_*_fragment2.log" "nvme_precondition_log"
+     fi
+-    cd "$CPWD"
++    cd "$CPWD" || exit 1
+ }
+ 
+ filter_ssd_hdd_nvme_set
+
+
+===== FILE: modified_scripts/multi_disk_fio_scripts-V0.4/raw_disk_fio_test.sh =====
+diff --git a/modified_scripts/multi_disk_fio_scripts-V0.4/raw_disk_fio_test.sh b/modified_scripts/multi_disk_fio_scripts-V0.4/raw_disk_fio_test.sh
+index 7eec892..7a2030a 100644
+--- a/modified_scripts/multi_disk_fio_scripts-V0.4/raw_disk_fio_test.sh
++++ b/modified_scripts/multi_disk_fio_scripts-V0.4/raw_disk_fio_test.sh
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env bash
+-set -o pipefail
++set -euo pipefail
+ #*************************************************************************************#
+ # Author: zhouq32@chinatelecom.cn
+ # Modified in 11/16/2025 - fix a little bugs for precondition test
+@@ -18,13 +18,8 @@ IS_NVME_BIND_CPUS_BASE_SEQ=false
+ IS_NVME_BIND_CPUS_BASE_RAND=false
+ FILE_SIZE=100%
+ CPWD="$(cd -- "$(dirname -- "$0")" && pwd)"
+-cd "$CPWD"
+-path_to_fio="$(command -v fio 2>/dev/null || true)"
+-if [[ -z "$path_to_fio" ]];then
+-    echo "fio not found in PATH" >&2
+-    exit 1
+-fi
+-
++cd "$CPWD" || exit 1
++path_to_fio=""
+ 
+ usage(){
+ 	echo "$0 [-s] [-e io_engine] [-v|V] [-h] [-b|B]  [-d dev_name] [-n|N]"
+@@ -78,15 +73,14 @@ do
+ 	esac
+ done
+ 
+-PARA_LINE="-end_fsync=0 -group_reporting -direct=1 -ioengine=${IO_ENGINE} -thread -time_based -buffer_compress_percentage=0 -invalidate=1 \
+--norandommap -randrepeat=0 -exitall -size=${FILE_SIZE}"
++PARA_LINE=(--end_fsync=0 --group_reporting --direct=1 "--ioengine=${IO_ENGINE}" --thread --time_based --buffer_compress_percentage=0 --invalidate=1 --norandommap --randrepeat=0 --exitall "--size=${FILE_SIZE}")
+ 
+-PARA_LINE1="-end_fsync=0 -group_reporting -direct=1 -ioengine=${IO_ENGINE} -thread -buffer_compress_percentage=0 -invalidate=1 \
+--norandommap -randrepeat=0 -exitall"
++PARA_LINE1=(--end_fsync=0 --group_reporting --direct=1 "--ioengine=${IO_ENGINE}" --thread --buffer_compress_percentage=0 --invalidate=1 --norandommap --randrepeat=0 --exitall)
+ 
+ get_nvmebind_all_numa_node()
+ {
+-    local nvme_block_symbol=$1
++    local nvme_block_symbol
++    nvme_block_symbol="$1"
+     local cpu_socket
+     cpu_socket="$(grep -F -- "$nvme_block_symbol" cpu_numa_nvme_topo | awk '{print $1}' | sort -u)"
+     local nvmebind_all_numa_node
+@@ -96,7 +90,8 @@ get_nvmebind_all_numa_node()
+ 
+ get_nvmebind_node_id()
+ {
+-    local nvme_block_symbol=$1
++    local nvme_block_symbol
++    nvme_block_symbol="$1"
+     local nvmebind_numa_node
+     nvmebind_numa_node="$(grep -F -- "$nvme_block_symbol" cpu_numa_nvme_topo | awk '{print $2}' | awk -F"=" '{print $2}')"
+     echo "$nvmebind_numa_node"
+@@ -110,7 +105,7 @@ ssd_precondition_sequence()
+             exit 1
+         else
+         #Full sequential write to let sata ssd be stable state before sequential test without binding cpu cores
+-        "$path_to_fio" --readwrite=write --bs=128k --iodepth=128 --numjobs=1 --loop=2 ${PARA_LINE1} --filename="/dev/${DEV_LIST}" \
++        "$path_to_fio" --readwrite=write --bs=128k --iodepth=128 --numjobs=1 --loop=2 "${PARA_LINE1[@]}" --filename="/dev/${DEV_LIST}" \
+ 		--name="${DEV_LIST}_write_precondition" | tee -a "ssd_${DEV_LIST}_write_precondition.log"
+         fi
+     fi
+@@ -122,11 +117,11 @@ ssd_precondition_sequence()
+         else
+             local bind_numa_node
+             bind_numa_node="$(get_nvmebind_node_id "$DEV_LIST")"
+-            local numa_mem_opt=""
++            local -a numa_mem_opt=()
+             if [[ "${ENABLE_NUMA_MEMBIND:-0}" == "1" ]];then
+-                numa_mem_opt="-m $bind_numa_node"
++                numa_mem_opt=(-m "$bind_numa_node")
+             fi
+-            numactl -N "$bind_numa_node" $numa_mem_opt "$path_to_fio" --readwrite=write --bs=128k --iodepth=128 --numjobs=1 --loop=2 ${PARA_LINE1} --filename="/dev/${DEV_LIST}" \
++            numactl -N "$bind_numa_node" "${numa_mem_opt[@]}" "$path_to_fio" --readwrite=write --bs=128k --iodepth=128 --numjobs=1 --loop=2 "${PARA_LINE1[@]}" --filename="/dev/${DEV_LIST}" \
+ 			--name="${DEV_LIST}_write_precondition" | tee -a "ssd_${DEV_LIST}_write_precondition.log"
+         fi
+     fi
+@@ -149,7 +144,7 @@ ssd_precondition_random()
+                 runtime=12h
+             fi
+         fi
+-        "$path_to_fio" --readwrite=randwrite --bs="$bs" --iodepth=128 --numjobs=4 --runtime="$runtime" --time_based ${PARA_LINE1} --filename="/dev/${DEV_LIST}" \
++        "$path_to_fio" --readwrite=randwrite --bs="$bs" --iodepth=128 --numjobs=4 --runtime="$runtime" --time_based "${PARA_LINE1[@]}" --filename="/dev/${DEV_LIST}" \
+ 	    --name="${DEV_LIST}_${bs}_randwrite_precondition" | tee -a "ssd_${DEV_LIST}_randwrite_precondition.log"
+     fi
+ 
+@@ -171,11 +166,11 @@ ssd_precondition_random()
+         fi
+         local bind_numa_node
+         bind_numa_node="$(get_nvmebind_node_id "$DEV_LIST")"
+-        local numa_mem_opt=""
++        local -a numa_mem_opt=()
+         if [[ "${ENABLE_NUMA_MEMBIND:-0}" == "1" ]];then
+-            numa_mem_opt="-m $bind_numa_node"
++            numa_mem_opt=(-m "$bind_numa_node")
+         fi
+-        numactl -N "$bind_numa_node" $numa_mem_opt "$path_to_fio" --readwrite=randwrite --bs="$bs" --iodepth=128 --numjobs=4 --runtime="$runtime" --time_based ${PARA_LINE1} --filename="/dev/${DEV_LIST}" \
++        numactl -N "$bind_numa_node" "${numa_mem_opt[@]}" "$path_to_fio" --readwrite=randwrite --bs="$bs" --iodepth=128 --numjobs=4 --runtime="$runtime" --time_based "${PARA_LINE1[@]}" --filename="/dev/${DEV_LIST}" \
+             --name="${DEV_LIST}_${bs}_randwrite_precondition" | tee -a "ssd_${DEV_LIST}_randwrite_precondition.log"
+     fi
+ }
+@@ -187,10 +182,11 @@ cpubind_nvme_base_test_sequence_with_numa_constraint()
+ 	ssd_precondition_sequence
+ 	wait
+ 
+-	local bind_node_id=$(get_nvmebind_node_id $DEV_LIST)
+-	local numa_mem_opt=""
++	local bind_node_id
++	bind_node_id=$(get_nvmebind_node_id "$DEV_LIST")
++	local -a numa_mem_opt=()
+ 	if [[ "${ENABLE_NUMA_MEMBIND:-0}" == "1" ]];then
+-		numa_mem_opt="-m $bind_node_id"
++		numa_mem_opt=(-m "$bind_node_id")
+ 	fi
+ 	for RW in read write
+ 	do
+@@ -200,9 +196,9 @@ cpubind_nvme_base_test_sequence_with_numa_constraint()
+ 			do
+ 				for depth in 32 64 128 256 512
+ 				do
+-					numactl -N $bind_node_id $numa_mem_opt $path_to_fio --readwrite=${RW} --bs=${BS} --numjobs=${THREADS} --iodepth=${depth} --ramp_time=60s \
+-					--runtime=300s ${PARA_LINE} --filename=/dev/${DEV_LIST} --name=${RW}_${BS}_${THREADS}_${depth} | tee -a ssd_${DEV_LIST}_${RW}.log
+-					sleep 30s
++					numactl -N "$bind_node_id" "${numa_mem_opt[@]}" "$path_to_fio" --readwrite=${RW} --bs=${BS} --numjobs=${THREADS} --iodepth=${depth} --ramp_time=60s \
++					--runtime=300s "${PARA_LINE[@]}" --filename="/dev/${DEV_LIST}" --name=${RW}_${BS}_${THREADS}_${depth} | tee -a ssd_${DEV_LIST}_${RW}.log
++					sleep 30
+ 				done
+ 			done
+ 		done
+@@ -213,9 +209,9 @@ cpubind_nvme_base_test_sequence_with_numa_constraint()
+ 			do
+ 				for depth in 32
+ 				do
+-					numactl -N $bind_node_id $numa_mem_opt $path_to_fio --readwrite=${RW} --bs=${BS} --numjobs=${THREADS} --iodepth=${depth} --ramp_time=60s \
+-					--runtime=300s ${PARA_LINE} --filename=/dev/${DEV_LIST} --name=${RW}_${BS}_${THREADS}_${depth} | tee -a ssd_${DEV_LIST}_${RW}.log
+-					sleep 30s
++					numactl -N "$bind_node_id" "${numa_mem_opt[@]}" "$path_to_fio" --readwrite=${RW} --bs=${BS} --numjobs=${THREADS} --iodepth=${depth} --ramp_time=60s \
++					--runtime=300s "${PARA_LINE[@]}" --filename="/dev/${DEV_LIST}" --name=${RW}_${BS}_${THREADS}_${depth} | tee -a ssd_${DEV_LIST}_${RW}.log
++					sleep 30
+ 				done
+ 			done
+ 		done
+@@ -229,55 +225,56 @@ cpubind_nvme_base_test_random_with_numa_constraint()
+ 	ssd_precondition_random 4k
+ 	wait
+ 
+-	local bind_node_id=$(get_nvmebind_node_id $DEV_LIST)
+-	local numa_mem_opt=""
++	local bind_node_id
++	bind_node_id=$(get_nvmebind_node_id "$DEV_LIST")
++	local -a numa_mem_opt=()
+ 	if [[ "${ENABLE_NUMA_MEMBIND:-0}" == "1" ]];then
+-		numa_mem_opt="-m $bind_node_id"
++		numa_mem_opt=(-m "$bind_node_id")
+ 	fi
+ 	for RW in randread randwrite
+ 	do
+ 		local nj=1
+-		numactl -N $bind_node_id $numa_mem_opt $path_to_fio --readwrite=${RW} --bs=4k --ramp_time=60s --runtime=300s --numjobs=$nj --iodepth=1 ${PARA_LINE} \
+-		--filename=/dev/${DEV_LIST} --name=${DEV_LIST}_${RW}_4k_${nj}_1 | tee -a ssd_${DEV_LIST}_${RW}.log
+-		sleep 30s
+-		numactl -N $bind_node_id $numa_mem_opt $path_to_fio --readwrite=${RW} --bs=4k --ramp_time=60s --runtime=300s --numjobs=$nj --iodepth=32 ${PARA_LINE} \
+-		--filename=/dev/${DEV_LIST} --name=${DEV_LIST}_${RW}_4k_${nj}_32 | tee -a ssd_${DEV_LIST}_${RW}.log
+-		sleep 30s	
++		numactl -N "$bind_node_id" "${numa_mem_opt[@]}" "$path_to_fio" --readwrite=${RW} --bs=4k --ramp_time=60s --runtime=300s --numjobs=$nj --iodepth=1 "${PARA_LINE[@]}" \
++		--filename="/dev/${DEV_LIST}" --name=${DEV_LIST}_${RW}_4k_${nj}_1 | tee -a ssd_${DEV_LIST}_${RW}.log
++		sleep 30
++		numactl -N "$bind_node_id" "${numa_mem_opt[@]}" "$path_to_fio" --readwrite=${RW} --bs=4k --ramp_time=60s --runtime=300s --numjobs=$nj --iodepth=32 "${PARA_LINE[@]}" \
++		--filename="/dev/${DEV_LIST}" --name=${DEV_LIST}_${RW}_4k_${nj}_32 | tee -a ssd_${DEV_LIST}_${RW}.log
++		sleep 30	
+ 		
+ 		local nj=2
+-		numactl -N $bind_node_id $numa_mem_opt $path_to_fio --readwrite=${RW} --bs=4k --ramp_time=60s --runtime=300s --numjobs=$nj --iodepth=32 ${PARA_LINE} \
+-		--filename=/dev/${DEV_LIST} --name=${DEV_LIST}_${RW}_4k_${nj}_32 | tee -a ssd_${DEV_LIST}_${RW}.log
+-		sleep 30s
+-		numactl -N $bind_node_id $numa_mem_opt $path_to_fio --readwrite=${RW} --bs=4k --ramp_time=60s --runtime=300s --numjobs=$nj --iodepth=256 ${PARA_LINE} \
+-		--filename=/dev/${DEV_LIST} --name=${DEV_LIST}_${RW}_4k_${nj}_256 | tee -a ssd_${DEV_LIST}_${RW}.log
+-		sleep 30s
++		numactl -N "$bind_node_id" "${numa_mem_opt[@]}" "$path_to_fio" --readwrite=${RW} --bs=4k --ramp_time=60s --runtime=300s --numjobs=$nj --iodepth=32 "${PARA_LINE[@]}" \
++		--filename="/dev/${DEV_LIST}" --name=${DEV_LIST}_${RW}_4k_${nj}_32 | tee -a ssd_${DEV_LIST}_${RW}.log
++		sleep 30
++		numactl -N "$bind_node_id" "${numa_mem_opt[@]}" "$path_to_fio" --readwrite=${RW} --bs=4k --ramp_time=60s --runtime=300s --numjobs=$nj --iodepth=256 "${PARA_LINE[@]}" \
++		--filename="/dev/${DEV_LIST}" --name=${DEV_LIST}_${RW}_4k_${nj}_256 | tee -a ssd_${DEV_LIST}_${RW}.log
++		sleep 30
+ 		
+ 		local nj=4
+-		numactl -N $bind_node_id $numa_mem_opt $path_to_fio --readwrite=${RW} --bs=4k --ramp_time=60s --runtime=300s --numjobs=$nj --iodepth=32 ${PARA_LINE} \
+-		--filename=/dev/${DEV_LIST} --name=${DEV_LIST}_${RW}_4k_${nj}_32 | tee -a ssd_${DEV_LIST}_${RW}.log
+-		sleep 30s
+-		numactl -N $bind_node_id $numa_mem_opt $path_to_fio --readwrite=${RW} --bs=4k --ramp_time=60s --runtime=300s --numjobs=$nj --iodepth=64 ${PARA_LINE} \
+-		--filename=/dev/${DEV_LIST} --name=${DEV_LIST}_${RW}_4k_${nj}_64  | tee -a ssd_${DEV_LIST}_${RW}.log
+-		sleep 30s
++		numactl -N "$bind_node_id" "${numa_mem_opt[@]}" "$path_to_fio" --readwrite=${RW} --bs=4k --ramp_time=60s --runtime=300s --numjobs=$nj --iodepth=32 "${PARA_LINE[@]}" \
++		--filename="/dev/${DEV_LIST}" --name=${DEV_LIST}_${RW}_4k_${nj}_32 | tee -a ssd_${DEV_LIST}_${RW}.log
++		sleep 30
++		numactl -N "$bind_node_id" "${numa_mem_opt[@]}" "$path_to_fio" --readwrite=${RW} --bs=4k --ramp_time=60s --runtime=300s --numjobs=$nj --iodepth=64 "${PARA_LINE[@]}" \
++		--filename="/dev/${DEV_LIST}" --name=${DEV_LIST}_${RW}_4k_${nj}_64  | tee -a ssd_${DEV_LIST}_${RW}.log
++		sleep 30
+ 		
+ 		local nj=8		
+-		numactl -N $bind_node_id $numa_mem_opt $path_to_fio --readwrite=${RW} --bs=4k --ramp_time=60s --runtime=300s --numjobs=$nj --iodepth=1 ${PARA_LINE} \
+-		--filename=/dev/${DEV_LIST} --name=${DEV_LIST}_${RW}_4k_${nj}_1 | tee -a ssd_${DEV_LIST}_${RW}.log
+-		sleep 30s
+-		numactl -N $bind_node_id $numa_mem_opt $path_to_fio --readwrite=${RW} --bs=4k --ramp_time=60s --runtime=300s --numjobs=$nj --iodepth=32 ${PARA_LINE} \
+-		--filename=/dev/${DEV_LIST} --name=${DEV_LIST}_${RW}_4k_${nj}_32 | tee -a ssd_${DEV_LIST}_${RW}.log
+-		sleep 30s
+-		numactl -N $bind_node_id $numa_mem_opt $path_to_fio --readwrite=${RW} --bs=4k --ramp_time=60s --runtime=300s --numjobs=$nj --iodepth=64 ${PARA_LINE} \
+-		--filename=/dev/${DEV_LIST} --name=${DEV_LIST}_${RW}_4k_${nj}_64 | tee -a ssd_${DEV_LIST}_${RW}.log
+-		sleep 30s
+-		numactl -N $bind_node_id $numa_mem_opt $path_to_fio --readwrite=${RW} --bs=4k --ramp_time=60s --runtime=300s --numjobs=$nj --iodepth=256 ${PARA_LINE} \
+-		--filename=/dev/${DEV_LIST} --name=${DEV_LIST}_${RW}_4k_${nj}_256 | tee -a ssd_${DEV_LIST}_${RW}.log
+-		sleep 30s
++		numactl -N "$bind_node_id" "${numa_mem_opt[@]}" "$path_to_fio" --readwrite=${RW} --bs=4k --ramp_time=60s --runtime=300s --numjobs=$nj --iodepth=1 "${PARA_LINE[@]}" \
++		--filename="/dev/${DEV_LIST}" --name=${DEV_LIST}_${RW}_4k_${nj}_1 | tee -a ssd_${DEV_LIST}_${RW}.log
++		sleep 30
++		numactl -N "$bind_node_id" "${numa_mem_opt[@]}" "$path_to_fio" --readwrite=${RW} --bs=4k --ramp_time=60s --runtime=300s --numjobs=$nj --iodepth=32 "${PARA_LINE[@]}" \
++		--filename="/dev/${DEV_LIST}" --name=${DEV_LIST}_${RW}_4k_${nj}_32 | tee -a ssd_${DEV_LIST}_${RW}.log
++		sleep 30
++		numactl -N "$bind_node_id" "${numa_mem_opt[@]}" "$path_to_fio" --readwrite=${RW} --bs=4k --ramp_time=60s --runtime=300s --numjobs=$nj --iodepth=64 "${PARA_LINE[@]}" \
++		--filename="/dev/${DEV_LIST}" --name=${DEV_LIST}_${RW}_4k_${nj}_64 | tee -a ssd_${DEV_LIST}_${RW}.log
++		sleep 30
++		numactl -N "$bind_node_id" "${numa_mem_opt[@]}" "$path_to_fio" --readwrite=${RW} --bs=4k --ramp_time=60s --runtime=300s --numjobs=$nj --iodepth=256 "${PARA_LINE[@]}" \
++		--filename="/dev/${DEV_LIST}" --name=${DEV_LIST}_${RW}_4k_${nj}_256 | tee -a ssd_${DEV_LIST}_${RW}.log
++		sleep 30
+ 		
+ 		local nj=16
+-		numactl -N $bind_node_id $numa_mem_opt $path_to_fio --readwrite=${RW} --bs=4k --ramp_time=60s --runtime=300s --numjobs=$nj --iodepth=64 ${PARA_LINE} \
+-		--filename=/dev/${DEV_LIST} --name=${DEV_LIST}_${RW}_4k_${nj}_64 | tee -a ssd_${DEV_LIST}_${RW}.log
+-		sleep 30s
++		numactl -N "$bind_node_id" "${numa_mem_opt[@]}" "$path_to_fio" --readwrite=${RW} --bs=4k --ramp_time=60s --runtime=300s --numjobs=$nj --iodepth=64 "${PARA_LINE[@]}" \
++		--filename="/dev/${DEV_LIST}" --name=${DEV_LIST}_${RW}_4k_${nj}_64 | tee -a ssd_${DEV_LIST}_${RW}.log
++		sleep 30
+ 	done
+ 
+ 	#8k randwrite precondition
+@@ -286,25 +283,25 @@ cpubind_nvme_base_test_random_with_numa_constraint()
+ 	for RW in randread randwrite
+ 	do
+ 		local nj=1
+-		numactl -N $bind_node_id $numa_mem_opt $path_to_fio --readwrite=${RW} --bs=8k --ramp_time=60s --runtime=300s --numjobs=$nj --iodepth=32 ${PARA_LINE} \
+-		--filename=/dev/${DEV_LIST} --name=${DEV_LIST}_${RW}_8k_${nj}_32 | tee -a ssd_${DEV_LIST}_${RW}.log
+-		sleep 30s
++		numactl -N "$bind_node_id" "${numa_mem_opt[@]}" "$path_to_fio" --readwrite=${RW} --bs=8k --ramp_time=60s --runtime=300s --numjobs=$nj --iodepth=32 "${PARA_LINE[@]}" \
++		--filename="/dev/${DEV_LIST}" --name=${DEV_LIST}_${RW}_8k_${nj}_32 | tee -a ssd_${DEV_LIST}_${RW}.log
++		sleep 30
+ 		
+ 		local nj=4
+-		numactl -N $bind_node_id $numa_mem_opt $path_to_fio --readwrite=${RW} --bs=8k --ramp_time=60s --runtime=300s --numjobs=$nj --iodepth=64 ${PARA_LINE} \
+-		--filename=/dev/${DEV_LIST} --name=${DEV_LIST}_${RW}_8k_${nj}_64 | tee -a ssd_${DEV_LIST}_${RW}.log
+-		sleep 30s
++		numactl -N "$bind_node_id" "${numa_mem_opt[@]}" "$path_to_fio" --readwrite=${RW} --bs=8k --ramp_time=60s --runtime=300s --numjobs=$nj --iodepth=64 "${PARA_LINE[@]}" \
++		--filename="/dev/${DEV_LIST}" --name=${DEV_LIST}_${RW}_8k_${nj}_64 | tee -a ssd_${DEV_LIST}_${RW}.log
++		sleep 30
+ 		
+ 		local nj=8
+-		numactl -N $bind_node_id $numa_mem_opt $path_to_fio --readwrite=${RW} --bs=8k --ramp_time=60s --runtime=300s --numjobs=$nj --iodepth=1 ${PARA_LINE} \
+-		--filename=/dev/${DEV_LIST} --name=${DEV_LIST}_${RW}_8k_${nj}_1 | tee -a ssd_${DEV_LIST}_${RW}.log
+-		sleep 30s
+-		numactl -N $bind_node_id $numa_mem_opt $path_to_fio --readwrite=${RW} --bs=8k --ramp_time=60s --runtime=300s --numjobs=$nj --iodepth=32 ${PARA_LINE} \
+-		--filename=/dev/${DEV_LIST} --name=${DEV_LIST}_${RW}_8k_${nj}_32 | tee -a ssd_${DEV_LIST}_${RW}.log
+-		sleep 30s
+-   		numactl -N $bind_node_id $numa_mem_opt $path_to_fio --readwrite=${RW} --bs=8k --ramp_time=60s --runtime=300s --numjobs=$nj --iodepth=64 ${PARA_LINE} \
+-		--filename=/dev/${DEV_LIST} --name=${DEV_LIST}_${RW}_8k_${nj}_64 | tee -a ssd_${DEV_LIST}_${RW}.log
+-		sleep 30s
++		numactl -N "$bind_node_id" "${numa_mem_opt[@]}" "$path_to_fio" --readwrite=${RW} --bs=8k --ramp_time=60s --runtime=300s --numjobs=$nj --iodepth=1 "${PARA_LINE[@]}" \
++		--filename="/dev/${DEV_LIST}" --name=${DEV_LIST}_${RW}_8k_${nj}_1 | tee -a ssd_${DEV_LIST}_${RW}.log
++		sleep 30
++		numactl -N "$bind_node_id" "${numa_mem_opt[@]}" "$path_to_fio" --readwrite=${RW} --bs=8k --ramp_time=60s --runtime=300s --numjobs=$nj --iodepth=32 "${PARA_LINE[@]}" \
++		--filename="/dev/${DEV_LIST}" --name=${DEV_LIST}_${RW}_8k_${nj}_32 | tee -a ssd_${DEV_LIST}_${RW}.log
++		sleep 30
++   		numactl -N "$bind_node_id" "${numa_mem_opt[@]}" "$path_to_fio" --readwrite=${RW} --bs=8k --ramp_time=60s --runtime=300s --numjobs=$nj --iodepth=64 "${PARA_LINE[@]}" \
++		--filename="/dev/${DEV_LIST}" --name=${DEV_LIST}_${RW}_8k_${nj}_64 | tee -a ssd_${DEV_LIST}_${RW}.log
++		sleep 30
+ 	done
+ 		
+ 	#64k randwrite precondition
+@@ -313,9 +310,9 @@ cpubind_nvme_base_test_random_with_numa_constraint()
+ 	for RW in randread randwrite
+ 	do
+ 		local nj=2
+-   		numactl -N $bind_node_id $numa_mem_opt $path_to_fio --readwrite=${RW} --bs=64k --ramp_time=60s --runtime=300s --numjobs=$nj --iodepth=32 ${PARA_LINE} \
+-		--filename=/dev/${DEV_LIST} --name=${DEV_LIST}_${RW}_64k_${nj}_32 | tee -a ssd_${DEV_LIST}_${RW}.log
+-		sleep 30s
++   		numactl -N "$bind_node_id" "${numa_mem_opt[@]}" "$path_to_fio" --readwrite=${RW} --bs=64k --ramp_time=60s --runtime=300s --numjobs=$nj --iodepth=32 "${PARA_LINE[@]}" \
++		--filename="/dev/${DEV_LIST}" --name=${DEV_LIST}_${RW}_64k_${nj}_32 | tee -a ssd_${DEV_LIST}_${RW}.log
++		sleep 30
+ 	done
+ 
+ 	#128k randwrite precondition
+@@ -324,9 +321,9 @@ cpubind_nvme_base_test_random_with_numa_constraint()
+ 	for RW in randread randwrite
+ 	do
+ 		local nj=2
+-   		numactl -N $bind_node_id $numa_mem_opt $path_to_fio --readwrite=${RW} --bs=128k --ramp_time=60s --runtime=300s --numjobs=$nj --iodepth=64 ${PARA_LINE} \
+-		--filename=/dev/${DEV_LIST} --name=${DEV_LIST}_${RW}_128k_${nj}_64 | tee -a ssd_${DEV_LIST}_${RW}.log
+-		sleep 30s
++   		numactl -N "$bind_node_id" "${numa_mem_opt[@]}" "$path_to_fio" --readwrite=${RW} --bs=128k --ramp_time=60s --runtime=300s --numjobs=$nj --iodepth=64 "${PARA_LINE[@]}" \
++		--filename="/dev/${DEV_LIST}" --name=${DEV_LIST}_${RW}_128k_${nj}_64 | tee -a ssd_${DEV_LIST}_${RW}.log
++		sleep 30
+ 	done
+ 	
+ 	#256k randwrite precondition
+@@ -335,9 +332,9 @@ cpubind_nvme_base_test_random_with_numa_constraint()
+ 	for RW in randread randwrite
+ 	do
+ 		local nj=2
+-		numactl -N $bind_node_id $numa_mem_opt $path_to_fio --readwrite=${RW} --bs=256k --ramp_time=60s --runtime=300s --numjobs=$nj --iodepth=32 ${PARA_LINE} \
+-		--filename=/dev/${DEV_LIST} --name=${DEV_LIST}_${RW}_256k_${nj}_32 | tee -a ssd_${DEV_LIST}_${RW}.log
+-		sleep 30s
++		numactl -N "$bind_node_id" "${numa_mem_opt[@]}" "$path_to_fio" --readwrite=${RW} --bs=256k --ramp_time=60s --runtime=300s --numjobs=$nj --iodepth=32 "${PARA_LINE[@]}" \
++		--filename="/dev/${DEV_LIST}" --name=${DEV_LIST}_${RW}_256k_${nj}_32 | tee -a ssd_${DEV_LIST}_${RW}.log
++		sleep 30
+ 	done
+ 
+ 	#1m randwrite precondition
+@@ -346,9 +343,9 @@ cpubind_nvme_base_test_random_with_numa_constraint()
+ 	for RW in randread randwrite
+ 	do
+ 		local nj=2
+-		numactl -N $bind_node_id $numa_mem_opt $path_to_fio --readwrite=${RW} --bs=1m --ramp_time=60s --runtime=300s --numjobs=$nj --iodepth=32 ${PARA_LINE} \
+-		--filename=/dev/${DEV_LIST} --name=${DEV_LIST}_${RW}_1m_${nj}_32 | tee -a ssd_${DEV_LIST}_${RW}.log
+-		sleep 30s
++		numactl -N "$bind_node_id" "${numa_mem_opt[@]}" "$path_to_fio" --readwrite=${RW} --bs=1m --ramp_time=60s --runtime=300s --numjobs=$nj --iodepth=32 "${PARA_LINE[@]}" \
++		--filename="/dev/${DEV_LIST}" --name=${DEV_LIST}_${RW}_1m_${nj}_32 | tee -a ssd_${DEV_LIST}_${RW}.log
++		sleep 30
+ 	done
+ }
+ 
+@@ -367,9 +364,9 @@ ssd_base_test_sequence()
+ 			do
+ 				for depth in 32 64 128 256 512
+ 				do
+-					$path_to_fio --readwrite=${RW} --bs=${BS} --numjobs=${THREADS} --iodepth=${depth} --runtime=300s ${PARA_LINE} --filename=/dev/${DEV_LIST} \
++					$path_to_fio --readwrite=${RW} --bs=${BS} --numjobs=${THREADS} --iodepth=${depth} --runtime=300s "${PARA_LINE[@]}" --filename="/dev/${DEV_LIST}" \
+ 					--name=${RW}_${BS}_${THREADS}_${depth} | tee -a ssd_${DEV_LIST}_${RW}.log
+-					sleep 30s
++					sleep 30
+ 				done
+ 			done
+ 		done
+@@ -380,9 +377,9 @@ ssd_base_test_sequence()
+ 			do
+ 				for depth in 32
+ 				do
+-					$path_to_fio --readwrite=${RW} --bs=${BS} --numjobs=${THREADS} --iodepth=${depth} --runtime=300s ${PARA_LINE} --filename=/dev/${DEV_LIST} \
++					$path_to_fio --readwrite=${RW} --bs=${BS} --numjobs=${THREADS} --iodepth=${depth} --runtime=300s "${PARA_LINE[@]}" --filename="/dev/${DEV_LIST}" \
+ 					--name=${RW}_${BS}_${THREADS}_${depth} | tee -a ssd_${DEV_LIST}_${RW}.log
+-					sleep 30s
++					sleep 30
+ 				done
+ 			done
+ 		done				
+@@ -397,39 +394,39 @@ ssd_base_test_random()
+ 	wait	
+ 	for RW in randread randwrite
+ 	do		
+-		$path_to_fio --readwrite=${RW} --bs=4k --runtime=300s --numjobs=1 --iodepth=1 ${PARA_LINE} --filename=/dev/${DEV_LIST} --name=${DEV_LIST}_${RW}_4k_1_1  \
++		$path_to_fio --readwrite=${RW} --bs=4k --runtime=300s --numjobs=1 --iodepth=1 "${PARA_LINE[@]}" --filename="/dev/${DEV_LIST}" --name=${DEV_LIST}_${RW}_4k_1_1  \
+ 		| tee -a ssd_${DEV_LIST}_${RW}.log
+-		sleep 30s 
+-		$path_to_fio --readwrite=${RW} --bs=4k --runtime=300s --numjobs=1 --iodepth=32 ${PARA_LINE} --filename=/dev/${DEV_LIST} --name=${DEV_LIST}_${RW}_4k_1_32  \
++		sleep 30 
++		$path_to_fio --readwrite=${RW} --bs=4k --runtime=300s --numjobs=1 --iodepth=32 "${PARA_LINE[@]}" --filename="/dev/${DEV_LIST}" --name=${DEV_LIST}_${RW}_4k_1_32  \
+ 		| tee -a ssd_${DEV_LIST}_${RW}.log
+-		sleep 30s	
+-		$path_to_fio --readwrite=${RW} --bs=4k --runtime=300s --numjobs=2 --iodepth=32 ${PARA_LINE} --filename=/dev/${DEV_LIST} --name=${DEV_LIST}_${RW}_4k_2_32  \
++		sleep 30	
++		$path_to_fio --readwrite=${RW} --bs=4k --runtime=300s --numjobs=2 --iodepth=32 "${PARA_LINE[@]}" --filename="/dev/${DEV_LIST}" --name=${DEV_LIST}_${RW}_4k_2_32  \
+ 		| tee -a ssd_${DEV_LIST}_${RW}.log
+-		sleep 30s
+-		$path_to_fio --readwrite=${RW} --bs=4k --runtime=300s --numjobs=2 --iodepth=256 ${PARA_LINE} --filename=/dev/${DEV_LIST} --name=${DEV_LIST}_${RW}_4k_2_256  \
++		sleep 30
++		$path_to_fio --readwrite=${RW} --bs=4k --runtime=300s --numjobs=2 --iodepth=256 "${PARA_LINE[@]}" --filename="/dev/${DEV_LIST}" --name=${DEV_LIST}_${RW}_4k_2_256  \
+ 		| tee -a ssd_${DEV_LIST}_${RW}.log
+-		sleep 30s
+-		$path_to_fio --readwrite=${RW} --bs=4k --runtime=300s --numjobs=4 --iodepth=32 ${PARA_LINE} --filename=/dev/${DEV_LIST} --name=${DEV_LIST}_${RW}_4k_4_32  \
++		sleep 30
++		$path_to_fio --readwrite=${RW} --bs=4k --runtime=300s --numjobs=4 --iodepth=32 "${PARA_LINE[@]}" --filename="/dev/${DEV_LIST}" --name=${DEV_LIST}_${RW}_4k_4_32  \
+ 		| tee -a ssd_${DEV_LIST}_${RW}.log
+-		sleep 30s
+-		$path_to_fio --readwrite=${RW} --bs=4k --runtime=300s --numjobs=4 --iodepth=64 ${PARA_LINE} --filename=/dev/${DEV_LIST} --name=${DEV_LIST}_${RW}_4k_4_64  \
++		sleep 30
++		$path_to_fio --readwrite=${RW} --bs=4k --runtime=300s --numjobs=4 --iodepth=64 "${PARA_LINE[@]}" --filename="/dev/${DEV_LIST}" --name=${DEV_LIST}_${RW}_4k_4_64  \
+ 		| tee -a ssd_${DEV_LIST}_${RW}.log
+-		sleep 30s
+-		$path_to_fio --readwrite=${RW} --bs=4k --runtime=300s --numjobs=8 --iodepth=1 ${PARA_LINE} --filename=/dev/${DEV_LIST} --name=${DEV_LIST}_${RW}_4k_8_1  \
++		sleep 30
++		$path_to_fio --readwrite=${RW} --bs=4k --runtime=300s --numjobs=8 --iodepth=1 "${PARA_LINE[@]}" --filename="/dev/${DEV_LIST}" --name=${DEV_LIST}_${RW}_4k_8_1  \
+ 		| tee -a ssd_${DEV_LIST}_${RW}.log
+-		sleep 30s	
+-		$path_to_fio --readwrite=${RW} --bs=4k --runtime=300s --numjobs=8 --iodepth=32 ${PARA_LINE} --filename=/dev/${DEV_LIST} --name=${DEV_LIST}_${RW}_4k_8_32 \
++		sleep 30	
++		$path_to_fio --readwrite=${RW} --bs=4k --runtime=300s --numjobs=8 --iodepth=32 "${PARA_LINE[@]}" --filename="/dev/${DEV_LIST}" --name=${DEV_LIST}_${RW}_4k_8_32 \
+ 		| tee -a ssd_${DEV_LIST}_${RW}.log
+-		sleep 30s
+-		$path_to_fio --readwrite=${RW} --bs=4k --runtime=300s --numjobs=8 --iodepth=64 ${PARA_LINE} --filename=/dev/${DEV_LIST} --name=${DEV_LIST}_${RW}_4k_8_64  \
++		sleep 30
++		$path_to_fio --readwrite=${RW} --bs=4k --runtime=300s --numjobs=8 --iodepth=64 "${PARA_LINE[@]}" --filename="/dev/${DEV_LIST}" --name=${DEV_LIST}_${RW}_4k_8_64  \
+ 		| tee -a ssd_${DEV_LIST}_${RW}.log
+-		sleep 30s
+-		$path_to_fio --readwrite=${RW} --bs=4k --runtime=300s --numjobs=8 --iodepth=256 ${PARA_LINE} --filename=/dev/${DEV_LIST} --name=${DEV_LIST}_${RW}_4k_8_256  \
++		sleep 30
++		$path_to_fio --readwrite=${RW} --bs=4k --runtime=300s --numjobs=8 --iodepth=256 "${PARA_LINE[@]}" --filename="/dev/${DEV_LIST}" --name=${DEV_LIST}_${RW}_4k_8_256  \
+ 		| tee -a ssd_${DEV_LIST}_${RW}.log
+-		sleep 30s
+-		$path_to_fio --readwrite=${RW} --bs=4k --runtime=300s --numjobs=16 --iodepth=64 ${PARA_LINE} --filename=/dev/${DEV_LIST} --name=${DEV_LIST}_${RW}_4k_16_64  \
++		sleep 30
++		$path_to_fio --readwrite=${RW} --bs=4k --runtime=300s --numjobs=16 --iodepth=64 "${PARA_LINE[@]}" --filename="/dev/${DEV_LIST}" --name=${DEV_LIST}_${RW}_4k_16_64  \
+ 		| tee -a ssd_${DEV_LIST}_${RW}.log
+-		sleep 30s
++		sleep 30
+ 	done
+ 
+ 	#8k randwrite precondition
+@@ -437,21 +434,21 @@ ssd_base_test_random()
+ 	wait		
+ 	for RW in randread randwrite
+ 	do
+-   		$path_to_fio --readwrite=${RW} --bs=8k --runtime=300s --numjobs=1 --iodepth=32 ${PARA_LINE} --filename=/dev/${DEV_LIST} --name=${DEV_LIST}_${RW}_8k_1_32  \
++   		$path_to_fio --readwrite=${RW} --bs=8k --runtime=300s --numjobs=1 --iodepth=32 "${PARA_LINE[@]}" --filename="/dev/${DEV_LIST}" --name=${DEV_LIST}_${RW}_8k_1_32  \
+ 		| tee -a ssd_${DEV_LIST}_${RW}.log
+-		sleep 30s
+-		$path_to_fio --readwrite=${RW} --bs=8k --runtime=300s --numjobs=4 --iodepth=64 ${PARA_LINE} --filename=/dev/${DEV_LIST} --name=${DEV_LIST}_${RW}_8k_4_64  \
++		sleep 30
++		$path_to_fio --readwrite=${RW} --bs=8k --runtime=300s --numjobs=4 --iodepth=64 "${PARA_LINE[@]}" --filename="/dev/${DEV_LIST}" --name=${DEV_LIST}_${RW}_8k_4_64  \
+ 		| tee -a ssd_${DEV_LIST}_${RW}.log
+-		sleep 30s
+-		$path_to_fio --readwrite=${RW} --bs=8k --runtime=300s --numjobs=8 --iodepth=1 ${PARA_LINE} --filename=/dev/${DEV_LIST} --name=${DEV_LIST}_${RW}_8k_8_1  \
++		sleep 30
++		$path_to_fio --readwrite=${RW} --bs=8k --runtime=300s --numjobs=8 --iodepth=1 "${PARA_LINE[@]}" --filename="/dev/${DEV_LIST}" --name=${DEV_LIST}_${RW}_8k_8_1  \
+ 		| tee -a ssd_${DEV_LIST}_${RW}.log
+-		sleep 30s
+-		$path_to_fio --readwrite=${RW} --bs=8k --runtime=300s --numjobs=8 --iodepth=32 ${PARA_LINE} --filename=/dev/${DEV_LIST} --name=${DEV_LIST}_${RW}_8k_8_32  \
++		sleep 30
++		$path_to_fio --readwrite=${RW} --bs=8k --runtime=300s --numjobs=8 --iodepth=32 "${PARA_LINE[@]}" --filename="/dev/${DEV_LIST}" --name=${DEV_LIST}_${RW}_8k_8_32  \
+ 		| tee -a ssd_${DEV_LIST}_${RW}.log
+-		sleep 30s
+-   		$path_to_fio --readwrite=${RW} --bs=8k --runtime=300s --numjobs=8 --iodepth=64 ${PARA_LINE} --filename=/dev/${DEV_LIST} --name=${DEV_LIST}_${RW}_8k_8_64  \
++		sleep 30
++   		$path_to_fio --readwrite=${RW} --bs=8k --runtime=300s --numjobs=8 --iodepth=64 "${PARA_LINE[@]}" --filename="/dev/${DEV_LIST}" --name=${DEV_LIST}_${RW}_8k_8_64  \
+ 		| tee -a ssd_${DEV_LIST}_${RW}.log
+-		sleep 30s
++		sleep 30
+ 	done
+ 		
+ 	#64k randwrite precondition
+@@ -459,9 +456,9 @@ ssd_base_test_random()
+ 	wait
+ 	for RW in randread randwrite
+ 	do
+-   		$path_to_fio --readwrite=${RW} --bs=64k --runtime=300s --numjobs=2 --iodepth=32 ${PARA_LINE} --filename=/dev/${DEV_LIST} --name=${DEV_LIST}_${RW}_64k_2_32  \
++   		$path_to_fio --readwrite=${RW} --bs=64k --runtime=300s --numjobs=2 --iodepth=32 "${PARA_LINE[@]}" --filename="/dev/${DEV_LIST}" --name=${DEV_LIST}_${RW}_64k_2_32  \
+ 		| tee -a ssd_${DEV_LIST}_${RW}.log
+-		sleep 30s
++		sleep 30
+ 	done
+ 
+ 
+@@ -470,9 +467,9 @@ ssd_base_test_random()
+ 	wait
+ 	for RW in randread randwrite
+ 	do
+-   		$path_to_fio --readwrite=${RW} --bs=128k --runtime=300s --numjobs=2 --iodepth=64 ${PARA_LINE} --filename=/dev/${DEV_LIST} --name=${DEV_LIST}_${RW}_128k_2_64  \
++   		$path_to_fio --readwrite=${RW} --bs=128k --runtime=300s --numjobs=2 --iodepth=64 "${PARA_LINE[@]}" --filename="/dev/${DEV_LIST}" --name=${DEV_LIST}_${RW}_128k_2_64  \
+ 		| tee -a ssd_${DEV_LIST}_${RW}.log
+-		sleep 30s
++		sleep 30
+ 	done
+ 	
+ 	#256k randwrite precondition
+@@ -480,9 +477,9 @@ ssd_base_test_random()
+ 	wait
+ 	for RW in randread randwrite
+ 	do
+-		$path_to_fio --readwrite=${RW} --bs=256k --runtime=300s --numjobs=2 --iodepth=32 ${PARA_LINE} --filename=/dev/${DEV_LIST} --name=${DEV_LIST}_${RW}_256k_2_32  \
++		$path_to_fio --readwrite=${RW} --bs=256k --runtime=300s --numjobs=2 --iodepth=32 "${PARA_LINE[@]}" --filename="/dev/${DEV_LIST}" --name=${DEV_LIST}_${RW}_256k_2_32  \
+ 		| tee -a ssd_${DEV_LIST}_${RW}.log
+-		sleep 30s
++		sleep 30
+ 	done
+ 
+ 	#1m randwrite precondition
+@@ -490,9 +487,9 @@ ssd_base_test_random()
+ 	wait
+ 	for RW in randread randwrite
+ 	do
+-		$path_to_fio --readwrite=${RW} --bs=1m --runtime=300s --numjobs=2 --iodepth=32 ${PARA_LINE} --filename=/dev/${DEV_LIST} --name=${DEV_LIST}_${RW}_1m_2_32 \
++		$path_to_fio --readwrite=${RW} --bs=1m --runtime=300s --numjobs=2 --iodepth=32 "${PARA_LINE[@]}" --filename="/dev/${DEV_LIST}" --name=${DEV_LIST}_${RW}_1m_2_32 \
+ 		| tee -a ssd_${DEV_LIST}_${RW}.log
+-		sleep 30s
++		sleep 30
+ 	done
+ }
+ 
+@@ -503,35 +500,35 @@ hdd_base_test_sequence()
+ 	# Sequential write/read test
+ 	for RW in write read
+ 	do
+-		$path_to_fio --readwrite=${RW} --bs=4k --runtime=300s --numjobs=2 --iodepth=32 ${PARA_LINE} --offset_increment=80G --filename=/dev/${DEV_LIST} --name=${DEV_LIST}_${RW}_4k_2_32  \
++		$path_to_fio --readwrite=${RW} --bs=4k --runtime=300s --numjobs=2 --iodepth=32 "${PARA_LINE[@]}" --offset_increment=80G --filename="/dev/${DEV_LIST}" --name=${DEV_LIST}_${RW}_4k_2_32  \
+ 		| tee -a hdd_${DEV_LIST}_${RW}.log
+-		sleep 30s
++		sleep 30
+ 		
+-		$path_to_fio --readwrite=${RW} --bs=64k --runtime=300s --numjobs=2 --iodepth=32 ${PARA_LINE} --offset_increment=80G --filename=/dev/${DEV_LIST} --name=${DEV_LIST}_${RW}_64k_2_32  \
++		$path_to_fio --readwrite=${RW} --bs=64k --runtime=300s --numjobs=2 --iodepth=32 "${PARA_LINE[@]}" --offset_increment=80G --filename="/dev/${DEV_LIST}" --name=${DEV_LIST}_${RW}_64k_2_32  \
+ 		| tee -a hdd_${DEV_LIST}_${RW}.log
+-		sleep 30s
++		sleep 30
+ 
+-		$path_to_fio --readwrite=${RW} --bs=256k --runtime=300s --numjobs=2 --iodepth=32 ${PARA_LINE} --offset_increment=80G --filename=/dev/${DEV_LIST} --name=${DEV_LIST}_${RW}_256k_2_32  \
++		$path_to_fio --readwrite=${RW} --bs=256k --runtime=300s --numjobs=2 --iodepth=32 "${PARA_LINE[@]}" --offset_increment=80G --filename="/dev/${DEV_LIST}" --name=${DEV_LIST}_${RW}_256k_2_32  \
+ 		| tee -a hdd_${DEV_LIST}_${RW}.log
+-		sleep 30s
++		sleep 30
+ 
+-		$path_to_fio --readwrite=${RW} --bs=1m --runtime=300s --numjobs=1 --iodepth=32 ${PARA_LINE} --filename=/dev/${DEV_LIST} --name=${DEV_LIST}_${RW}_1m_1_32  \
++		$path_to_fio --readwrite=${RW} --bs=1m --runtime=300s --numjobs=1 --iodepth=32 "${PARA_LINE[@]}" --filename="/dev/${DEV_LIST}" --name=${DEV_LIST}_${RW}_1m_1_32  \
+ 		| tee -a hdd_${DEV_LIST}_${RW}.log
+-		sleep 30s
++		sleep 30
+ 
+-		$path_to_fio --readwrite=${RW} --bs=1m --runtime=300s --numjobs=2 --iodepth=32 ${PARA_LINE} --offset_increment=80G --filename=/dev/${DEV_LIST} --name=${DEV_LIST}_${RW}_1m_2_32  \
++		$path_to_fio --readwrite=${RW} --bs=1m --runtime=300s --numjobs=2 --iodepth=32 "${PARA_LINE[@]}" --offset_increment=80G --filename="/dev/${DEV_LIST}" --name=${DEV_LIST}_${RW}_1m_2_32  \
+ 		| tee -a hdd_${DEV_LIST}_${RW}.log
+-		sleep 30s
++		sleep 30
+ 	done
+ }
+ 
+ hdd_base_test_random()
+ {
+-    rm -f hdd_${DEV_LIST}_randread.log ssd_${DEV_LIST}_randwrite.log
++    rm -f "hdd_${DEV_LIST}_randread.log" "hdd_${DEV_LIST}_randwrite.log"
+ 	# Randrom write test with different io pattern       
+-	$path_to_fio --readwrite=randwrite --bs=4k --ramp_time=10s --runtime=300s --numjobs=1 --iodepth=1 ${PARA_LINE} --filename=/dev/${DEV_LIST} --name=${DEV_LIST}_randwrite_4k_1_1  \
++	$path_to_fio --readwrite=randwrite --bs=4k --ramp_time=10s --runtime=300s --numjobs=1 --iodepth=1 "${PARA_LINE[@]}" --filename="/dev/${DEV_LIST}" --name=${DEV_LIST}_randwrite_4k_1_1  \
+ 	| tee -a hdd_${DEV_LIST}_randwrite.log
+-	sleep 30s
++	sleep 30
+ 
+ 	for BS in 4k 64k 256k 1m
+ 	do
+@@ -539,9 +536,9 @@ hdd_base_test_random()
+ 		do
+ 			for depth in 32
+ 			do
+-				$path_to_fio --readwrite=randwrite --bs=${BS} --ramp_time=10s --runtime=300s --numjobs=${THREADS} --iodepth=${depth} ${PARA_LINE} --filename=/dev/${DEV_LIST} \
++				$path_to_fio --readwrite=randwrite --bs=${BS} --ramp_time=10s --runtime=300s --numjobs=${THREADS} --iodepth=${depth} "${PARA_LINE[@]}" --filename="/dev/${DEV_LIST}" \
+ 				--name=${DEV_LIST}_randwrite_${BS}_${THREADS}_${depth} | tee -a hdd_${DEV_LIST}_randwrite.log
+-			    sleep 30s
++			    sleep 30
+ 			done
+ 		done
+ 	done
+@@ -554,18 +551,18 @@ hdd_base_test_random()
+ 		do
+ 			for depth in 1 4 8 16 32
+ 			do	
+-				$path_to_fio --readwrite=randread --bs=${BS} --ramp_time=10s --runtime=300s --numjobs=${THREADS} --iodepth=${depth} ${PARA_LINE} --filename=/dev/${DEV_LIST} \
++				$path_to_fio --readwrite=randread --bs=${BS} --ramp_time=10s --runtime=300s --numjobs=${THREADS} --iodepth=${depth} "${PARA_LINE[@]}" --filename="/dev/${DEV_LIST}" \
+ 				--name=${DEV_LIST}_randread_${BS}_${THREADS}_${depth} | tee -a hdd_${DEV_LIST}_randread.log
+-				sleep 30s
++				sleep 30
+ 			done
+ 		done
+ 	done
+ 
+-	$path_to_fio --readwrite=randread --bs=8k --ramp_time=10s --runtime=300s --numjobs=1 --iodepth=1 ${PARA_LINE} --filename=/dev/${DEV_LIST} --name=${DEV_LIST}_randread_8k_1_1  \
++	$path_to_fio --readwrite=randread --bs=8k --ramp_time=10s --runtime=300s --numjobs=1 --iodepth=1 "${PARA_LINE[@]}" --filename="/dev/${DEV_LIST}" --name=${DEV_LIST}_randread_8k_1_1  \
+ 	| tee -a hdd_${DEV_LIST}_randread.log
+-	sleep 30s
++	sleep 30
+ 	
+-	$path_to_fio --readwrite=randread --bs=8k --ramp_time=10s --runtime=300s --numjobs=1 --iodepth=32 ${PARA_LINE} --filename=/dev/${DEV_LIST} --name=${DEV_LIST}_randread_8k_1_32  \
++	$path_to_fio --readwrite=randread --bs=8k --ramp_time=10s --runtime=300s --numjobs=1 --iodepth=32 "${PARA_LINE[@]}" --filename="/dev/${DEV_LIST}" --name=${DEV_LIST}_randread_8k_1_32  \
+ 	| tee -a hdd_${DEV_LIST}_randread.log
+ 
+ 
+@@ -575,9 +572,9 @@ hdd_base_test_random()
+ 		do
+ 			for depth in 32
+ 			do
+-				$path_to_fio --readwrite=randread --bs=${BS} --ramp_time=10s --runtime=300s --numjobs=${THREADS} --iodepth=${depth} ${PARA_LINE} --filename=/dev/${DEV_LIST} \
++				$path_to_fio --readwrite=randread --bs=${BS} --ramp_time=10s --runtime=300s --numjobs=${THREADS} --iodepth=${depth} "${PARA_LINE[@]}" --filename="/dev/${DEV_LIST}" \
+ 				--name=${DEV_LIST}_randread_${BS}_${THREADS}_${depth} | tee -a hdd_${DEV_LIST}_randread.log
+-				sleep 30s
++				sleep 30
+ 			done
+ 		done
+ 	done
+@@ -590,53 +587,53 @@ ssd_stress()
+ 	ssd_precondition_sequence
+ 	wait
+ 	#128k read stress for 2h
+-	$path_to_fio --readwrite=read --bs=128k --numjobs=1 --iodepth=128 --runtime=2h ${PARA_LINE} --filename=/dev/${DEV_LIST} \
++	$path_to_fio --readwrite=read --bs=128k --numjobs=1 --iodepth=128 --runtime=2h "${PARA_LINE[@]}" --filename="/dev/${DEV_LIST}" \
+ 	--name=${DEV_LIST}_128k_read_stress | tee -a ssd_${DEV_LIST}_128k_read_stress.log
+-	sleep 30s
++	sleep 30
+ 	#128k write stress for 10h
+-	$path_to_fio --readwrite=write --bs=128k --numjobs=1 --iodepth=128 --runtime=10h ${PARA_LINE} --filename=/dev/${DEV_LIST} \
++	$path_to_fio --readwrite=write --bs=128k --numjobs=1 --iodepth=128 --runtime=10h "${PARA_LINE[@]}" --filename="/dev/${DEV_LIST}" \
+ 	--name=${DEV_LIST}_128k_write_stress | tee -a ssd_${DEV_LIST}_128k_write_stress.log
+-	sleep 30s
++	sleep 30
+ 	#4k randwrite precondition
+ 	ssd_precondition_random 4k
+ 	wait
+ 	#4k randread stress for 2h
+-	$path_to_fio --readwrite=randread --bs=4k --numjobs=8 --iodepth=128 --runtime=2h ${PARA_LINE} --filename=/dev/${DEV_LIST} \
+-	--name=${DEV_LIST}_4k_randwrite_stress | tee -a ssd_${DEV_LIST}_4k_randread_stress.log
+-	sleep 30s
++	$path_to_fio --readwrite=randread --bs=4k --numjobs=8 --iodepth=128 --runtime=2h "${PARA_LINE[@]}" --filename="/dev/${DEV_LIST}" \
++	--name=${DEV_LIST}_4k_randread_stress | tee -a ssd_${DEV_LIST}_4k_randread_stress.log
++	sleep 30
+ 	#4k randwrite stress for 10h
+-	$path_to_fio --readwrite=randwrite --bs=4k --numjobs=8 --iodepth=128 --runtime=10h ${PARA_LINE} --filename=/dev/${DEV_LIST} \
++	$path_to_fio --readwrite=randwrite --bs=4k --numjobs=8 --iodepth=128 --runtime=10h "${PARA_LINE[@]}" --filename="/dev/${DEV_LIST}" \
+ 	--name=${DEV_LIST}_4k_randwrite_stress | tee -a ssd_${DEV_LIST}_4k_randwrite_stress.log
+-	sleep 30s
++	sleep 30
+ 	#4k 70% mixrw stress for 2h
+-	$path_to_fio --readwrite=randrw --rwmixread=70 --bs=4k --numjobs=8 --iodepth=128 --runtime=2h ${PARA_LINE} --filename=/dev/${DEV_LIST} \
+-	--name=${DEV_LIST}_4k_randwrite_stress | tee -a ssd_${DEV_LIST}_4k_mixrw_stress.log
+-	sleep 30s   	
++	$path_to_fio --readwrite=randrw --rwmixread=70 --bs=4k --numjobs=8 --iodepth=128 --runtime=2h "${PARA_LINE[@]}" --filename="/dev/${DEV_LIST}" \
++	--name=${DEV_LIST}_4k_mixrw_stress | tee -a ssd_${DEV_LIST}_4k_mixrw_stress.log
++	sleep 30   	
+ }
+ 
+ hdd_stress()
+ {
+     rm -f hdd_${DEV_LIST}*stress.log
+ 	#128k read stress for 8h
+-	$path_to_fio --readwrite=read --bs=128k --numjobs=1 --iodepth=128 --runtime=8h ${PARA_LINE} --filename=/dev/${DEV_LIST} \
++	$path_to_fio --readwrite=read --bs=128k --numjobs=1 --iodepth=128 --runtime=8h "${PARA_LINE[@]}" --filename="/dev/${DEV_LIST}" \
+ 	--name=${DEV_LIST}_128k_read_stress | tee -a hdd_${DEV_LIST}_128k_read_stress.log
+-	sleep 30s
++	sleep 30
+ 	#128k write stress for 8h
+-	$path_to_fio --readwrite=write --bs=128k --numjobs=1 --iodepth=128 --runtime=8h ${PARA_LINE} --filename=/dev/${DEV_LIST} \
++	$path_to_fio --readwrite=write --bs=128k --numjobs=1 --iodepth=128 --runtime=8h "${PARA_LINE[@]}" --filename="/dev/${DEV_LIST}" \
+ 	--name=${DEV_LIST}_128k_write_stress | tee -a hdd_${DEV_LIST}_128k_write_stress.log
+-	sleep 30s
++	sleep 30
+ 	#4k randread stress for 8h
+-	$path_to_fio --readwrite=randread --bs=4k --numjobs=4 --iodepth=64 --runtime=8h ${PARA_LINE} --filename=/dev/${DEV_LIST} \
+-	--name=${DEV_LIST}_4k_randwrite_stress | tee -a hdd_${DEV_LIST}_4k_randread_stress.log
+-	sleep 30s
++	$path_to_fio --readwrite=randread --bs=4k --numjobs=4 --iodepth=64 --runtime=8h "${PARA_LINE[@]}" --filename="/dev/${DEV_LIST}" \
++	--name=${DEV_LIST}_4k_randread_stress | tee -a hdd_${DEV_LIST}_4k_randread_stress.log
++	sleep 30
+ 	#4k randwrite stress for 8h
+-	$path_to_fio --readwrite=randwrite --bs=4k --numjobs=4 --iodepth=64 --runtime=8h ${PARA_LINE} --filename=/dev/${DEV_LIST} \
++	$path_to_fio --readwrite=randwrite --bs=4k --numjobs=4 --iodepth=64 --runtime=8h "${PARA_LINE[@]}" --filename="/dev/${DEV_LIST}" \
+ 	--name=${DEV_LIST}_4k_randwrite_stress | tee -a hdd_${DEV_LIST}_4k_randwrite_stress.log
+-	sleep 30s
++	sleep 30
+ 	#4k 70% mixrw stress for 8h
+-	$path_to_fio --readwrite=randrw --rwmixread=70 --bs=4k --numjobs=4 --iodepth=64 --runtime=8h ${PARA_LINE} --filename=/dev/${DEV_LIST} \
++	$path_to_fio --readwrite=randrw --rwmixread=70 --bs=4k --numjobs=4 --iodepth=64 --runtime=8h "${PARA_LINE[@]}" --filename="/dev/${DEV_LIST}" \
+ 	--name=${DEV_LIST}_4k_randwrite_stress | tee -a hdd_${DEV_LIST}_4k_mixrw_stress.log
+-	sleep 30s   	
++	sleep 30   	
+ }
+ 
+ 
+@@ -644,34 +641,45 @@ if [[ $# -eq 0 ]];then
+     usage
+ fi
+ 
+-if ${IS_SSD_BASE_SEQ};then
++path_to_fio="$(command -v fio 2>/dev/null || true)"
++if [[ -z "$path_to_fio" ]];then
++    echo "fio not found in PATH" >&2
++    exit 1
++fi
++
++if [[ -z "${DEV_LIST:-}" ]] || [[ ! "$DEV_LIST" =~ ^(sd[a-z]+|nvme[0-9]+n[0-9]+|vd[a-z]+)$ ]]; then
++    echo "Invalid device: ${DEV_LIST:-<empty>}" >&2
++    exit 1
++fi
++
++if [[ "${IS_SSD_BASE_SEQ}" == "true" ]]; then
+     ssd_base_test_sequence
+ fi
+ 
+-if ${IS_SSD_BASE_RAND};then
++if [[ "${IS_SSD_BASE_RAND}" == "true" ]]; then
+     ssd_base_test_random
+ fi
+ 
+-if ${IS_NVME_BIND_CPUS_BASE_SEQ};then
++if [[ "${IS_NVME_BIND_CPUS_BASE_SEQ}" == "true" ]]; then
+     cpubind_nvme_base_test_sequence_with_numa_constraint
+ fi
+ 
+-if ${IS_NVME_BIND_CPUS_BASE_RAND};then
++if [[ "${IS_NVME_BIND_CPUS_BASE_RAND}" == "true" ]]; then
+     cpubind_nvme_base_test_random_with_numa_constraint
+ fi
+ 
+-if ${IS_HDD_BASE_SEQ};then
++if [[ "${IS_HDD_BASE_SEQ}" == "true" ]]; then
+     hdd_base_test_sequence
+ fi
+ 
+-if ${IS_HDD_BASE_RAND};then
++if [[ "${IS_HDD_BASE_RAND}" == "true" ]]; then
+     hdd_base_test_random
+ fi
+ 
+-if ${IS_SSD_STRESS};then
++if [[ "${IS_SSD_STRESS}" == "true" ]]; then
+     ssd_stress
+ fi
+ 
+-if ${IS_HDD_STRESS};then
++if [[ "${IS_HDD_STRESS}" == "true" ]]; then
+     hdd_stress
+ fi
+
+
+===== FILE: modified_scripts/multi_disk_fio_scripts-V0.4/run_parallel_disk.sh =====
+diff --git a/modified_scripts/multi_disk_fio_scripts-V0.4/run_parallel_disk.sh b/modified_scripts/multi_disk_fio_scripts-V0.4/run_parallel_disk.sh
+index e7c0002..094db52 100644
+--- a/modified_scripts/multi_disk_fio_scripts-V0.4/run_parallel_disk.sh
++++ b/modified_scripts/multi_disk_fio_scripts-V0.4/run_parallel_disk.sh
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env bash
+-set -o pipefail
++set -euo pipefail
+ #****************************************************************#
+ # Author: zhouq32@chinatelecom.cn
+ # merge parallel nvme/ssd/hdd fio test with arguments option
+@@ -8,7 +8,7 @@ set -o pipefail
+ #****************************************************************#
+ 
+ CPWD="$(cd -- "$(dirname -- "$0")" && pwd)"
+-cd "$CPWD"
++cd "$CPWD" || { echo "ERROR: failed to enter $CPWD" >&2; exit 1; }
+ rm -f -- ssd_symbol_set hdd_symbol_set nvme_symbol_set raid_symbol_set filter_multi*.csv
+ 
+ move_glob()
+@@ -24,7 +24,7 @@ move_glob()
+ 
+ IS_NVME_PARALLEL=false
+ IS_SSD_PARALLEL=false
+-IS_NVME_PARALLER_WITH_CPUSBIND=false
++IS_NVME_PARALLEL_WITH_CPUSBIND=false
+ IS_HDD_PARALLEL=false
+ IS_NVME_PARALLEL_STRESS=false
+ IS_SSD_PARALLEL_STRESS=false
+@@ -56,7 +56,7 @@ do
+         S)
+         IS_SSD_PARALLEL=true;;
+         C)
+-        IS_NVME_PARALLER_WITH_CPUSBIND=true;;
++        IS_NVME_PARALLEL_WITH_CPUSBIND=true;;
+         H)
+         IS_HDD_PARALLEL=true;;
+         n)
+@@ -84,7 +84,7 @@ check_tool_installed()
+ filter_ssd_hdd_nvme_set()
+ {
+     rm -f ssd_symbol_set hdd_symbol_set nvme_symbol_set raid_symbol_set
+-    os_disk_symbol=$(echo $(lsblk |grep -B1 -E "part|boot" |grep -E "^sd[a-z]+|^nvme|^vd[a-z]+" |awk '{print $1}') |sed 's/ /|/')
++    os_disk_symbol=$(lsblk | grep -B1 -E "part|boot" | grep -E "^sd[a-z]+|^nvme|^vd[a-z]+" | awk '{print $1}' | xargs | sed 's/ /|/g')
+     non_os_disk_set=$(lsscsi -g |grep -E "ATA|TOSHIBA" |awk '{print $(NF-1)}' |grep -Ewv -- "$os_disk_symbol")
+     if [[ -n $non_os_disk_set ]];then
+         for i in $(echo "$non_os_disk_set")
+@@ -104,7 +104,7 @@ filter_ssd_hdd_nvme_set()
+     if [[ -n $is_os_nvme ]];then
+         os_nvme_symbol=$(echo "$is_os_nvme" |grep -Eo "nvme[0-9]+n1")
+     else
+-        os_nvme_symbol=null
++        os_nvme_symbol='^$'
+     fi
+     nvme_info_set=$(nvme list |grep -E "nvme[0-9]+n1" |grep -v -- "$os_nvme_symbol")
+     if [[ -n $nvme_info_set ]];then
+@@ -115,15 +115,17 @@ filter_ssd_hdd_nvme_set()
+ ssd_cap_set()
+ {
+     rm -f sata_ssd_cap nvme_cap
+-    os_disk_symbol=$(echo $(lsblk |grep -B1 -E "part|boot" |grep -E "^sd[a-z]+|^nvme|^vd[a-z]+" |awk '{print $1}') |sed 's/ /|/')
+-    non_os_disk_set=$(lsscsi -g |grep -E "ATA|TOSHIBA" |awk '{print $(NF-1)}' |grep -Evw $os_disk_symbol)
++    os_disk_symbol=$(lsblk | grep -B1 -E "part|boot" | grep -E "^sd[a-z]+|^nvme|^vd[a-z]+" | awk '{print $1}' | xargs | sed 's/ /|/g')
++    non_os_disk_set=$(lsscsi -g |grep -E "ATA|TOSHIBA" |awk '{print $(NF-1)}' |grep -Evw -- "$os_disk_symbol")
+     if [[ -n $non_os_disk_set ]];then
+         for i in $(echo "$non_os_disk_set")
+         do
+-            rotationRate=$(smartctl -i $i |awk -F":" '/Rotation Rate/{print $2}')
++            diskCapDigit=""
++            diskCapUnit=""
++            rotationRate=$(smartctl -i "$i" |awk -F":" '/Rotation Rate/{print $2}')
+             if [[ $rotationRate =~ "Solid State Device" ]];then
+-               	diskCapDigit=$(smartctl -i $i |awk '/User Capacity/{print $(NF-1)}' |sed 's/\[//')
+-                diskCapUnit=$(smartctl -i $i |awk '/User Capacity/{print $NF}' |sed 's/\]//')
++               	diskCapDigit=$(smartctl -i "$i" |awk '/User Capacity/{print $(NF-1)}' |sed 's/\[//')
++                diskCapUnit=$(smartctl -i "$i" |awk '/User Capacity/{print $NF}' |sed 's/\]//')
+             fi
+             if [[ -n $(echo "$diskCapDigit" |grep "\.") ]];then
+                 mdiskCapDigit=$(echo "$diskCapDigit" |sed -e 's/\0$//' -e 's/\0$//' -e 's/\.$//')
+@@ -139,9 +141,9 @@ ssd_cap_set()
+     if [[ -n $is_os_nvme ]];then
+         os_nvme_symbol=$(echo "$is_os_nvme" |grep -Eo "nvme[0-9]+n1")
+     else
+-        os_nvme_symbol=null
++        os_nvme_symbol='^$'
+     fi
+-    nvme_info_set=$(nvme list |grep -E "nvme[0-9]+n1" |grep -v $os_nvme_symbol)
++    nvme_info_set=$(nvme list |grep -E "nvme[0-9]+n1" |grep -v -- "$os_nvme_symbol")
+     if [[ -n $nvme_info_set ]];then
+         for i in $(nvme list -o json |awk -F":" '/PhysicalSize/{print $2}' |sed -e 's/,//' -e 's/"//g' -e 's/^\s*//')
+         do
+@@ -189,7 +191,7 @@ get_cpu_numa_nvme_topo()
+     rm -f numanode_nvme_map
+     for dev in $(nvme list |awk '/nvme[0-9]*n1/{print $1}' |awk -F"/" '{print $3}' |sed 's/n1$//g')
+     do
+-        local busInfo=$(ls -l /sys/class/nvme |grep -w $dev |awk '{print $NF}' |awk -F"/" '{print $(NF-2)}')
++        local busInfo=$(ls -l /sys/class/nvme | grep -w -- "$dev" |awk '{print $NF}' |awk -F"/" '{print $(NF-2)}')
+         local numaNode=$(cat /sys/bus/pci/devices/$busInfo/numa_node 2>/dev/null)
+         # numa_node=-1 means NUMA info unavailable, treat as node 0
+         if [[ -z $numaNode ]] || [[ $numaNode -lt 0 ]]; then
+@@ -227,11 +229,13 @@ nvme_format()
+         echo "Skip nvme format. Set ALLOW_NVME_FORMAT=1 to enable." >&2
+         return 0
+     fi
+-    for dev in $(cat nvme_symbol_set)
+-    do
++    local -a pids=()
++        for dev in $(cat nvme_symbol_set)
++        do
++        echo "[$(date '+%F %T')] nvme format /dev/$dev" >> "$CPWD/nvme_format_audit.log"
+         nvme format "/dev/$dev"
+     done
+-    cd "$CPWD"
++    cd "$CPWD" || { echo "ERROR: failed to enter $CPWD" >&2; exit 1; }
+ }
+ 
+ nvme_parallel_fio_test()
+@@ -247,15 +251,18 @@ nvme_parallel_fio_test()
+         fi
+         for dev in $(cat nvme_symbol_set)
+         do		
+-            nohup &>/dev/null ./ssd_raw_fio_test.sh $dev &
++            nohup "$CPWD/ssd_raw_fio_test.sh" "$dev" &>/dev/null &
++            pids+=("$!")
++        done
++        for pid in "${pids[@]}"; do
++            wait "$pid" || echo "WARNING: child failed: $pid" >&2
+         done
+-        wait
+-        sleep 30s
++        sleep 30
+         move_glob "ssd_nvme*_*.log" "nvme_fio_log"
+         cp multi_disk_log_filter.sh nvme_symbol_set nvme_fio_log
+         cd nvme_fio_log
+         ./multi_disk_log_filter.sh -N
+-        cd "$CPWD"
++        cd "$CPWD" || { echo "ERROR: failed to enter $CPWD" >&2; exit 1; }
+     fi
+ }
+ 
+@@ -271,17 +278,21 @@ nvme_parallel_fio_test_with_cpusbind()
+         else
+             mkdir -p cpusbind_nvme_fio_log
+         fi
++        local -a pids=()
+         for dev in $(cat nvme_symbol_set)
+         do
+-            nohup &>/dev/null ./nvme_raw_fio_test_with_cpubind.sh $dev &
++            nohup "$CPWD/nvme_raw_fio_test_with_cpubind.sh" "$dev" &>/dev/null &
++            pids+=("$!")
++        done
++        for pid in "${pids[@]}"; do
++            wait "$pid" || echo "WARNING: child failed: $pid" >&2
+         done
+-        wait
+-        sleep 30s
++        sleep 30
+         move_glob "ssd_nvme*_*.log" "cpusbind_nvme_fio_log"
+         cp multi_disk_log_filter.sh nvme_symbol_set cpusbind_nvme_fio_log
+         cd cpusbind_nvme_fio_log
+         ./multi_disk_log_filter.sh -N
+-        cd "$CPWD"
++        cd "$CPWD" || { echo "ERROR: failed to enter $CPWD" >&2; exit 1; }
+     fi
+ }
+ 
+@@ -295,12 +306,16 @@ nvme_parallel_fio_stress_test()
+         else
+             mkdir -p nvme_fio_stress_log
+         fi
++        local -a pids=()
+         for dev in $(cat nvme_symbol_set)
+         do
+-            nohup &>/dev/null ./ssd_fio_stress_test.sh $dev &
++            nohup "$CPWD/ssd_fio_stress_test.sh" "$dev" &>/dev/null &
++            pids+=("$!")
+         done
+-        wait
+-        sleep 30s
++        for pid in "${pids[@]}"; do
++            wait "$pid" || echo "WARNING: child failed: $pid" >&2
++        done
++        sleep 30
+         move_glob "ssd_nvme*_stress.log" "nvme_fio_stress_log"
+     fi
+ }
+@@ -315,17 +330,21 @@ raid_parallel_fio_test()
+         else
+             mkdir -p ssd_raid_fio_log
+         fi
++        local -a pids=()
+         for dev in $(cat raid_symbol_set)
+         do
+-            nohup &>/dev/null ./ssd_raw_fio_test.sh $dev &
++            nohup "$CPWD/ssd_raw_fio_test.sh" "$dev" &>/dev/null &
++            pids+=("$!")
++        done
++        for pid in "${pids[@]}"; do
++            wait "$pid" || echo "WARNING: child failed: $pid" >&2
+         done
+-        wait
+-        sleep 30s
++        sleep 30
+         move_glob "raid_sd*_*.log" "ssd_raid_fio_log"
+         cp multi_disk_log_filter.sh raid_symbol_set ssd_raid_fio_log
+         cd ssd_raid_fio_log
+         ./multi_disk_log_filter.sh -S
+-        cd "$CPWD"
++        cd "$CPWD" || { echo "ERROR: failed to enter $CPWD" >&2; exit 1; }
+     fi    
+ }
+ 
+@@ -339,17 +358,21 @@ ssd_parallel_fio_test()
+         else
+             mkdir -p ssd_fio_log
+         fi
++        local -a pids=()
+         for dev in $(cat ssd_symbol_set)
+         do
+-            nohup &>/dev/null ./ssd_raw_fio_test.sh $dev &
++            nohup "$CPWD/ssd_raw_fio_test.sh" "$dev" &>/dev/null &
++            pids+=("$!")
++        done
++        for pid in "${pids[@]}"; do
++            wait "$pid" || echo "WARNING: child failed: $pid" >&2
+         done
+-        wait
+-        sleep 30s
++        sleep 30
+         move_glob "ssd_sd*_*.log" "ssd_fio_log"
+         cp multi_disk_log_filter.sh ssd_symbol_set ssd_fio_log
+         cd ssd_fio_log
+         ./multi_disk_log_filter.sh -S
+-        cd "$CPWD"
++        cd "$CPWD" || { echo "ERROR: failed to enter $CPWD" >&2; exit 1; }
+     fi
+ }
+ 
+@@ -363,12 +386,16 @@ ssd_parallel_fio_stress_test()
+         else
+             mkdir -p ssd_fio_stress_log
+         fi
++        local -a pids=()
+         for dev in $(cat ssd_symbol_set)
+         do
+-            nohup &>/dev/null ./ssd_fio_stress_test.sh $dev &
++            nohup "$CPWD/ssd_fio_stress_test.sh" "$dev" &>/dev/null &
++            pids+=("$!")
+         done
+-        wait
+-        sleep 30s
++        for pid in "${pids[@]}"; do
++            wait "$pid" || echo "WARNING: child failed: $pid" >&2
++        done
++        sleep 30
+         move_glob "ssd*_stress.log" "ssd_fio_stress_log"
+     fi
+ }   
+@@ -383,17 +410,21 @@ hdd_parallel_fio_test()
+         else
+             mkdir -p hdd_fio_log
+         fi
++        local -a pids=()
+         for dev in $(cat hdd_symbol_set)
+         do
+-            nohup &>/dev/null ./hdd_raw_fio_test.sh $dev &
++            nohup "$CPWD/hdd_raw_fio_test.sh" "$dev" &>/dev/null &
++            pids+=("$!")
++        done
++        for pid in "${pids[@]}"; do
++            wait "$pid" || echo "WARNING: child failed: $pid" >&2
+         done
+-        wait
+-        sleep 30s
++        sleep 30
+         move_glob "hdd_sd*_*.log" "hdd_fio_log"
+         cp multi_disk_log_filter.sh hdd_symbol_set hdd_fio_log
+         cd hdd_fio_log
+         ./multi_disk_log_filter.sh -H
+-        cd "$CPWD"
++        cd "$CPWD" || { echo "ERROR: failed to enter $CPWD" >&2; exit 1; }
+     fi
+ } 
+ 
+@@ -407,12 +438,16 @@ hdd_parallel_fio_stress_test()
+         else
+             mkdir -p hdd_fio_stress_log
+         fi
++        local -a pids=()
+         for dev in $(cat hdd_symbol_set)
+         do
+-            nohup &>/dev/null ./hdd_fio_stress_test.sh $dev &
++            nohup "$CPWD/hdd_fio_stress_test.sh" "$dev" &>/dev/null &
++            pids+=("$!")
++        done
++        for pid in "${pids[@]}"; do
++            wait "$pid" || echo "WARNING: child failed: $pid" >&2
+         done
+-        wait
+-        sleep 30s
++        sleep 30
+         move_glob "hdd*_stress.log" "hdd_fio_stress_log"
+     fi
+ }
+@@ -424,30 +459,30 @@ check_tool_installed
+ filter_ssd_hdd_nvme_set
+ ssd_cap_set
+ 
+-if ${IS_NVME_PARALLEL};then
++if [[ "${IS_NVME_PARALLEL}" == "true" ]]; then
+     nvme_parallel_fio_test  
+ fi
+ 
+-if ${IS_NVME_PARALLER_WITH_CPUSBIND};then
++if [[ "${IS_NVME_PARALLEL_WITH_CPUSBIND}" == "true" ]]; then
+     nvme_parallel_fio_test_with_cpusbind
+ fi
+ 
+-if ${IS_SSD_PARALLEL};then
++if [[ "${IS_SSD_PARALLEL}" == "true" ]]; then
+     ssd_parallel_fio_test
+ fi
+ 	
+-if ${IS_HDD_PARALLEL};then
++if [[ "${IS_HDD_PARALLEL}" == "true" ]]; then
+     hdd_parallel_fio_test
+ fi
+ 
+-if ${IS_NVME_PARALLEL_STRESS};then
++if [[ "${IS_NVME_PARALLEL_STRESS}" == "true" ]]; then
+     nvme_parallel_fio_stress_test
+ fi
+ 
+-if ${IS_SSD_PARALLEL_STRESS};then
++if [[ "${IS_SSD_PARALLEL_STRESS}" == "true" ]]; then
+     ssd_parallel_fio_stress_test
+ fi
+ 
+-if ${IS_HDD_PARALLEL_STRESS};then
++if [[ "${IS_HDD_PARALLEL_STRESS}" == "true" ]]; then
+     hdd_parallel_fio_stress_test
+ fi
+
+
+===== FILE: modified_scripts/multi_disk_fio_scripts-V0.4/ssd_raw_fio_test.sh =====
+diff --git a/modified_scripts/multi_disk_fio_scripts-V0.4/ssd_raw_fio_test.sh b/modified_scripts/multi_disk_fio_scripts-V0.4/ssd_raw_fio_test.sh
+index fc1b8e5..e3e1699 100644
+--- a/modified_scripts/multi_disk_fio_scripts-V0.4/ssd_raw_fio_test.sh
++++ b/modified_scripts/multi_disk_fio_scripts-V0.4/ssd_raw_fio_test.sh
+@@ -12,8 +12,8 @@ fi
+ devname="$1"
+ #Sequence write/read test of ssd
+ "$SCRIPT_DIR/raw_disk_fio_test.sh" -b -d "$devname"
+-sleep 30s
++sleep 30
+ 
+ #Random write/read test of ssd
+ "$SCRIPT_DIR/raw_disk_fio_test.sh" -B -d "$devname"
+-sleep 30s
++sleep 30
+
+
+===== FILE: network-test-script/Performance Test for ConnectX-7 HCA on Hygon 74xx cpus/HCA_iperf_stress.sh =====
+diff --git a/network-test-script/Performance Test for ConnectX-7 HCA on Hygon 74xx cpus/HCA_iperf_stress.sh b/network-test-script/Performance Test for ConnectX-7 HCA on Hygon 74xx cpus/HCA_iperf_stress.sh
+index f63f54f..703fc81 100644
+--- a/network-test-script/Performance Test for ConnectX-7 HCA on Hygon 74xx cpus/HCA_iperf_stress.sh	
++++ b/network-test-script/Performance Test for ConnectX-7 HCA on Hygon 74xx cpus/HCA_iperf_stress.sh	
+@@ -41,6 +41,13 @@ usage() {
+ }
+ 
+ # 终极侦测硬件 NUMA 节点逻辑 (优先使用 lspci)
++validate_config() {
++    if [[ "$PORT1_DEV" == *"这里"* ]] || [[ "$PORT2_DEV" == *"这里"* ]]; then
++        echo "请先修改 PORT1_DEV/PORT2_DEV 为实际网卡名" >&2
++        exit 1
++    fi
++}
++
+ get_hw_numa() {
+     local dev="$1"
+     local pci_id=""
+@@ -48,7 +55,7 @@ get_hw_numa() {
+ 
+     # 1. 解析设备的 PCI ID
+     if [ -e "/sys/class/net/$dev/device" ]; then
+-        pci_id=$(basename $(readlink /sys/class/net/$dev/device))
++        pci_id=$(basename "$(readlink "/sys/class/net/$dev/device")")
+     elif [ -e "/sys/class/infiniband/$dev/device" ]; then
+         pci_id=$(basename $(readlink /sys/class/infiniband/$dev/device))
+     fi
+@@ -118,18 +125,19 @@ run_cmd() {
+         fi
+     fi
+ 
+-    cmd="numactl -N $app_numa -m $app_numa $cmd"
+-    echo ">>> [设备: $dev] 执行命令: $cmd"
+-    nohup $cmd > "$log_file" 2>&1 &
++    read -r -a cmd_parts <<< "$cmd"
++    local -a full_cmd=(numactl -N "$app_numa" -m "$app_numa" "${cmd_parts[@]}")
++    echo ">>> [设备: $dev] 执行命令: ${full_cmd[*]}"
++    nohup "${full_cmd[@]}" > "$log_file" 2>&1 &
+     echo ">>> 进程 PID: $! | 日志: $log_file"
+     echo "------------------------------------------------------"
+ }
+ 
+ check_env() {
+     for pkg in iperf numactl pciutils; do
+-        if ! command -v $pkg &> /dev/null; then
++        if ! command -v "$pkg" &> /dev/null; then
+             yum install epel-release -y &>/dev/null
+-            yum install $pkg -y
++            yum install "$pkg" -y
+         fi
+     done
+     if ! command -v ib_write_bw &> /dev/null; then
+@@ -139,17 +147,17 @@ check_env() {
+ 
+ setup_ip() {
+     local role=$1
+-    ip addr flush dev $PORT1_DEV 2>/dev/null
+-    ip addr flush dev $PORT2_DEV 2>/dev/null
++    ip addr flush dev "$PORT1_DEV" 2>/dev/null
++    ip addr flush dev "$PORT2_DEV" 2>/dev/null
+     if [ "$role" == "server" ]; then
+-        ip addr add $PORT1_SERVER_IP/24 dev $PORT1_DEV
+-        ip addr add $PORT2_SERVER_IP/24 dev $PORT2_DEV
++        ip addr add "$PORT1_SERVER_IP"/24 dev "$PORT1_DEV"
++        ip addr add "$PORT2_SERVER_IP"/24 dev "$PORT2_DEV"
+     elif [ "$role" == "client" ]; then
+-        ip addr add $PORT1_CLIENT_IP/24 dev $PORT1_DEV
+-        ip addr add $PORT2_CLIENT_IP/24 dev $PORT2_DEV
++        ip addr add "$PORT1_CLIENT_IP"/24 dev "$PORT1_DEV"
++        ip addr add "$PORT2_CLIENT_IP"/24 dev "$PORT2_DEV"
+     fi
+-    ip link set dev $PORT1_DEV up
+-    ip link set dev $PORT2_DEV up
++    ip link set dev "$PORT1_DEV" up
++    ip link set dev "$PORT2_DEV" up
+ }
+ 
+ run_iperf_server() {
+@@ -193,6 +201,8 @@ while [[ "$#" -gt 0 ]]; do
+     esac
+ done
+ 
++validate_config
++
+ case "$ACTION" in
+     env) check_env ;;
+     setup_ip) setup_ip "$ROLE_ARG" ;;
+
+
+===== FILE: network-test-script/Performance Tuning for ConnectX-6 Dx on Hygon 74xx cpus/A_run.sh =====
+diff --git a/network-test-script/Performance Tuning for ConnectX-6 Dx on Hygon 74xx cpus/A_run.sh b/network-test-script/Performance Tuning for ConnectX-6 Dx on Hygon 74xx cpus/A_run.sh
+index bb38bdc..0489452 100644
+--- a/network-test-script/Performance Tuning for ConnectX-6 Dx on Hygon 74xx cpus/A_run.sh	
++++ b/network-test-script/Performance Tuning for ConnectX-6 Dx on Hygon 74xx cpus/A_run.sh	
+@@ -2,12 +2,12 @@
+ # 25机 (服务端) — IRQ绑核 + IP配置 + iperf服务端
+ # 网卡: ens5f0np0 / ens5f1np1, NIC NUMA: 5, APP NUMA: 自动检测最近邻
+ 
+-set -e
++set -euo pipefail
+ NIC1=ens5f0np0
+ NIC2=ens5f1np1
+ 
+ # ---------- 自动获取 NUMA 信息 ----------
+-NIC_NUMA=$(cat /sys/class/net/$NIC1/device/numa_node)
++NIC_NUMA=$(cat "/sys/class/net/${NIC1}/device/numa_node")
+ echo "NIC NUMA 节点: $NIC_NUMA"
+ 
+ # 获取该 NUMA 的 CPU 列表
+@@ -23,7 +23,7 @@ echo "NIC1 ($NIC1) IRQ 绑核 CPU: ${CPUS_NIC1[*]}"
+ echo "NIC2 ($NIC2) IRQ 绑核 CPU: ${CPUS_NIC2[*]}"
+ 
+ # 跳过最近邻 NUMA (共享 die, 与 IRQ 争抢内存总线), 用第 2、3 近的
+-read APP_NUMA1 APP_NUMA2 <<< $(numactl -H | awk "/^ *${NIC_NUMA}:/{print}" | awk '{
++read APP_NUMA1 APP_NUMA2 <<< "$(numactl -H | awk "/^ *${NIC_NUMA}:/{print}" | awk '{
+     for(i=2;i<=NF;i++){node=i-2; if(node!='"$NIC_NUMA"'){d[node]=$i}}
+     b1=-1;b1d=99999; b2=-1;b2d=99999; b3=-1;b3d=99999;
+     for(node in d){
+@@ -31,7 +31,7 @@ read APP_NUMA1 APP_NUMA2 <<< $(numactl -H | awk "/^ *${NIC_NUMA}:/{print}" | awk
+         else if(d[node]+0<b2d+0){b3=b2;b3d=b2d;b2=node;b2d=d[node]}
+         else if(d[node]+0<b3d+0){b3=node;b3d=d[node]}
+     }
+-    print b2, b3}')
++    print b2, b3}')"
+ echo "Pair1 iperf -> NUMA $APP_NUMA1 | Pair2 iperf -> NUMA $APP_NUMA2 (跳过最近邻, 避免 die 争抢)"
+ 
+ # ---------- IRQ 绑核 ----------
+@@ -39,7 +39,7 @@ echo ""
+ echo "===== IRQ 绑核 ====="
+ 
+ # NIC1
+-PCI=$(basename $(readlink -f /sys/class/net/$NIC1/device))
++PCI=$(basename "$(readlink -f "/sys/class/net/${NIC1}/device")")
+ i=0
+ for irq in $(grep "mlx5_comp.*$PCI" /proc/interrupts | awk -F: '{print $1}' | tr -d ' '); do
+     echo ${CPUS_NIC1[$((i % ${#CPUS_NIC1[@]}))]} > /proc/irq/$irq/smp_affinity_list
+@@ -48,7 +48,7 @@ done
+ echo "NIC1 ($NIC1) 绑核完成: $i 个中断 -> CPU ${CPUS_NIC1[*]}"
+ 
+ # NIC2
+-PCI=$(basename $(readlink -f /sys/class/net/$NIC2/device))
++PCI=$(basename "$(readlink -f "/sys/class/net/${NIC2}/device")")
+ i=0
+ for irq in $(grep "mlx5_comp.*$PCI" /proc/interrupts | awk -F: '{print $1}' | tr -d ' '); do
+     echo ${CPUS_NIC2[$((i % ${#CPUS_NIC2[@]}))]} > /proc/irq/$irq/smp_affinity_list
+@@ -59,22 +59,22 @@ echo "NIC2 ($NIC2) 绑核完成: $i 个中断 -> CPU ${CPUS_NIC2[*]}"
+ # ---------- IP 配置 ----------
+ echo ""
+ echo "===== 配置 IP (服务端 .2) ====="
+-ip addr flush dev $NIC1 2>/dev/null || true
+-ip addr add 192.168.100.2/24 dev $NIC1
+-ip link set $NIC1 up
++ip addr flush dev "$NIC1" 2>/dev/null || true
++ip addr add 192.168.100.2/24 dev "$NIC1"
++ip link set "$NIC1" up
+ 
+-ip addr flush dev $NIC2 2>/dev/null || true
+-ip addr add 192.168.110.2/24 dev $NIC2
+-ip link set $NIC2 up
++ip addr flush dev "$NIC2" 2>/dev/null || true
++ip addr add 192.168.110.2/24 dev "$NIC2"
++ip link set "$NIC2" up
+ 
+-echo "$NIC1: $(ip -4 addr show $NIC1 | grep inet | awk '{print $2}')"
+-echo "$NIC2: $(ip -4 addr show $NIC2 | grep inet | awk '{print $2}')"
++echo "$NIC1: $(ip -4 addr show "$NIC1" | grep inet | awk '{print $2}')"
++echo "$NIC2: $(ip -4 addr show "$NIC2" | grep inet | awk '{print $2}')"
+ 
+ # ---------- 路由初始窗口 + busy_poll ----------
+-ip route change 192.168.100.0/24 dev $NIC1 initcwnd 128 initrwnd 128 2>/dev/null || \
+-  ip route add 192.168.100.0/24 dev $NIC1 initcwnd 128 initrwnd 128 2>/dev/null || true
+-ip route change 192.168.110.0/24 dev $NIC2 initcwnd 128 initrwnd 128 2>/dev/null || \
+-  ip route add 192.168.110.0/24 dev $NIC2 initcwnd 128 initrwnd 128 2>/dev/null || true
++ip route change 192.168.100.0/24 dev "$NIC1" initcwnd 128 initrwnd 128 2>/dev/null || \
++  ip route add 192.168.100.0/24 dev "$NIC1" initcwnd 128 initrwnd 128 2>/dev/null || true
++ip route change 192.168.110.0/24 dev "$NIC2" initcwnd 128 initrwnd 128 2>/dev/null || \
++  ip route add 192.168.110.0/24 dev "$NIC2" initcwnd 128 initrwnd 128 2>/dev/null || true
+ echo "路由 initcwnd/initrwnd=128 已设置"
+ 
+ sysctl -w net.core.busy_read=100  >/dev/null 2>&1
+@@ -110,5 +110,5 @@ echo "Pair2 server PID=$P2 (端口6001, NUMA $APP_NUMA2)"
+ ss -tulpn | grep -E "5001|6001"
+ echo ""
+ echo "服务端已就绪，等待客户端连接... (Ctrl+C 退出)"
+-trap "kill $P1 $P2 2>/dev/null; echo '已停止'" EXIT INT TERM
++trap 'kill "${P1:-}" "${P2:-}" 2>/dev/null; echo "已停止"' EXIT INT TERM
+ wait
+
+
+===== FILE: network-test-script/Performance Tuning for ConnectX-6 Dx on Hygon 74xx cpus/B_run.sh =====
+diff --git a/network-test-script/Performance Tuning for ConnectX-6 Dx on Hygon 74xx cpus/B_run.sh b/network-test-script/Performance Tuning for ConnectX-6 Dx on Hygon 74xx cpus/B_run.sh
+index b8e27f8..5f9fbeb 100644
+--- a/network-test-script/Performance Tuning for ConnectX-6 Dx on Hygon 74xx cpus/B_run.sh	
++++ b/network-test-script/Performance Tuning for ConnectX-6 Dx on Hygon 74xx cpus/B_run.sh	
+@@ -2,12 +2,12 @@
+ # 71机 (客户端) — IRQ绑核 + IP配置 + iperf测试
+ # 网卡: ens2f0np0 / ens2f1np1, NIC NUMA: 0, APP NUMA: 自动检测最近邻
+ 
+-set -e
++set -euo pipefail
+ NIC1=ens2f0np0
+ NIC2=ens2f1np1
+ 
+ # ---------- 自动获取 NUMA 信息 ----------
+-NIC_NUMA=$(cat /sys/class/net/$NIC1/device/numa_node)
++NIC_NUMA=$(cat "/sys/class/net/${NIC1}/device/numa_node")
+ echo "NIC NUMA 节点: $NIC_NUMA"
+ 
+ # 获取该 NUMA 的 CPU 列表
+@@ -23,7 +23,7 @@ echo "NIC1 ($NIC1) IRQ 绑核 CPU: ${CPUS_NIC1[*]}"
+ echo "NIC2 ($NIC2) IRQ 绑核 CPU: ${CPUS_NIC2[*]}"
+ 
+ # ★ 跳过最近邻 NUMA (共享 die, 与 IRQ 争抢内存总线), 用第 2、3 近的
+-read APP_NUMA1 APP_NUMA2 <<< $(numactl -H | awk "/^ *${NIC_NUMA}:/{print}" | awk '{
++read APP_NUMA1 APP_NUMA2 <<< "$(numactl -H | awk "/^ *${NIC_NUMA}:/{print}" | awk '{
+     for(i=2;i<=NF;i++){node=i-2; if(node!='"$NIC_NUMA"'){d[node]=$i}}
+     b1=-1;b1d=99999; b2=-1;b2d=99999; b3=-1;b3d=99999;
+     for(node in d){
+@@ -31,7 +31,7 @@ read APP_NUMA1 APP_NUMA2 <<< $(numactl -H | awk "/^ *${NIC_NUMA}:/{print}" | awk
+         else if(d[node]+0<b2d+0){b3=b2;b3d=b2d;b2=node;b2d=d[node]}
+         else if(d[node]+0<b3d+0){b3=node;b3d=d[node]}
+     }
+-    print b2, b3}')
++    print b2, b3}')"
+ echo "Pair1 iperf -> NUMA $APP_NUMA1 | Pair2 iperf -> NUMA $APP_NUMA2 (跳过最近邻, 避免 die 争抢)"
+ 
+ # ---------- IRQ 绑核 ----------
+@@ -39,7 +39,7 @@ echo ""
+ echo "===== IRQ 绑核 ====="
+ 
+ # NIC1
+-PCI=$(basename $(readlink -f /sys/class/net/$NIC1/device))
++PCI=$(basename "$(readlink -f "/sys/class/net/${NIC1}/device")")
+ i=0
+ for irq in $(grep "mlx5_comp.*$PCI" /proc/interrupts | awk -F: '{print $1}' | tr -d ' '); do
+     echo ${CPUS_NIC1[$((i % ${#CPUS_NIC1[@]}))]} > /proc/irq/$irq/smp_affinity_list
+@@ -48,7 +48,7 @@ done
+ echo "NIC1 ($NIC1) 绑核完成: $i 个中断 -> CPU ${CPUS_NIC1[*]}"
+ 
+ # NIC2
+-PCI=$(basename $(readlink -f /sys/class/net/$NIC2/device))
++PCI=$(basename "$(readlink -f "/sys/class/net/${NIC2}/device")")
+ i=0
+ for irq in $(grep "mlx5_comp.*$PCI" /proc/interrupts | awk -F: '{print $1}' | tr -d ' '); do
+     echo ${CPUS_NIC2[$((i % ${#CPUS_NIC2[@]}))]} > /proc/irq/$irq/smp_affinity_list
+@@ -59,22 +59,22 @@ echo "NIC2 ($NIC2) 绑核完成: $i 个中断 -> CPU ${CPUS_NIC2[*]}"
+ # ---------- IP 配置 ----------
+ echo ""
+ echo "===== 配置 IP (客户端 .1) ====="
+-ip addr flush dev $NIC1 2>/dev/null || true
+-ip addr add 192.168.100.1/24 dev $NIC1
+-ip link set $NIC1 up
++ip addr flush dev "$NIC1" 2>/dev/null || true
++ip addr add 192.168.100.1/24 dev "$NIC1"
++ip link set "$NIC1" up
+ 
+-ip addr flush dev $NIC2 2>/dev/null || true
+-ip addr add 192.168.110.1/24 dev $NIC2
+-ip link set $NIC2 up
++ip addr flush dev "$NIC2" 2>/dev/null || true
++ip addr add 192.168.110.1/24 dev "$NIC2"
++ip link set "$NIC2" up
+ 
+-echo "$NIC1: $(ip -4 addr show $NIC1 | grep inet | awk '{print $2}')"
+-echo "$NIC2: $(ip -4 addr show $NIC2 | grep inet | awk '{print $2}')"
++echo "$NIC1: $(ip -4 addr show "$NIC1" | grep inet | awk '{print $2}')"
++echo "$NIC2: $(ip -4 addr show "$NIC2" | grep inet | awk '{print $2}')"
+ 
+ # ---------- 路由初始窗口 + busy_poll ----------
+-ip route change 192.168.100.0/24 dev $NIC1 initcwnd 128 initrwnd 128 2>/dev/null || \
+-  ip route add 192.168.100.0/24 dev $NIC1 initcwnd 128 initrwnd 128 2>/dev/null || true
+-ip route change 192.168.110.0/24 dev $NIC2 initcwnd 128 initrwnd 128 2>/dev/null || \
+-  ip route add 192.168.110.0/24 dev $NIC2 initcwnd 128 initrwnd 128 2>/dev/null || true
++ip route change 192.168.100.0/24 dev "$NIC1" initcwnd 128 initrwnd 128 2>/dev/null || \
++  ip route add 192.168.100.0/24 dev "$NIC1" initcwnd 128 initrwnd 128 2>/dev/null || true
++ip route change 192.168.110.0/24 dev "$NIC2" initcwnd 128 initrwnd 128 2>/dev/null || \
++  ip route add 192.168.110.0/24 dev "$NIC2" initcwnd 128 initrwnd 128 2>/dev/null || true
+ echo "路由 initcwnd/initrwnd=128 已设置"
+ 
+ sysctl -w net.core.busy_read=100  >/dev/null 2>&1
+@@ -121,7 +121,7 @@ P2=$!
+ 
+ echo "Pair1 PID=$P1, Pair2 PID=$P2"
+ echo "等待 ${dur} 秒..."
+-wait $P1 $P2
++wait "$P1" "$P2"
+ 
+ echo ""
+ echo "===== 测试结果 ====="
+
+
+===== FILE: network-test-script/Performance Tuning for ConnectX-6 Dx on Hygon 74xx cpus/Deprecated scripts/network_diag.sh =====
+diff --git a/network-test-script/Performance Tuning for ConnectX-6 Dx on Hygon 74xx cpus/Deprecated scripts/network_diag.sh b/network-test-script/Performance Tuning for ConnectX-6 Dx on Hygon 74xx cpus/Deprecated scripts/network_diag.sh
+index 91a81ab..79eba30 100644
+--- a/network-test-script/Performance Tuning for ConnectX-6 Dx on Hygon 74xx cpus/Deprecated scripts/network_diag.sh	
++++ b/network-test-script/Performance Tuning for ConnectX-6 Dx on Hygon 74xx cpus/Deprecated scripts/network_diag.sh	
+@@ -1,4 +1,7 @@
+ #!/bin/bash
++
++set -euo pipefail
++
+ ###############################################################################
+ #  网络性能诊断脚本 — 排查 100G Mellanox NIC 吞吐下降根因
+ #  用法: sudo bash network_diag.sh
+@@ -53,16 +56,16 @@ for nic in "${NICS[@]}"; do
+     echo -e "  ${BOLD}--- $nic ---${NC}"
+     
+     # 驱动信息
+-    local drv_ver fw_ver
++    drv_ver fw_ver
+     drv_ver=$(ethtool -i "$nic" 2>/dev/null | grep 'version' | head -1)
+     fw_ver=$(ethtool -i "$nic" 2>/dev/null | grep 'firmware' | head -1)
+     echo "  $drv_ver"
+     echo "  $fw_ver"
+     
+     # 链路状态
+-    local link_speed
++    link_speed
+     link_speed=$(ethtool "$nic" 2>/dev/null | grep 'Speed:' | awk '{print $2}')
+-    local link_status
++    link_status
+     link_status=$(ethtool "$nic" 2>/dev/null | grep 'Link detected:' | awk '{print $3}')
+     echo "  链路速率: $link_speed | 链路状态: $link_status"
+     
+@@ -76,16 +79,16 @@ for nic in "${NICS[@]}"; do
+     fi
+ 
+     # PCIe 带宽 (关键！)
+-    local pci_addr
++    pci_addr
+     pci_addr=$(basename "$(readlink -f /sys/class/net/${nic}/device)" 2>/dev/null)
+     if [ -n "$pci_addr" ]; then
+         echo "  PCI 地址: $pci_addr"
+         
+-        local pcie_speed pcie_width
++        pcie_speed pcie_width
+         pcie_speed=$(lspci -vvs "$pci_addr" 2>/dev/null | grep "LnkSta:" | head -1 | grep -oP 'Speed \K[^,]+')
+         pcie_width=$(lspci -vvs "$pci_addr" 2>/dev/null | grep "LnkSta:" | head -1 | grep -oP 'Width \K[^,]+')
+         
+-        local pcie_cap_speed pcie_cap_width
++        pcie_cap_speed pcie_cap_width
+         pcie_cap_speed=$(lspci -vvs "$pci_addr" 2>/dev/null | grep "LnkCap:" | head -1 | grep -oP 'Speed \K[^,]+')
+         pcie_cap_width=$(lspci -vvs "$pci_addr" 2>/dev/null | grep "LnkCap:" | head -1 | grep -oP 'Width \K[^,]+')
+         
+@@ -103,7 +106,7 @@ for nic in "${NICS[@]}"; do
+         fi
+         
+         # ASPM 状态 (应为 Disabled)
+-        local aspm
++        aspm
+         aspm=$(lspci -vvs "$pci_addr" 2>/dev/null | grep "ASPM" | head -1)
+         if echo "$aspm" | grep -qi "enabled\|L0s\|L1"; then
+             warn "$nic PCIe ASPM 已启用 (省电模式会增加延迟): $aspm"
+@@ -113,12 +116,12 @@ for nic in "${NICS[@]}"; do
+     fi
+ 
+     # NUMA 节点
+-    local nic_numa
++    nic_numa
+     nic_numa=$(cat /sys/class/net/${nic}/device/numa_node 2>/dev/null)
+     echo "  NUMA 节点: $nic_numa"
+ 
+     # MTU
+-    local mtu
++    mtu
+     mtu=$(cat /sys/class/net/${nic}/mtu 2>/dev/null)
+     echo "  MTU: $mtu"
+     if [ "$mtu" -lt 9000 ] 2>/dev/null; then
+@@ -128,15 +131,13 @@ for nic in "${NICS[@]}"; do
+     fi
+ 
+     # Ring buffer
+-    local rx_ring tx_ring
+-    rx_ring=$(ethtool -g "$nic" 2>/dev/null | awk '/^RX:/{getline; if(/Current/) getline; print $1}' | tail -1)
+-    tx_ring=$(ethtool -g "$nic" 2>/dev/null | awk '/^TX:/{getline; if(/Current/) getline; print $1}' | tail -1)
++    rx_ring tx_ring
+     # 更可靠的方式
+     echo "  Ring Buffer (ethtool -g):"
+     ethtool -g "$nic" 2>/dev/null | grep -A1 "Current" | head -5 | sed 's/^/    /'
+ 
+     # 队列数
+-    local combined_q
++    combined_q
+     combined_q=$(ethtool -l "$nic" 2>/dev/null | awk '/Current/{found=1} found && /Combined/{print $2; exit}')
+     echo "  Combined 队列数: $combined_q"
+ 
+@@ -175,7 +176,7 @@ if dmesg 2>/dev/null | grep -qi "DMAR.*IOMMU enabled\|AMD-Vi.*enabled\|IOMMU.*en
+     fail "IOMMU 已启用！这会导致 DMA 重映射开销，严重影响网络吞吐 (可降低 20-40%)"
+     echo "  修复方法: 在 GRUB 内核参数中添加 intel_iommu=off 或 iommu=off"
+ elif cat /proc/cmdline | grep -qi "intel_iommu=on\|iommu=pt\|iommu=on"; then
+-    local iommu_mode
++    iommu_mode
+     iommu_mode=$(cat /proc/cmdline | tr ' ' '\n' | grep -iE "iommu")
+     if echo "$iommu_mode" | grep -q "iommu=pt"; then
+         warn "IOMMU 为 passthrough 模式 (iommu=pt)，性能影响较小但仍有开销"
+@@ -212,7 +213,7 @@ fi
+ # 实际频率
+ echo "  CPU 当前频率 (采样 4 个核心):"
+ for cpu in 0 1 $(( $(nproc) / 2 )) $(( $(nproc) - 1 )); do
+-    local freq
++    freq
+     freq=$(cat /sys/devices/system/cpu/cpu${cpu}/cpufreq/scaling_cur_freq 2>/dev/null)
+     if [ -n "$freq" ]; then
+         echo "    CPU $cpu: $((freq / 1000)) MHz"
+@@ -220,9 +221,9 @@ for cpu in 0 1 $(( $(nproc) / 2 )) $(( $(nproc) - 1 )); do
+ done
+ 
+ # Turbo Boost
+-local turbo_file="/sys/devices/system/cpu/intel_pstate/no_turbo"
++turbo_file="/sys/devices/system/cpu/intel_pstate/no_turbo"
+ if [ -f "$turbo_file" ]; then
+-    local turbo_off
++    turbo_off
+     turbo_off=$(cat "$turbo_file" 2>/dev/null)
+     if [ "$turbo_off" = "1" ]; then
+         warn "Intel Turbo Boost 已禁用！影响单核/少核性能"
+@@ -233,7 +234,7 @@ fi
+ 
+ # C-States
+ echo "  C-State 状态:"
+-local max_cstate=""
++max_cstate=""
+ if cat /proc/cmdline | grep -qoP "intel_idle.max_cstate=\K\d+"; then
+     max_cstate=$(cat /proc/cmdline | grep -oP "intel_idle.max_cstate=\K\d+")
+     echo "    intel_idle.max_cstate=$max_cstate"
+@@ -247,7 +248,7 @@ else
+ fi
+ 
+ # P-State 驱动
+-local pstate_drv
++pstate_drv
+ pstate_drv=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_driver 2>/dev/null)
+ echo "  频率调节驱动: ${pstate_drv:-未知}"
+ 
+@@ -257,7 +258,7 @@ header "4. 内核安全缓解措施 (Spectre/Meltdown)"
+ echo "  内核缓解状态:"
+ if [ -d /sys/devices/system/cpu/vulnerabilities ]; then
+     for v in /sys/devices/system/cpu/vulnerabilities/*; do
+-        local name status
++        name status
+         name=$(basename "$v")
+         status=$(cat "$v" 2>/dev/null)
+         if echo "$status" | grep -qi "mitigation"; then
+@@ -294,12 +295,12 @@ header "5. 内存与 NUMA 配置"
+ ###############################################################################
+ 
+ # 透明大页
+-local thp
++thp
+ thp=$(cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null)
+ echo "  透明大页 (THP): $thp"
+ 
+ # NUMA balancing
+-local numa_bal
++numa_bal
+ numa_bal=$(sysctl -n kernel.numa_balancing 2>/dev/null)
+ echo "  NUMA Balancing: $numa_bal"
+ if [ "$numa_bal" = "1" ]; then
+@@ -333,7 +334,7 @@ EXPECTED_PARAMS=(
+ )
+ 
+ for param in "${!EXPECTED_PARAMS[@]}"; do
+-    local actual expected
++    actual expected
+     actual=$(sysctl -n "$param" 2>/dev/null | tr -d '[:space:]' | head -1)
+     expected="${EXPECTED_PARAMS[$param]}"
+     if [ "$actual" = "$expected" ]; then
+@@ -361,7 +362,7 @@ header "7. IRQ 亲和性检查"
+ for nic in "${NICS[@]}"; do
+     echo ""
+     echo -e "  ${BOLD}--- $nic IRQ 绑核状态 ---${NC}"
+-    local pci_addr
++    pci_addr
+     pci_addr=$(basename "$(readlink -f /sys/class/net/${nic}/device)" 2>/dev/null)
+     
+     if [ -z "$pci_addr" ]; then
+@@ -369,29 +370,29 @@ for nic in "${NICS[@]}"; do
+         continue
+     fi
+     
+-    local irqs
+-    irqs=($(grep "mlx5_comp.*${pci_addr}" /proc/interrupts 2>/dev/null | awk -F: '{print $1}' | tr -d ' '))
+-    
++    irqs
++    mapfile -t irqs < <(grep "mlx5_comp.*${pci_addr}" /proc/interrupts 2>/dev/null | awk -F:':' '{print $1}' | tr -d ' ' || true)
++
+     if [ ${#irqs[@]} -eq 0 ]; then
+-        irqs=($(grep "${pci_addr}" /proc/interrupts 2>/dev/null | awk -F: '{print $1}' | tr -d ' '))
++        mapfile -t irqs < <(grep "${pci_addr}" /proc/interrupts 2>/dev/null | awk -F:':' '{print $1}' | tr -d ' ' || true)
+     fi
+     
+     echo "  中断向量数: ${#irqs[@]}"
+     
+-    local cpu_set=()
++    cpu_set=()
+     for irq in "${irqs[@]}"; do
+-        local aff
++        aff
+         aff=$(cat /proc/irq/${irq}/smp_affinity_list 2>/dev/null)
+         cpu_set+=("$aff")
+     done
+     
+     # 统计绑定情况
+-    local unique_cpus
++    unique_cpus
+     unique_cpus=$(printf '%s\n' "${cpu_set[@]}" | sort -un | tr '\n' ' ')
+     echo "  绑定的 CPU: $unique_cpus"
+     
+     # 检查是否有 IRQ 绑到同一个 CPU
+-    local dup_count
++    dup_count
+     dup_count=$(printf '%s\n' "${cpu_set[@]}" | sort | uniq -d | wc -l)
+     if [ "$dup_count" -gt 0 ]; then
+         warn "$nic 有 $dup_count 个 CPU 被多个 IRQ 共享"
+@@ -411,7 +412,7 @@ header "8. 内核模块与驱动参数"
+ echo "  mlx5_core 模块参数:"
+ if [ -d /sys/module/mlx5_core/parameters ]; then
+     for p in /sys/module/mlx5_core/parameters/*; do
+-        local pname pval
++        pname pval
+         pname=$(basename "$p")
+         pval=$(cat "$p" 2>/dev/null)
+         echo "    $pname = $pval"
+@@ -437,7 +438,7 @@ else
+ fi
+ 
+ # tuned / power-profiles-daemon
+-local tuned_profile=""
++tuned_profile=""
+ if command -v tuned-adm &>/dev/null; then
+     tuned_profile=$(tuned-adm active 2>/dev/null)
+     echo "  tuned 配置: $tuned_profile"
+@@ -462,10 +463,10 @@ header "11. PCIe ACS (Access Control Services) 检查"
+ ###############################################################################
+ echo "  检查 PCIe ACS 状态 (影响 DMA 路由):"
+ for nic in "${NICS[@]}"; do
+-    local pci_addr
++    pci_addr
+     pci_addr=$(basename "$(readlink -f /sys/class/net/${nic}/device)" 2>/dev/null)
+     if [ -n "$pci_addr" ]; then
+-        local acs
++        acs
+         acs=$(lspci -vvs "$pci_addr" 2>/dev/null | grep -i "ACSCtl" | head -1)
+         if [ -n "$acs" ]; then
+             echo "    $nic ($pci_addr): $acs"
+@@ -486,9 +487,9 @@ for nic in "${NICS[@]}"; do
+     echo "  RPS (Receive Packet Steering):"
+     for f in /sys/class/net/${nic}/queues/rx-*/rps_cpus; do
+         if [ -f "$f" ]; then
+-            local val
++            val
+             val=$(cat "$f" 2>/dev/null)
+-            local q
++            q
+             q=$(echo "$f" | grep -oP 'rx-\K\d+')
+             # 非零 RPS 可能与硬件 RSS 冲突
+             if [ "$val" != "00000000" ] && [ "$val" != "0" ] && echo "$val" | grep -qvE '^[0,]*$'; then
+@@ -497,7 +498,7 @@ for nic in "${NICS[@]}"; do
+         fi
+     done 2>/dev/null | head -5
+     
+-    local nonzero_rps
++    nonzero_rps
+     nonzero_rps=$(cat /sys/class/net/${nic}/queues/rx-*/rps_cpus 2>/dev/null | grep -cvE '^[0,]*$')
+     if [ "$nonzero_rps" -gt 0 ] 2>/dev/null; then
+         warn "$nic 有 $nonzero_rps 个队列启用了 RPS — 可能与硬件 RSS 冲突导致性能下降！"
+@@ -507,7 +508,7 @@ for nic in "${NICS[@]}"; do
+     fi
+     
+     # RFS
+-    local rfs_entries
++    rfs_entries
+     rfs_entries=$(sysctl -n net.core.rps_sock_flow_entries 2>/dev/null)
+     echo "  RFS (rps_sock_flow_entries): $rfs_entries"
+     if [ "$rfs_entries" -gt 0 ] 2>/dev/null; then
+@@ -535,12 +536,16 @@ done
+ header "14. iptables / nftables 规则 (可能阻断或增加开销)"
+ ###############################################################################
+ echo "  iptables INPUT 链 (前 20 条):"
+-iptables -L INPUT -n --line-numbers 2>/dev/null | head -20 | sed 's/^/    /'
+-echo ""
+-echo "  iptables 规则总数: $(iptables -L -n 2>/dev/null | wc -l)"
++if command -v iptables >/dev/null 2>&1; then
++    iptables -L INPUT -n --line-numbers 2>/dev/null | head -20 | sed 's/^/    /'
++    echo ""
++    echo "  iptables 规则总数: $(iptables -L -n 2>/dev/null | wc -l)"
+ 
+-local ipt_count
+-ipt_count=$(iptables -L -n 2>/dev/null | wc -l)
++    ipt_count=$(iptables -L -n 2>/dev/null | wc -l)
++else
++    echo "    未安装 iptables"
++    ipt_count=0
++fi
+ if [ "$ipt_count" -gt 50 ]; then
+     warn "iptables 规则较多 ($ipt_count 行)，大量规则匹配会增加 per-packet 开销"
+ fi
+@@ -548,12 +553,12 @@ fi
+ # conntrack
+ echo ""
+ echo "  conntrack 状态:"
+-local ct_count ct_max
+-ct_count=$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null)
+-ct_max=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null)
++ct_count ct_max
++ct_count=$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || true)
++ct_max=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || true)
+ echo "    当前连接数: ${ct_count:-N/A} / 最大: ${ct_max:-N/A}"
+-if [ -n "$ct_count" ] && [ -n "$ct_max" ]; then
+-    local usage_pct=$(( ct_count * 100 / ct_max ))
++if [ -n "$ct_count" ] && [ -n "$ct_max" ] && [ "$ct_max" -gt 0 ] 2>/dev/null; then
++    usage_pct=$(( ct_count * 100 / ct_max ))
+     if [ "$usage_pct" -gt 50 ]; then
+         warn "conntrack 使用率 ${usage_pct}% — 高使用率增加延迟"
+     fi
+@@ -582,7 +587,7 @@ if [ $WARN_COUNT -eq 0 ]; then
+     echo -e "\n  ${GREEN}${BOLD}未发现明显系统级问题${NC}\n"
+ else
+     echo -e "\n  ${RED}${BOLD}发现 $WARN_COUNT 个潜在问题:${NC}\n"
+-    local idx=1
++    idx=1
+     for issue in "${ISSUE_LIST[@]}"; do
+         echo -e "  ${RED}${idx}.${NC} $issue"
+         idx=$((idx + 1))
+
+
+===== FILE: network-test-script/Performance Tuning for ConnectX-6 Dx on Hygon 74xx cpus/Deprecated scripts/network_tune_test_v1.sh =====
+diff --git a/network-test-script/Performance Tuning for ConnectX-6 Dx on Hygon 74xx cpus/Deprecated scripts/network_tune_test_v1.sh b/network-test-script/Performance Tuning for ConnectX-6 Dx on Hygon 74xx cpus/Deprecated scripts/network_tune_test_v1.sh
+index 8972cdc..f7dea4d 100644
+--- a/network-test-script/Performance Tuning for ConnectX-6 Dx on Hygon 74xx cpus/Deprecated scripts/network_tune_test_v1.sh	
++++ b/network-test-script/Performance Tuning for ConnectX-6 Dx on Hygon 74xx cpus/Deprecated scripts/network_tune_test_v1.sh	
+@@ -1,5 +1,8 @@
+ #!/bin/bash
+ 
++set -euo pipefail
++
++
+ # 颜色输出
+ RED='\033[0;31m'
+ GREEN='\033[0;32m'
+@@ -14,6 +17,9 @@ QUEUES_PER_NIC=0
+ LOG_DIR="/tmp/iperf_logs"
+ TIMESTAMP=""
+ SERVER_PIDS=()
++AUTO_YES=${AUTO_YES:-0}
++MODE_ARG=${1:-}
++ADDED_RAW_RULES=()
+ 
+ # 日志函数
+ log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
+@@ -33,9 +39,7 @@ cleanup() {
+     for pid in "${MONITOR_PIDS[@]}"; do
+         kill "$pid" 2>/dev/null || true
+     done
+-    sudo pkill -x iperf 2>/dev/null || true
+-    # 恢复 irqbalance
+-    if systemctl is-enabled irqbalance &>/dev/null; then
++    if systemctl list-unit-files irqbalance.service >/dev/null 2>&1; then
+         sudo systemctl start irqbalance 2>/dev/null || true
+         log_info "已恢复 irqbalance 服务"
+     fi
+@@ -160,17 +164,59 @@ select_nearest_numa() {
+ #############################################################################
+ run_cmd() {
+     local cmd="$1"
++    local tmp_script
++    tmp_script=$(mktemp)
++    printf "#!/bin/bash
++set -e
++%s
++" "$cmd" > "$tmp_script"
++    chmod +x "$tmp_script"
+     echo -n -e "  执行: ${cmd} ... "
+-    if eval "sudo $cmd" >/dev/null 2>&1; then
++    if sudo bash "$tmp_script" >/dev/null 2>&1; then
+         echo -e "${GREEN}[成功]${NC}"
+     else
+         echo -e "${RED}[失败或不支持]${NC}"
+     fi
++    rm -f "$tmp_script"
+ }
+ 
+ #############################################################################
+ # 5.1 生成 CPU hex 位掩码 (用于 XPS 等需要 bitmask 的内核接口)
+ #############################################################################
++write_root_file() {
++    local value="$1"
++    local target_file="$2"
++    printf "%s\n" "$value" | sudo tee "$target_file" >/dev/null
++}
++
++set_all_governors_performance() {
++    local gov
++    for gov in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
++        [ -f "$gov" ] || continue
++        write_root_file "performance" "$gov" 2>/dev/null || true
++    done
++}
++
++add_raw_notrack_rule() {
++    local chain="$1"
++    local proto_field="$2"
++    local port_range="$3"
++    if command -v iptables >/dev/null 2>&1; then
++        sudo iptables -t raw -C "$chain" -p tcp "$proto_field" "$port_range" -j NOTRACK 2>/dev/null || {
++            sudo iptables -t raw -A "$chain" -p tcp "$proto_field" "$port_range" -j NOTRACK 2>/dev/null && ADDED_RAW_RULES+=("$chain|$proto_field|$port_range")
++        }
++    fi
++}
++
++remove_added_raw_rules() {
++    local rule
++    for rule in "${ADDED_RAW_RULES[@]:-}"; do
++        [ -n "$rule" ] || continue
++        IFS="|" read -r chain proto_field port_range <<< "$rule"
++        sudo iptables -t raw -D "$chain" -p tcp "$proto_field" "$port_range" -j NOTRACK 2>/dev/null || true
++    done
++}
++
+ cpu_to_mask() {
+     local cpu=$1
+     local total_cpus
+@@ -202,7 +248,7 @@ setup_route_tuning() {
+         local existing
+         existing=$(ip route show "$subnet" 2>/dev/null | head -1)
+         if [ -n "$existing" ]; then
+-            sudo ip route change $existing initcwnd 128 initrwnd 128 2>/dev/null || true
++            sudo bash -c "ip route change $existing initcwnd 128 initrwnd 128" 2>/dev/null || true
+             log_info "  $subnet: initcwnd=128 initrwnd=128"
+         fi
+     done
+@@ -230,7 +276,7 @@ start_monitoring() {
+     # sar 网卡流量 (如果可用)
+     if command -v sar &>/dev/null; then
+         sar -n DEV 5 $((duration / 5 + 1)) > "${LOG_DIR}/sar_net.log" 2>&1 &
+-        MONITOR_PIDS+=($!)
++        MONITOR_PIDS+=("$!")
+     fi
+ }
+ 
+@@ -297,7 +343,6 @@ stop_monitoring() {
+ }
+ 
+ # 监控进程 PID 列表
+-MONITOR_PIDS=()
+ 
+ #############################################################################
+ # 6.3 防火墙放通 iperf 端口
+@@ -362,7 +407,7 @@ optimize_all() {
+ 
+     log_info "关闭 irqbalance 并设置 CPU P-State..."
+     run_cmd "systemctl stop irqbalance"
+-    run_cmd "bash -c 'for gov in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do echo performance > \$gov 2>/dev/null || true; done'"
++    set_all_governors_performance
+ 
+     log_info "基础网络与 TCP 参数优化..."
+     run_cmd "sysctl -w net.core.rmem_max=2147483647"
+@@ -403,7 +448,8 @@ optimize_all() {
+         # 获取该 NUMA 节点的 CPU 列表
+         local cpus_str
+         cpus_str=$(get_numa_cpus "$this_numa")
+-        local cpus_all=($cpus_str)
++        local -a cpus_all=()
++        read -r -a cpus_all <<< "$cpus_str"
+         local total=${#cpus_all[@]}
+ 
+         local bind_cpus
+@@ -449,19 +495,20 @@ optimize_all() {
+         pci_dev=$(basename "$(readlink -f /sys/class/net/${nic}/device)" 2>/dev/null)
+         local irqs=()
+         if [ -n "$pci_dev" ]; then
+-            irqs=($(grep "mlx5_comp.*${pci_dev}" /proc/interrupts | awk -F: '{print $1}' | tr -d ' '))
++            mapfile -t irqs < <(grep "mlx5_comp.*${pci_dev}" /proc/interrupts | awk -F: '{print $1}' | tr -d ' ' || true)
+             # 如果 mlx5_comp 匹配不到，回退到仅 PCI 地址匹配
+             if [ ${#irqs[@]} -eq 0 ]; then
+-                irqs=($(grep "${pci_dev}" /proc/interrupts | awk -F: '{print $1}' | tr -d ' '))
++                mapfile -t irqs < <(grep "${pci_dev}" /proc/interrupts | awk -F: '{print $1}' | tr -d ' ' || true)
+             fi
+         fi
+-        local cpu_arr=($bind_cpus)
++        local -a cpu_arr=()
++        read -r -a cpu_arr <<< "$bind_cpus"
+         local count=${#cpu_arr[@]}
+         local idx=0
+         local success_irq=0
+         for irq in "${irqs[@]}"; do
+             local target_cpu=${cpu_arr[$((idx % count))]}
+-            if sudo bash -c "echo '${target_cpu}' > /proc/irq/${irq}/smp_affinity_list" 2>/dev/null; then
++            if write_root_file "$target_cpu" "/proc/irq/${irq}/smp_affinity_list" 2>/dev/null; then
+                 success_irq=$((success_irq + 1))
+             fi
+             idx=$((idx + 1))
+@@ -482,7 +529,7 @@ optimize_all() {
+             if [ -f "$xps_file" ]; then
+                 local mask
+                 mask=$(cpu_to_mask "$cpuid")
+-                if sudo bash -c "echo '$mask' > '$xps_file'" 2>/dev/null; then
++                if write_root_file "$mask" "$xps_file" 2>/dev/null; then
+                     xps_ok=$((xps_ok + 1))
+                 fi
+             fi
+@@ -559,8 +606,6 @@ run_server() {
+ 
+     log_info "启动 iperf 服务端 (业务隔离在 NUMA $app_numa)..."
+ 
+-    sudo pkill -x iperf 2>/dev/null || true
+-    sleep 1
+ 
+     mkdir -p "$LOG_DIR"
+ 
+@@ -570,13 +615,13 @@ run_server() {
+     log_info "启动 iperf server: 端口 5001 ($nic1 / 192.168.100.x)"
+     numactl -N "$app_numa" -m "$app_numa" \
+         iperf -s -p 5001 > "${LOG_DIR}/${nic1}_server_port5001.log" 2>&1 &
+-    SERVER_PIDS+=($!)
++    SERVER_PIDS+=("$!")
+     sleep 1
+ 
+     log_info "启动 iperf server: 端口 5002 ($nic2 / 192.168.110.x)"
+     numactl -N "$app_numa" -m "$app_numa" \
+         iperf -s -p 5002 > "${LOG_DIR}/${nic2}_server_port5002.log" 2>&1 &
+-    SERVER_PIDS+=($!)
++    SERVER_PIDS+=("$!")
+     sleep 1
+ 
+     log_info "服务端已启动，监听端口 5001/5002"
+@@ -614,7 +659,11 @@ check_connectivity() {
+ 
+     if [ "$ok" = false ]; then
+         log_warn "部分链路不通，是否继续测试？(y/N)"
+-        read -r ans
++        if [ "$AUTO_YES" -eq 1 ]; then
++            ans="y"
++        else
++            read -r ans
++        fi
+         if [[ ! "$ans" =~ ^[yY] ]]; then
+             log_error "用户取消测试"
+         fi
+@@ -642,8 +691,6 @@ run_client() {
+     log_info "连接服务器 Pair1 ($nic1): $server_ip:5001"
+     log_info "连接服务器 Pair2 ($nic2): $server_ip2:5002"
+ 
+-    sudo pkill -x iperf 2>/dev/null || true
+-    sleep 1
+ 
+     mkdir -p "$LOG_DIR"
+ 
+@@ -770,7 +817,14 @@ main() {
+     echo "选择运行模式:"
+     echo "  1) 服务端 (Server)"
+     echo "  2) 客户端 (Client)"
+-    read -p "请输入选择 [1-2]: " mode
++    local mode="${1:-${MODE_ARG:-}}"
++    if [ -z "$mode" ]; then
++        echo ""
++        echo "选择运行模式:"
++        echo "  1) 服务端 (Server)"
++        echo "  2) 客户端 (Client)"
++        read -r -p "请输入选择 [1-2]: " mode
++    fi
+ 
+     case $mode in
+         1)
+@@ -785,11 +839,16 @@ main() {
+         2)
+             setup_client_ips
+ 
+-            read -p "请输入服务器 IP (Pair1) [默认: 192.168.100.2]: " server_ip
+-            server_ip=${server_ip:-192.168.100.2}
+-
+-            read -p "测试时长(秒) [默认: 60]: " duration
+-            duration=${duration:-60}
++            local server_ip="${2:-192.168.100.2}"
++            local duration="${3:-60}"
++            if [ $# -lt 2 ] && [ "$AUTO_YES" -ne 1 ]; then
++                read -r -p "请输入服务器 IP (Pair1) [默认: 192.168.100.2]: " server_ip
++                server_ip=${server_ip:-192.168.100.2}
++            fi
++            if [ $# -lt 3 ] && [ "$AUTO_YES" -ne 1 ]; then
++                read -r -p "测试时长(秒) [默认: 60]: " duration
++                duration=${duration:-60}
++            fi
+ 
+             run_client "$server_ip" "$APP_NUMA" "$duration"
+             ;;
+
+
+===== FILE: network-test-script/Performance Tuning for ConnectX-6 Dx on Hygon 74xx cpus/Deprecated scripts/network_tune_test_v2.sh =====
+diff --git a/network-test-script/Performance Tuning for ConnectX-6 Dx on Hygon 74xx cpus/Deprecated scripts/network_tune_test_v2.sh b/network-test-script/Performance Tuning for ConnectX-6 Dx on Hygon 74xx cpus/Deprecated scripts/network_tune_test_v2.sh
+index c031e92..ac9dafc 100644
+--- a/network-test-script/Performance Tuning for ConnectX-6 Dx on Hygon 74xx cpus/Deprecated scripts/network_tune_test_v2.sh	
++++ b/network-test-script/Performance Tuning for ConnectX-6 Dx on Hygon 74xx cpus/Deprecated scripts/network_tune_test_v2.sh	
+@@ -1,5 +1,8 @@
+ #!/bin/bash
+ 
++set -euo pipefail
++
++
+ # 颜色输出
+ RED='\033[0;31m'
+ GREEN='\033[0;32m'
+@@ -14,6 +17,11 @@ QUEUES_PER_NIC=0
+ LOG_DIR="/tmp/iperf_logs"
+ TIMESTAMP=""
+ SERVER_PIDS=()
++AUTO_YES=${AUTO_YES:-0}
++MODE_ARG=${1:-}
++SERVER_IP_ARG=${2:-}
++DURATION_ARG=${3:-}
++ADDED_RAW_RULES=()
+ 
+ # 日志函数
+ log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
+@@ -31,15 +39,13 @@ cleanup() {
+     for pid in "${MONITOR_PIDS[@]}"; do
+         kill "$pid" 2>/dev/null || true
+     done
+-    sudo pkill -x iperf 2>/dev/null || true
+     # 恢复 irqbalance
+-    sudo systemctl enable irqbalance 2>/dev/null || true
+-    sudo systemctl start irqbalance 2>/dev/null || true
+-    log_info "已恢复 irqbalance 服务"
+-    # 恢复 NUMA balancing
++    if systemctl list-unit-files irqbalance.service >/dev/null 2>&1; then
++        sudo systemctl start irqbalance 2>/dev/null || true
++        log_info "已恢复 irqbalance 服务"
++    fi
+     sudo sysctl -w kernel.numa_balancing=1 &>/dev/null || true
+-    # 清理 conntrack NOTRACK 规则
+-    sudo iptables -t raw -F 2>/dev/null || true
++    remove_added_raw_rules
+     log_info "清理完成"
+ }
+ trap cleanup EXIT INT TERM
+@@ -149,17 +155,59 @@ select_nearest_numa() {
+ #############################################################################
+ run_cmd() {
+     local cmd="$1"
++    local tmp_script
++    tmp_script=$(mktemp)
++    printf "#!/bin/bash
++set -e
++%s
++" "$cmd" > "$tmp_script"
++    chmod +x "$tmp_script"
+     echo -n -e "  执行: ${cmd} ... "
+-    if eval "sudo $cmd" >/dev/null 2>&1; then
++    if sudo bash "$tmp_script" >/dev/null 2>&1; then
+         echo -e "${GREEN}[成功]${NC}"
+     else
+         echo -e "${RED}[失败或不支持]${NC}"
+     fi
++    rm -f "$tmp_script"
+ }
+ 
+ #############################################################################
+ # 5.1 生成 CPU hex 位掩码
+ #############################################################################
++write_root_file() {
++    local value="$1"
++    local target_file="$2"
++    printf "%s\n" "$value" | sudo tee "$target_file" >/dev/null
++}
++
++set_all_governors_performance() {
++    local gov
++    for gov in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
++        [ -f "$gov" ] || continue
++        write_root_file "performance" "$gov" 2>/dev/null || true
++    done
++}
++
++add_raw_notrack_rule() {
++    local chain="$1"
++    local proto_field="$2"
++    local port_range="$3"
++    if command -v iptables >/dev/null 2>&1; then
++        sudo iptables -t raw -C "$chain" -p tcp "$proto_field" "$port_range" -j NOTRACK 2>/dev/null || {
++            sudo iptables -t raw -A "$chain" -p tcp "$proto_field" "$port_range" -j NOTRACK 2>/dev/null && ADDED_RAW_RULES+=("$chain|$proto_field|$port_range")
++        }
++    fi
++}
++
++remove_added_raw_rules() {
++    local rule
++    for rule in "${ADDED_RAW_RULES[@]:-}"; do
++        [ -n "$rule" ] || continue
++        IFS="|" read -r chain proto_field port_range <<< "$rule"
++        sudo iptables -t raw -D "$chain" -p tcp "$proto_field" "$port_range" -j NOTRACK 2>/dev/null || true
++    done
++}
++
+ cpu_to_mask() {
+     local cpu=$1
+     local total_cpus
+@@ -190,7 +238,7 @@ setup_route_tuning() {
+         local existing
+         existing=$(ip route show "$subnet" 2>/dev/null | head -1)
+         if [ -n "$existing" ]; then
+-            sudo ip route change $existing initcwnd 128 initrwnd 128 2>/dev/null || true
++            sudo bash -c "ip route change $existing initcwnd 128 initrwnd 128" 2>/dev/null || true
+             log_info "  $subnet: initcwnd=128 initrwnd=128"
+         fi
+     done
+@@ -210,7 +258,7 @@ start_monitoring() {
+     ethtool -S "$nic2" > "${LOG_DIR}/${nic2}_ethtool_S_before.log" 2>/dev/null || true
+     if command -v sar &>/dev/null; then
+         sar -n DEV 5 $((duration / 5 + 1)) > "${LOG_DIR}/sar_net.log" 2>&1 &
+-        MONITOR_PIDS+=($!)
++        MONITOR_PIDS+=("$!")
+     fi
+ }
+ 
+@@ -263,7 +311,6 @@ stop_monitoring() {
+     log_info "完整诊断日志: ${LOG_DIR}/"
+ }
+ 
+-MONITOR_PIDS=()
+ 
+ #############################################################################
+ # 6.3 防火墙放通 iperf 端口
+@@ -321,7 +368,7 @@ optimize_all() {
+     # 确保 irqbalance 进程彻底终止 (防止残留进程覆盖 IRQ 亲和性)
+     sudo pkill -9 irqbalance 2>/dev/null || true
+     sleep 0.5
+-    run_cmd "bash -c 'for gov in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do echo performance > \$gov 2>/dev/null || true; done'"
++    set_all_governors_performance
+ 
+     log_info "基础网络与 TCP 参数优化..."
+     run_cmd "sysctl -w net.core.rmem_max=2147483647"
+@@ -361,7 +408,8 @@ optimize_all() {
+ 
+         local cpus_str
+         cpus_str=$(get_numa_cpus "$this_numa")
+-        local cpus_all=($cpus_str)
++        local -a cpus_all=()
++        read -r -a cpus_all <<< "$cpus_str"
+         local total=${#cpus_all[@]}
+ 
+         local bind_cpus
+@@ -384,7 +432,8 @@ optimize_all() {
+         if [ "$queues" -gt 16 ]; then
+             queues=16
+             # 截取前 16 个 CPU 用于绑核
+-            local cpu_tmp=($bind_cpus)
++            local -a cpu_tmp=()
++            read -r -a cpu_tmp <<< "$bind_cpus"
+             bind_cpus="${cpu_tmp[*]:0:16}"
+         fi
+ 
+@@ -414,18 +463,19 @@ optimize_all() {
+         pci_dev=$(basename "$(readlink -f /sys/class/net/${nic}/device)" 2>/dev/null)
+         local irqs=()
+         if [ -n "$pci_dev" ]; then
+-            irqs=($(grep "mlx5_comp.*${pci_dev}" /proc/interrupts | awk -F: '{print $1}' | tr -d ' '))
++            mapfile -t irqs < <(grep "mlx5_comp.*${pci_dev}" /proc/interrupts | awk -F: '{print $1}' | tr -d ' ' || true)
+             if [ ${#irqs[@]} -eq 0 ]; then
+-                irqs=($(grep "${pci_dev}" /proc/interrupts | awk -F: '{print $1}' | tr -d ' '))
++                mapfile -t irqs < <(grep "${pci_dev}" /proc/interrupts | awk -F: '{print $1}' | tr -d ' ' || true)
+             fi
+         fi
+-        local cpu_arr=($bind_cpus)
++        local -a cpu_arr=()
++        read -r -a cpu_arr <<< "$bind_cpus"
+         local count=${#cpu_arr[@]}
+         local idx=0
+         local success_irq=0
+         for irq in "${irqs[@]}"; do
+             local target_cpu=${cpu_arr[$((idx % count))]}
+-            if sudo bash -c "echo '${target_cpu}' > /proc/irq/${irq}/smp_affinity_list" 2>/dev/null; then
++            if write_root_file "$target_cpu" "/proc/irq/${irq}/smp_affinity_list" 2>/dev/null; then
+                 success_irq=$((success_irq + 1))
+             fi
+             idx=$((idx + 1))
+@@ -445,7 +495,7 @@ optimize_all() {
+             if [ -f "$xps_file" ]; then
+                 local mask
+                 mask=$(cpu_to_mask "$cpuid")
+-                if sudo bash -c "echo '$mask' > '$xps_file'" 2>/dev/null; then
++                if write_root_file "$mask" "$xps_file" 2>/dev/null; then
+                     xps_ok=$((xps_ok + 1))
+                 fi
+             fi
+@@ -469,7 +519,7 @@ optimize_all() {
+         local rps_cleared=0
+         for f in /sys/class/net/${nic}/queues/rx-*/rps_cpus; do
+             if [ -f "$f" ]; then
+-                sudo bash -c "echo 0 > '$f'" 2>/dev/null && rps_cleared=$((rps_cleared + 1))
++                write_root_file 0 "$f" 2>/dev/null && rps_cleared=$((rps_cleared + 1))
+             fi
+         done
+         echo -e "  [RPS] $nic 已清除 ${rps_cleared} 个队列的 RPS ... ${GREEN}[完成]${NC}"
+@@ -482,19 +532,12 @@ optimize_all() {
+     log_info "为 iperf 端口绕过 conntrack 连接跟踪..."
+     if command -v iptables &>/dev/null; then
+         # 先清理旧规则 (避免重复)
+-        sudo iptables -t raw -D PREROUTING -p tcp --dport 5001:5100 -j NOTRACK 2>/dev/null || true
+-        sudo iptables -t raw -D PREROUTING -p tcp --dport 6001:6100 -j NOTRACK 2>/dev/null || true
+-        sudo iptables -t raw -D OUTPUT -p tcp --sport 5001:5100 -j NOTRACK 2>/dev/null || true
+-        sudo iptables -t raw -D OUTPUT -p tcp --sport 6001:6100 -j NOTRACK 2>/dev/null || true
+-        sudo iptables -t raw -D PREROUTING -p tcp --sport 5001:5100 -j NOTRACK 2>/dev/null || true
+-        sudo iptables -t raw -D PREROUTING -p tcp --sport 6001:6100 -j NOTRACK 2>/dev/null || true
+-        # 添加 NOTRACK 规则
+-        sudo iptables -t raw -A PREROUTING -p tcp --dport 5001:5100 -j NOTRACK 2>/dev/null || true
+-        sudo iptables -t raw -A PREROUTING -p tcp --dport 6001:6100 -j NOTRACK 2>/dev/null || true
+-        sudo iptables -t raw -A PREROUTING -p tcp --sport 5001:5100 -j NOTRACK 2>/dev/null || true
+-        sudo iptables -t raw -A PREROUTING -p tcp --sport 6001:6100 -j NOTRACK 2>/dev/null || true
+-        sudo iptables -t raw -A OUTPUT -p tcp --sport 5001:5100 -j NOTRACK 2>/dev/null || true
+-        sudo iptables -t raw -A OUTPUT -p tcp --sport 6001:6100 -j NOTRACK 2>/dev/null || true
++        add_raw_notrack_rule PREROUTING --dport 5001:5100
++        add_raw_notrack_rule PREROUTING --dport 6001:6100
++        add_raw_notrack_rule PREROUTING --sport 5001:5100
++        add_raw_notrack_rule PREROUTING --sport 6001:6100
++        add_raw_notrack_rule OUTPUT --sport 5001:5100
++        add_raw_notrack_rule OUTPUT --sport 6001:6100
+         log_info "  已为端口 5001-5100 / 6001-6100 绕过 conntrack"
+     fi
+ 
+@@ -549,8 +592,6 @@ setup_client_ips() {
+ run_server() {
+     local app_numa=$1
+     log_info "启动 iperf 服务端 (多实例模式, NUMA $app_numa)..."
+-    sudo pkill -x iperf 2>/dev/null || true
+-    sleep 1
+     mkdir -p "$LOG_DIR"
+     local nic1=${NICS[0]}
+     local nic2=${NICS[1]}
+@@ -558,7 +599,8 @@ run_server() {
+     # 获取 APP NUMA 的 CPU 列表
+     local app_cpus_str
+     app_cpus_str=$(get_numa_cpus "$app_numa")
+-    local app_cpus=($app_cpus_str)
++    local -a app_cpus=()
++    read -r -a app_cpus <<< "$app_cpus_str"
+     local num_app_cpus=${#app_cpus[@]}
+ 
+     # ★ 实例数固定 3: 实测 7 进程×2 流开销过大 (进程调度 + 系统调用),
+@@ -572,7 +614,7 @@ run_server() {
+         local cpu=${app_cpus[$((j % num_app_cpus))]}
+         taskset -c "$cpu" \
+             iperf -s -p "$port" > "${LOG_DIR}/${nic1}_server_p${j}.log" 2>&1 &
+-        SERVER_PIDS+=($!)
++        SERVER_PIDS+=("$!")
+     done
+     sleep 1
+ 
+@@ -583,7 +625,7 @@ run_server() {
+         local cpu=${app_cpus[$(( (j + num_inst) % num_app_cpus ))]}
+         taskset -c "$cpu" \
+             iperf -s -p "$port" > "${LOG_DIR}/${nic2}_server_p${j}.log" 2>&1 &
+-        SERVER_PIDS+=($!)
++        SERVER_PIDS+=("$!")
+     done
+     sleep 1
+ 
+@@ -615,7 +657,11 @@ check_connectivity() {
+     fi
+     if [ "$ok" = false ]; then
+         log_warn "部分链路不通，是否继续测试？(y/N)"
+-        read -r ans
++        if [ "$AUTO_YES" -eq 1 ]; then
++            ans="y"
++        else
++            read -r ans
++        fi
+         if [[ ! "$ans" =~ ^[yY] ]]; then
+             log_error "用户取消测试"
+         fi
+@@ -638,14 +684,13 @@ run_client() {
+ 
+     check_connectivity "$server_ip" "$server_ip2"
+ 
+-    sudo pkill -x iperf 2>/dev/null || true
+-    sleep 1
+     mkdir -p "$LOG_DIR"
+ 
+     # ★ 多端口多实例: 客户端和服务端各 N 个进程, 一一对应, 消除双端锁竞争
+     local app_cpus_str
+     app_cpus_str=$(get_numa_cpus "$app_numa")
+-    local app_cpus=($app_cpus_str)
++    local -a app_cpus=()
++    read -r -a app_cpus <<< "$app_cpus_str"
+     local num_app_cpus=${#app_cpus[@]}
+     # ★ 3 进程 × 5 流 = 15 流/口: 最佳平衡
+     #   - 3 进程: 最小化进程调度和系统调用开销
+@@ -672,7 +717,7 @@ run_client() {
+             iperf -c "${server_ip}" -p "$port" -P "$flows_per_inst" \
+             -t "$duration" -i 5 -w 4m -N \
+             > "${LOG_DIR}/${nic1}_pair1_p${j}.log" 2>&1 &
+-        all_pids+=($!)
++        all_pids+=("$!")
+     done
+     sleep 1
+ 
+@@ -685,7 +730,7 @@ run_client() {
+             iperf -c "${server_ip2}" -p "$port" -P "$flows_per_inst" \
+             -t "$duration" -i 5 -w 4m -N \
+             > "${LOG_DIR}/${nic2}_pair2_p${j}.log" 2>&1 &
+-        all_pids+=($!)
++        all_pids+=("$!")
+     done
+ 
+     # 等待所有进程完成
+@@ -792,7 +837,14 @@ main() {
+     echo "选择运行模式:"
+     echo "  1) 服务端 (Server)"
+     echo "  2) 客户端 (Client)"
+-    read -p "请输入选择 [1-2]: " mode
++    local mode="${1:-${MODE_ARG:-}}"
++    if [ -z "$mode" ]; then
++        echo ""
++        echo "选择运行模式:"
++        echo "  1) 服务端 (Server)"
++        echo "  2) 客户端 (Client)"
++        read -r -p "请输入选择 [1-2]: " mode
++    fi
+ 
+     case $mode in
+         1)
+@@ -805,10 +857,16 @@ main() {
+             ;;
+         2)
+             setup_client_ips
+-            read -p "请输入服务器 IP (Pair1) [默认: 192.168.100.2]: " server_ip
+-            server_ip=${server_ip:-192.168.100.2}
+-            read -p "测试时长(秒) [默认: 60]: " duration
+-            duration=${duration:-60}
++            local server_ip="${2:-${SERVER_IP_ARG:-192.168.100.2}}"
++            local duration="${3:-${DURATION_ARG:-60}}"
++            if [ -z "${SERVER_IP_ARG:-}" ] && [ "$AUTO_YES" -ne 1 ]; then
++                read -r -p "请输入服务器 IP (Pair1) [默认: 192.168.100.2]: " server_ip
++                server_ip=${server_ip:-192.168.100.2}
++            fi
++            if [ -z "${DURATION_ARG:-}" ] && [ "$AUTO_YES" -ne 1 ]; then
++                read -r -p "测试时长(秒) [默认: 60]: " duration
++                duration=${duration:-60}
++            fi
+             run_client "$server_ip" "$APP_NUMA" "$duration"
+             ;;
+         *)
+
+
+===== FILE: nvme-test-script/functional test script/nvme-fw-upgrade-downgreade-test-no-io.sh =====
+diff --git a/nvme-test-script/functional test script/nvme-fw-upgrade-downgreade-test-no-io.sh b/nvme-test-script/functional test script/nvme-fw-upgrade-downgreade-test-no-io.sh
+index 8a47920..9133a15 100644
+--- a/nvme-test-script/functional test script/nvme-fw-upgrade-downgreade-test-no-io.sh	
++++ b/nvme-test-script/functional test script/nvme-fw-upgrade-downgreade-test-no-io.sh	
+@@ -1,4 +1,6 @@
+ #!/bin/bash
++
++set -euo pipefail
+ # ==============================================================================
+ # NVMe Firmware Upgrade/Downgrade Automated Test Script (Standalone)
+ # ==============================================================================
+@@ -126,7 +128,7 @@ get_fw_rev() {
+         [ -n "$out" ] && { echo "$out"; return 0; }
+ 
+         sleep 2
+-        ((retry++))
++        retry=$((retry + 1))
+     done
+     echo "UNKNOWN"
+     return 1
+@@ -218,7 +220,7 @@ do_fw_update() {
+         local waited=0
+         while [ ! -b "$NVME_DEVICE" ] && [ $waited -lt 30 ]; do
+             sleep 1
+-            ((waited++))
++            waited=$((waited + 1))
+         done
+         if [ -b "$NVME_DEVICE" ]; then
+             log "NVMe device $NVME_DEVICE is back after reset (waited ${waited}s)"
+@@ -285,7 +287,7 @@ do_io_test() {
+ 
+     # Wait for iostat to finish naturally (max 80s)
+     local w=0
+-    while kill -0 "$iostat_pid" 2>/dev/null && [ $w -lt 80 ]; do sleep 1; ((w++)); done
++    while kill -0 "$iostat_pid" 2>/dev/null && [ $w -lt 80 ]; do sleep 1; w=$((w + 1)); done
+     kill "$iostat_pid" 2>/dev/null || true
+ 
+     # Append iostat result
+@@ -305,7 +307,7 @@ handle_power_cycle() {
+     log "Checkpoint saved: $STATE_FILE (expected FW: ${expected_after})"
+ 
+     # Register cron @reboot to resume after reboot
+-        ( crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH" ; \
++        ( crontab -l 2>/dev/null | grep -vF "$SCRIPT_PATH" ; \
+             echo "@reboot bash \"$SCRIPT_PATH\"" ) | crontab -
+         log "Registered cron @reboot: bash \"$SCRIPT_PATH\""
+ 
+@@ -356,7 +358,7 @@ run_after_powercycle() {
+ 
+     # Remove checkpoint and cron entry immediately to prevent infinite reboot loop
+     rm -f "$STATE_FILE"
+-    ( crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH" ) | crontab -
++    ( crontab -l 2>/dev/null | grep -vF "$SCRIPT_PATH" ) | crontab -
+     log "Checkpoint and cron @reboot entry cleared (expected after reboot: ${expected_after})"
+ 
+     # ---- Point 4 (power cycle): verify FW version survives reboot ----
+
+
+===== FILE: nvme-test-script/functional test script/nvme_driver_visible_check.sh =====
+diff --git a/nvme-test-script/functional test script/nvme_driver_visible_check.sh b/nvme-test-script/functional test script/nvme_driver_visible_check.sh
+index 018ca48..63ca951 100644
+--- a/nvme-test-script/functional test script/nvme_driver_visible_check.sh	
++++ b/nvme-test-script/functional test script/nvme_driver_visible_check.sh	
+@@ -1,5 +1,7 @@
+ #!/bin/bash
+ 
++set -euo pipefail
++
+ # ================= Configuration =================
+ LOOP_COUNT=10
+ WAIT_TIME=10
+@@ -23,9 +25,11 @@ for ((i=1; i<=LOOP_COUNT; i++)); do
+     echo "############################################################"
+ 
+     # ================= Step 2: Unload Driver =================
+-    CMD_UNLOAD="modprobe -r nvme"
+-    echo "[Action] Executing: $CMD_UNLOAD"
+-    $CMD_UNLOAD
++    echo "[Action] Executing: modprobe -r nvme"
++    if ! modprobe -r nvme; then
++        echo "FATAL ERROR: modprobe -r nvme failed." >&2
++        exit 1
++    fi
+     
+     echo ""
+     echo "[Check 1] Executing command: ls -1 /dev/nvme*"
+@@ -58,16 +62,15 @@ for ((i=1; i<=LOOP_COUNT; i++)); do
+     sleep 2
+ 
+     # ================= Step 3: Load Driver =================
+-    CMD_LOAD="modprobe nvme"
+     echo ""
+-    echo "[Action] Executing: $CMD_LOAD"
+-    $CMD_LOAD
++    echo "[Action] Executing: modprobe nvme"
++    modprobe nvme
+     
+     echo "Waiting ${WAIT_TIME}s for devices to initialize..."
+     sleep $WAIT_TIME
+     
+     # Check if devices appeared
+-    CONTROLLERS=$(for f in /dev/nvme* ; do [[ "$f" =~ n[0-9] ]] || echo "$f"; done 2>/dev/null)
++    CONTROLLERS=$(for f in /dev/nvme*; do [[ "$f" =~ n[0-9]+p[0-9]+$ ]] || echo "$f"; done 2>/dev/null)
+     if [ -z "$CONTROLLERS" ]; then
+             echo "FATAL ERROR: No devices found after load."
+             exit 1
+@@ -97,7 +100,7 @@ for ((i=1; i<=LOOP_COUNT; i++)); do
+ 
+     # 4. Sort and Display
+     LAST_SIZE=""
+-    sort -V "$TMP_LOGS" | while read line; do
++    sort -V "$TMP_LOGS" | while read -r line; do
+         CURRENT_SIZE=${line%%__*}
+         LOG_TEXT=${line#*__}
+ 
+
+
+===== FILE: nvme-test-script/functional test script/nvme_hotplug_unified.sh =====
+diff --git a/nvme-test-script/functional test script/nvme_hotplug_unified.sh b/nvme-test-script/functional test script/nvme_hotplug_unified.sh
+index 072e6a1..eb589c4 100644
+--- a/nvme-test-script/functional test script/nvme_hotplug_unified.sh	
++++ b/nvme-test-script/functional test script/nvme_hotplug_unified.sh	
+@@ -1,4 +1,7 @@
+ #!/bin/bash
++
++set -euo pipefail
++shopt -s nullglob
+ # ==============================================================================
+ # NVMe Hotplug Test 
+ # 功能: 物理热插拔测试 (暴力拔盘)，不通知操作系统下电
+@@ -42,8 +45,9 @@ log() {
+ }
+ 
+ get_bdf() {
+-    local dev_name=$(basename $1)
+-    local sys_link=$(readlink -f /sys/class/block/$dev_name/device/device) 2>/dev/null
++    local dev_name=$(basename "$1")
++    local sys_link
++    sys_link=$(readlink -f "/sys/class/block/$dev_name/device/device" 2>/dev/null)
+     if [[ -z "$sys_link" ]]; then
+         sys_link=$(readlink -f /sys/class/block/$dev_name/device)
+     fi
+@@ -66,8 +70,8 @@ bg_io_control() {
+ 
+     if [[ "$action" == "start" ]]; then
+         log "Starting Background IO on other NVMe drives..."
+-        local all_devs=$(ls /dev/nvme*n1 2>/dev/null)
+-        for dev in $all_devs; do
++        local all_devs=(/dev/nvme*n1)
++        for dev in "${all_devs[@]}"; do
+             if [[ "$dev" != "$target_dev" ]]; then
+                 fio --name=bg_stress_${dev##*/} --filename=$dev \
+                     --ioengine=libaio --direct=1 --rw=read --bs=1024k \
+@@ -111,7 +115,7 @@ run_cycle() {
+     
+     # --- 强力清理旧挂载和分区 (同步自新逻辑) ---
+     umount -R "$MOUNT_DIR" 2>/dev/null
+-    for part in ${current_dev}* ; do umount "$part" 2>/dev/null; done
++    for part in "${current_dev}"* ; do umount "$part" 2>/dev/null || true; done
+     wipefs -a -q "$current_dev" >/dev/null 2>&1
+     partprobe "$current_dev" 2>/dev/null
+     udevadm settle
+@@ -160,8 +164,14 @@ run_cycle() {
+     log "Step 3: Waiting for physical removal..."
+     
+     # 循环检查直到设备消失
++    local waited=0
+     while [ -b "$current_dev" ]; do
+         sleep 1
++        waited=$((waited + 1))
++        if [ "$waited" -gt 300 ]; then
++            log "${RED}FAIL: Timed out waiting for device removal${NC}"
++            return 1
++        fi
+     done
+     
+     log "${GREEN}PASS: Device node removed (Surprise).${NC}"
+
+
+===== FILE: nvme-test-script/functional test script/nvme_secure_erase_test.sh =====
+diff --git a/nvme-test-script/functional test script/nvme_secure_erase_test.sh b/nvme-test-script/functional test script/nvme_secure_erase_test.sh
+index 8d7bc98..862ea92 100644
+--- a/nvme-test-script/functional test script/nvme_secure_erase_test.sh	
++++ b/nvme-test-script/functional test script/nvme_secure_erase_test.sh	
+@@ -14,9 +14,10 @@ BASE_LOG_DIR="NVME_AUDIT_$(date +%Y%m%d_%H%M%S)"
+ 
+ # --- 核心逻辑 ---
+ do_full_audit() {
+-    local DEV_NAME=$1
++    local DEV_NAME="$1"
+     local TARGET_DEV="/dev/${DEV_NAME}"
+-    local DEV_SIZE_BYTES=$(blockdev --getsize64 "${TARGET_DEV}")
++    local DEV_SIZE_BYTES
++    DEV_SIZE_BYTES=$(blockdev --getsize64 "${TARGET_DEV}") || { echo "blockdev failed for ${TARGET_DEV}" >&2; return 1; }
+     local DEV_LOG_DIR="${BASE_LOG_DIR}/${DEV_NAME}"
+     
+     mkdir -p "${DEV_LOG_DIR}"
+@@ -61,7 +62,7 @@ do_full_audit() {
+         # 检查 Hex Dump 证据
+         # 逻辑：如果全盘为 0，文件行数应为 3，且最后一行地址应接近硬盘总容量
+         local LINE_COUNT=$(wc -l < "${HEX_DUMP_FILE}")
+-        local LAST_ADDR=$(tail -n 1 "${HEX_DUMP_FILE}" | awk '{print $1}')
++        local LAST_ADDR=$(awk '{if($1 != "*") print $1}' "${HEX_DUMP_FILE}" | tail -n 1)
+         
+         # 将十六进制地址转换为十进制进行比对
+         local LAST_ADDR_DEC=$((16#${LAST_ADDR:-0}))
+@@ -83,7 +84,7 @@ do_full_audit() {
+             echo "1. 物理设备: ${TARGET_DEV}"
+             echo "2. 标称容量: ${DEV_SIZE_BYTES} 字节"
+             echo "3. 擦除指令: nvme format -s 1 (User Data Erase)"
+-            echo "4. 扫描范围: 0x00000000 至 $(printf '0x%x' ${DEV_SIZE_BYTES})"
++            echo "4. 扫描范围: 0x00000000 至 $(printf '0x%x' "${DEV_SIZE_BYTES}")"
+             echo -e "\n[Hex Dump 原始证据]"
+             cat "${HEX_DUMP_FILE}"
+             echo -e "\n[逻辑判定依据]"
+@@ -99,11 +100,15 @@ do_full_audit() {
+ 
+ # --- 主程序 ---
+ mkdir -p "${BASE_LOG_DIR}"
+-DEVS=$(lsblk -dno NAME | grep nvme || true)
++DEVS=$(lsblk -dno NAME,TYPE,MOUNTPOINT | awk '$2=="disk" && $1 ~ /^nvme/ {print $1, $3}')
+ 
+-for d in $DEVS; do
+-    do_full_audit "$d" &
+-done
+-wait
++while read -r dev mountpoint; do
++    [[ -n "${dev:-}" ]] || continue
++    if [[ -n "${mountpoint:-}" ]]; then
++        echo "Skip mounted/system disk: /dev/${dev} (${mountpoint})" >&2
++        continue
++    fi
++    do_full_audit "$dev"
++done <<< "$DEVS"
+ 
+ echo "所有测试已完成。请查看 ${BASE_LOG_DIR} 下的报告。"
+
+
+===== FILE: os-test-script/10G-cptime.sh =====
+diff --git a/os-test-script/10G-cptime.sh b/os-test-script/10G-cptime.sh
+index 0b1f57f..d087d47 100644
+--- a/os-test-script/10G-cptime.sh
++++ b/os-test-script/10G-cptime.sh
+@@ -1,5 +1,7 @@
+ #!/bin/bash
+ 
++set -euo pipefail
++
+ # --- 配置参数 ---
+ FILE_SIZE="10G"              # 测试文件大小
+ TEST_DIR="."                 # 当前目录
+@@ -8,6 +10,7 @@ TEST_FILE="test_source_10G"
+ COPY_FILE="test_target_10G"
+ TIMESTAMP=$(date "+%Y%m%d_%H%M%S")
+ LOG_FILE="$LOG_DIR/copy_test_$TIMESTAMP.log"
++trap 'rm -f "$TEST_FILE" "$COPY_FILE" 2>/dev/null || true' EXIT INT TERM
+ 
+ # --- 创建日志目录 ---
+ mkdir -p "$LOG_DIR"
+@@ -32,7 +35,7 @@ log "==========================================="
+ # 1. 生成测试文件 (如果不存在)
+ if [ ! -f "$TEST_FILE" ]; then
+     log "[1/3] 正在生成 $FILE_SIZE 的测试文件..."
+-    dd if=/dev/zero of="$TEST_FILE" bs=1M count=10240 status=progress 2>&1 | tee -a "$LOG_FILE"
++    dd if=/dev/zero of="$TEST_FILE" bs=1M count=$(( ${FILE_SIZE%G} * 1024 )) status=progress 2>&1 | tee -a "$LOG_FILE"
+     sync
+ else
+     log "[1/3] 测试文件已存在，跳过创建。"
+
+
+===== FILE: os-test-script/cdm-fio-for-usb3test.sh =====
+diff --git a/os-test-script/cdm-fio-for-usb3test.sh b/os-test-script/cdm-fio-for-usb3test.sh
+index b2b9ecf..2252821 100644
+--- a/os-test-script/cdm-fio-for-usb3test.sh
++++ b/os-test-script/cdm-fio-for-usb3test.sh
+@@ -3,7 +3,7 @@
+ # ==========================================
+ # 1. 基础配置
+ # ==========================================
+-DEV="/dev/sdb"               # 盘符
++DEV="${1:-/dev/sdb}"               # 盘符
+ RESULT_DIR="fio_results_$(date +%Y%m%d_%H%M%S)"
+ SIZE="1G"                    # 测试数据范围；USB设备1G足够，NVMe/SATA SSD建议加大
+ RAMP="10"                    # 10秒预热
+@@ -52,15 +52,15 @@ run_fio() {
+     # 执行fio并将结果保存到文件
+     fio --name="$name" \
+         --filename="$DEV" \
+-        --ioengine=$ENGINE \
+-        --direct=$DIRECT \
++        --ioengine="$ENGINE" \
++        --direct="$DIRECT" \
+         --rw="$rw" \
+         --bs="$bs" \
+         --iodepth="$qd" \
+         --numjobs="$nj" \
+-        --size=$SIZE \
+-        --ramp_time=$RAMP \
+-        --runtime=$RUN \
++        --size="$SIZE" \
++        --ramp_time="$RAMP" \
++        --runtime="$RUN" \
+         --time_based \
+         --group_reporting \
+         --output="$output_file"
+
+
+===== FILE: os-test-script/cli-test-cript.sh =====
+diff --git a/os-test-script/cli-test-cript.sh b/os-test-script/cli-test-cript.sh
+index 6b212ba..a7aa919 100644
+--- a/os-test-script/cli-test-cript.sh
++++ b/os-test-script/cli-test-cript.sh
+@@ -1,8 +1,13 @@
+ #!/bin/bash
+ 
+ # 设置为中文环境以触发中文报错"未找到命令"
+-export LC_ALL=zh_CN.UTF-8
+-export LANG=zh_CN.UTF-8
++if locale -a 2>/dev/null | grep -q "zh_CN.utf8\|zh_CN.UTF-8"; then
++    export LC_ALL=zh_CN.UTF-8
++    export LANG=zh_CN.UTF-8
++else
++    export LC_ALL=C
++    export LANG=C
++fi
+ 
+ # 获取操作系统的内核版本
+ OS_KERNEL=$(uname -r)
+@@ -16,7 +21,7 @@ group5=("useradd" "userdel" "usermod" "groupadd" "groupdel" "groupmod" "id")
+ 
+ # 测试执行核心函数
+ run_test() {
+-    local folder_name=$1
++    local folder_name="$1"
+     shift
+     local cmds=("$@")
+ 
+@@ -34,7 +39,14 @@ run_test() {
+         echo "执行指令: $cmd --help" >> "$log_file"
+         echo "--------------------------------------------------" >> "$log_file"
+ 
+-        $cmd --help >> "$log_file" 2>&1
++        if command -v "$cmd" >/dev/null 2>&1; then
++            case "$cmd" in
++                vi) "$cmd" -h >> "$log_file" 2>&1 || "$cmd" --help >> "$log_file" 2>&1 ;;
++                *) "$cmd" --help >> "$log_file" 2>&1 ;;
++            esac
++        else
++            echo "command not found: $cmd" >> "$log_file"
++        fi
+         echo "" >> "$log_file"
+     done
+ 
+
+
+===== FILE: os-test-script/fio_test.sh =====
+diff --git a/os-test-script/fio_test.sh b/os-test-script/fio_test.sh
+index ca753da..30c9665 100644
+--- a/os-test-script/fio_test.sh
++++ b/os-test-script/fio_test.sh
+@@ -5,7 +5,7 @@ SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
+ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+ 
+ # 用户配置（直接修改这里）
+-TARGET_DEVICE="/dev/sdb"
++TARGET_DEVICE="${1:-/dev/sdb}"
+ DURATION=14400
+ FIO_SIZE="100G"               # 测试数据范围 per job；大容量盘建议设为全盘容量或更大
+ 
+@@ -64,6 +64,7 @@ check_device_safety() {
+ }
+ 
+ check_device_safety "$TARGET_DEVICE"
++echo "[WARN] 即将对 $TARGET_DEVICE 执行随机读写测试，设备上的现有数据可能被覆盖"
+ 
+ start_log_collection() {
+     dmesg -w > "$DMESG_LOG" 2>&1 &
+@@ -118,7 +119,7 @@ start_log_collection
+ 
+ fio --name=rw_test --rw=randrw --rwmixread=70 --bs=4k --size="$FIO_SIZE" \
+     --numjobs=4 --runtime="$DURATION" --time_based --group_reporting \
+-    --filename="$TARGET_DEVICE" --output="$FIO_RESULT" 2>&1 || true
++    --filename="$TARGET_DEVICE" --output="$FIO_RESULT" 2>&1
+ 
+ sleep 2
+ stop_log_collection
+@@ -127,14 +128,14 @@ stop_log_collection
+     echo "测试结束时间: $(date '+%Y-%m-%d %H:%M:%S')"
+     echo "================================================"
+     echo "输出文件："
+-    echo "  - 测试报告: $(basename $REPORT_FILE)"
+-    echo "  - dmesg日志: $(basename $DMESG_LOG)"
+-    echo "  - message日志: $(basename $MESSAGE_LOG)"
+-    echo "  - BMC日志: $(basename $BMC_LOG)"
+-    echo "  - FIO结果: $(basename $FIO_RESULT)"
++    echo "  - 测试报告: $(basename "$REPORT_FILE")"
++    echo "  - dmesg日志: $(basename "$DMESG_LOG")"
++    echo "  - message日志: $(basename "$MESSAGE_LOG")"
++    echo "  - BMC日志: $(basename "$BMC_LOG")"
++    echo "  - FIO结果: $(basename "$FIO_RESULT")"
+     echo "================================================"
+ } >> "$REPORT_FILE" 2>&1
+ 
+ echo "✓ FIO 测试已完成"
+ echo "✓ 所有结果已保存至: $SCRIPT_DIR"
+-echo "✓ 报告文件: $(basename $REPORT_FILE)"
++echo "✓ 报告文件: $(basename "$REPORT_FILE")"
+
+
+===== FILE: os-test-script/iperf_test.sh =====
+diff --git a/os-test-script/iperf_test.sh b/os-test-script/iperf_test.sh
+index d16043c..940ddcc 100644
+--- a/os-test-script/iperf_test.sh
++++ b/os-test-script/iperf_test.sh
+@@ -5,14 +5,14 @@ SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
+ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+ 
+ # 用户配置（直接修改这里）
+-SERVER_IP=""                  # 必填: 服务端IP地址，回环地址(127.0.0.1)走内核虚拟网卡，不测物理网卡
++SERVER_IP="${1:-}"                  # 必填: 服务端IP地址，回环地址(127.0.0.1)走内核虚拟网卡，不测物理网卡
+ DURATION=14400
+ IPERF_FORMAT="m"              # iperf -f 单位: m=Mbps, g=Gbps; 高速网卡(>=10Gbps)建议 g
+ 
+ # 参数校验
+ if [ -z "$SERVER_IP" ]; then
+-    echo "错误: SERVER_IP 未设置"
+-    echo "用法: 编辑脚本，将 SERVER_IP 设为目标服务端IP"
++    echo "错误: 请指定服务器IP"
++    echo "用法: bash $0 <server_ip>"
+     echo "注意: 127.0.0.1 为回环接口，测试结果不反映物理网卡性能"
+     exit 1
+ fi
+@@ -116,8 +116,7 @@ fi
+ # 4. 执行 iPerf 测试
+ # 参数说明：-c 客户端模式  -t 测试时长  -i 1 每秒输出一次报告  -f 单位
+ log "[4/5] 开始执行 iPerf 测试 (服务器: ${SERVER_IP}, 时长: ${DURATION}s)..."
+-iperf -c "$SERVER_IP" -t "$DURATION" -i 1 -f "$IPERF_FORMAT" > "$IPERF_RAW" 2>&1
+-if [ $? -ne 0 ]; then
++if ! iperf -c "$SERVER_IP" -t "$DURATION" -i 1 -f "$IPERF_FORMAT" > "$IPERF_RAW" 2>&1; then
+     log "警告: iPerf 测试执行失败或返回非零值，请检查 $IPERF_RAW"
+ fi
+ 
+@@ -141,7 +140,11 @@ else
+     log "  警告: 未找到 /var/log/messages 或 /var/log/syslog"
+ fi
+ 
+-ipmitool sel elist > "$BMC_LOG" 2>&1 || log "  警告: ipmitool sel elist 执行失败"
++if command -v ipmitool >/dev/null 2>&1; then
++    ipmitool sel elist > "$BMC_LOG" 2>&1 || log "  警告: ipmitool sel elist 执行失败"
++else
++    log "  警告: 未安装 ipmitool，跳过 BMC 日志收集"
++fi
+ 
+ {
+     echo ""
+
+
+===== FILE: os-test-script/memtester4h.sh =====
+diff --git a/os-test-script/memtester4h.sh b/os-test-script/memtester4h.sh
+index 32b16b8..3b5fa23 100644
+--- a/os-test-script/memtester4h.sh
++++ b/os-test-script/memtester4h.sh
+@@ -3,7 +3,7 @@
+ # Memory Test Procedure Using memtester (4 Hours)
+ # ================================================
+ 
+-set -e
++set -euo pipefail
+ 
+ # 初始化变量
+ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+@@ -40,7 +40,7 @@ echo "Step 1: Check Available Memory"
+ echo "--------------------------------------------------"
+ free -h
+ echo ""
+-cat /proc/meminfo | grep MemAvailable
++grep MemAvailable /proc/meminfo
+ 
+ # 计算可用于测试的内存大小
+ # 预留至少1GB或总内存的5%（取较大值），防止OOM killer触发
+@@ -82,19 +82,19 @@ echo "--------------------------------------------------"
+ echo "Step 3: Start memtester (Run for 4 Hours)"
+ echo "--------------------------------------------------"
+ echo "[Step 3] Starting memtester for 4 hours..."
+-echo "  Command: timeout $DURATION memtester $MEM_SIZE 0"
+-timeout $DURATION memtester $MEM_SIZE 0 > "$MEMTESTER_LOG" 2>&1 &
++echo "  Command: timeout "$DURATION" memtester "$MEM_SIZE" 0"
++timeout "$DURATION" memtester "$MEM_SIZE" 0 > "$MEMTESTER_LOG" 2>&1 &
+ MEMTESTER_PID=$!
+ echo "  memtester PID: $MEMTESTER_PID"
+ 
+ echo "  Test running... (checking every 60 seconds)"
+-while kill -0 $MEMTESTER_PID 2>/dev/null; do
++while kill -0 "$MEMTESTER_PID" 2>/dev/null; do
+     echo "  $(date): memtester still running (PID: $MEMTESTER_PID)"
+     tail -n 5 "$MEMTESTER_LOG" 2>/dev/null | grep -v "^$"
+     sleep 60
+ done
+ 
+-wait $MEMTESTER_PID
++wait "$MEMTESTER_PID" || true
+ echo "[Step 3] memtester finished."
+ 
+ echo "--------------------------------------------------"
+@@ -116,7 +116,11 @@ echo "Step 5: Collect System Log After Test"
+ echo "--------------------------------------------------"
+ echo "[Step 5] Collecting system logs..."
+ dmesg > "$LOG_DIR/dmesg_after_test_$TIMESTAMP.log" 2>&1
+-[ -f /var/log/messages ] && cp /var/log/messages "$LOG_DIR/system_messages_$TIMESTAMP.log" || echo "No /var/log/messages found" > "$LOG_DIR/messages_missing.txt"
++if [ -f /var/log/messages ]; then
++    cp /var/log/messages "$LOG_DIR/system_messages_$TIMESTAMP.log"
++else
++    echo "No /var/log/messages found" > "$LOG_DIR/messages_missing.txt"
++fi
+ journalctl --since "$(cat $LOG_DIR/test_start_marker.txt | cut -d' ' -f4-)" > "$LOG_DIR/journalctl_$TIMESTAMP.log" 2>&1 || echo "journalctl failed" > "$LOG_DIR/journalctl_error.txt"
+ 
+ echo "  Checking ECC errors in dmesg..."
+@@ -158,7 +162,6 @@ echo "--------------------------------------------------"
+ echo "Step 7: Package All Logs"
+ echo "--------------------------------------------------"
+ echo "[Step 7] Packaging all logs..."
+-cp "$MEMTESTER_LOG" "$LOG_DIR/" 2>/dev/null || echo "Failed to copy memtester log"
+ PACKAGE="$SCRIPT_DIR/memtest_logs_$TIMESTAMP.tar.gz"
+ tar -czf "$PACKAGE" -C "$SCRIPT_DIR" "memtest_logs_$TIMESTAMP" 2>/dev/null || echo "Failed to create package"
+ echo "  All logs packaged to $PACKAGE"
+@@ -176,7 +179,7 @@ Tester          : $(whoami)
+ Server Model    : $(dmidecode -s system-product-name 2>/dev/null || echo "N/A")
+ Memory Config   : $(free -h | head -2)
+ Test Duration   : 4 Hours
+-memtester Cmd   : timeout $DURATION memtester $MEM_SIZE 0
++memtester Cmd   : timeout "$DURATION" memtester "$MEM_SIZE" 0
+ System Hang     : NO
+ ECC Error       : $([ -f "$LOG_DIR/ecc_errors_found.log" ] && echo "YES (check ecc_errors_found.log)" || echo "NO")
+ BMC Log File    : $LOG_DIR/bmc_sel_log_$TIMESTAMP.log
+
+
+===== FILE: os-test-script/network_perf_test.sh =====
+diff --git a/os-test-script/network_perf_test.sh b/os-test-script/network_perf_test.sh
+index fa7d8f9..7cf5ee1 100644
+--- a/os-test-script/network_perf_test.sh
++++ b/os-test-script/network_perf_test.sh
+@@ -117,8 +117,7 @@ run_netperf() {
+     local outfile="$2"
+     shift 2
+     log "  正在进行 ${desc} 测试..."
+-    netperf "$@" > "${outfile}" 2>&1
+-    if [ $? -ne 0 ]; then
++    if ! netperf "$@" > "${outfile}" 2>&1; then
+         log "  错误: ${desc} 测试执行失败，请检查 ${outfile}"
+     fi
+ }
+@@ -252,9 +251,8 @@ cat "${REPORT}" >> "${LOG_FILE}"
+ 
+ # 清理 netserver (仅本地测试时停止)
+ if [ "$TARGET_IP" = "127.0.0.1" ] || [ "$TARGET_IP" = "localhost" ]; then
+-    pkill netserver > /dev/null 2>&1
++    pkill -x netserver > /dev/null 2>&1 || true
+     log "  已停止本地 netserver"
+ fi
+ 
+ log "测试完成！结果目录: ${RESULT_DIR}"
+-chmod -R a+rX "${RESULT_DIR}"
+
+
+===== FILE: os-test-script/os_management_test.sh =====
+diff --git a/os-test-script/os_management_test.sh b/os-test-script/os_management_test.sh
+index 7e900a2..6c3f89b 100644
+--- a/os-test-script/os_management_test.sh
++++ b/os-test-script/os_management_test.sh
+@@ -1,8 +1,13 @@
+ #!/bin/bash
+ 
+ # 设置为中文环境
+-export LC_ALL=zh_CN.UTF-8
+-export LANG=zh_CN.UTF-8
++if locale -a 2>/dev/null | grep -q "zh_CN.utf8\|zh_CN.UTF-8"; then
++  export LC_ALL=zh_CN.UTF-8
++  export LANG=zh_CN.UTF-8
++else
++  export LC_ALL=C
++  export LANG=C
++fi
+ 
+ echo "=================================================="
+ echo "开始执行操作系统功能专项测试 (共9项)..."
+@@ -25,6 +30,22 @@ if [ "$EUID" -ne 0 ]; then
+ fi
+ 
+ # 定义一个核心函数：创建独立文件夹、初始化日志并执行多个指令
++run_snippet() {
++    local snippet="$1"
++    local log_file="$2"
++    local tmp_script
++    tmp_script=$(mktemp)
++    printf "#!/bin/bash
++set -o pipefail
++%s
++" "$snippet" > "$tmp_script"
++    chmod +x "$tmp_script"
++    bash "$tmp_script" >> "$log_file" 2>&1
++    local exit_code=$?
++    rm -f "$tmp_script"
++    return "$exit_code"
++}
++
+ run_test_item() {
+     local folder_name="$1"
+     local test_desc="$2"
+@@ -48,7 +69,7 @@ run_test_item() {
+         echo "[执行指令]: $cmd" >> "$log_file"
+         echo "--------------------------------------------------" >> "$log_file"
+         
+-        bash -c "$cmd" >> "$log_file" 2>&1
++        run_snippet "$cmd" "$log_file"
+ 
+         # 检查命令是否因权限问题失败
+         local exit_code=$?
+
+
+===== FILE: os-test-script/run_iozone.sh =====
+diff --git a/os-test-script/run_iozone.sh b/os-test-script/run_iozone.sh
+index c94511e..cc51711 100644
+--- a/os-test-script/run_iozone.sh
++++ b/os-test-script/run_iozone.sh
+@@ -1,5 +1,7 @@
+ #!/bin/bash
+ 
++set -euo pipefail
++
+ # ==========================================
+ # Iozone Automated Benchmark Script (RHEL)
+ # Features: Auto RAM sizing, Space check, Pandas Excel export, Auto-cleanup
+@@ -11,7 +13,7 @@ CSV_FILE="$TEST_DIR/iozone_report_backup.csv"
+ EXCEL_FILE="$TEST_DIR/iozone_report.xlsx"
+ 
+ # 1. Environment Preparation
+-mkdir -p "$TEST_DIR"
++mkdir -p "$TEST_DIR" || { echo "[ERROR] 无法创建测试目录: $TEST_DIR" >&2; exit 1; }
+ echo "[INFO] Checking system physical memory..."
+ 
+ # Get total physical memory in GB (Rounded up)
+@@ -20,6 +22,7 @@ echo "[INFO] Total system physical memory: ${TOTAL_RAM_GB} GB"
+ 
+ # Calculate file sizes for the 3 test groups
+ SIZE_HALF=$((TOTAL_RAM_GB / 2))
++[ "$SIZE_HALF" -lt 1 ] && SIZE_HALF=1
+ SIZE_ONE=$TOTAL_RAM_GB
+ SIZE_TWO=$((TOTAL_RAM_GB * 2))
+ 
+@@ -91,7 +94,7 @@ get_free_space_gb() {
+     if [ -n "$t_check" ]; then
+         # 提取数字部分，转换为 GB
+         local tb_val
+-        tb_val=$(df -B1G "$TEST_DIR" | awk 'NR==2 {print $4}')
++        tb_val=$(df -BG "$TEST_DIR" | awk 'NR==2 {print $4}' | sed 's/G//')
+         echo "${tb_val:-0}"
+     else
+         echo "${raw:-0}"
+@@ -109,7 +112,12 @@ run_test() {
+     # Check free disk space in /home
+     local free_space_gb
+     free_space_gb=$(get_free_space_gb)
+-    if [ "$free_space_gb" -lt "$size_gb" ] 2>/dev/null; then
++    if ! [[ "$free_space_gb" =~ ^[0-9]+$ ]] || ! [[ "$size_gb" =~ ^[0-9]+$ ]]; then
++        echo "[ERROR] 无法解析磁盘空间或测试文件大小: free=${free_space_gb}, size=${size_gb}"
++        echo "$label,$size_gb,Skipped,Skipped,Skipped,Skipped" >> "$CSV_FILE"
++        return
++    fi
++    if [ "$free_space_gb" -lt "$size_gb" ]; then
+         echo "[ERROR] Insufficient disk space! Free: ${free_space_gb} GB, Required: ${size_gb} GB."
+         echo "[ERROR] Skipping [$label] test to prevent disk overflow."
+         echo "$label,$size_gb,Skipped,Skipped,Skipped,Skipped" >> "$CSV_FILE"
+
+
+===== FILE: os-test-script/stress1h.sh =====
+diff --git a/os-test-script/stress1h.sh b/os-test-script/stress1h.sh
+index 01e7e9f..7ac84c5 100644
+--- a/os-test-script/stress1h.sh
++++ b/os-test-script/stress1h.sh
+@@ -8,6 +8,7 @@ OUTDIR="${SCRIPT_DIR}/stress-test-${TIMESTAMP}"
+ RECORD_FILE="${OUTDIR}/test_record.txt"
+ CHECK_INTERVAL=60
+ STRESS_TIMEOUT=3600s
++RECORD_SAVED=0
+ 
+ mkdir -p "${OUTDIR}" || { echo "无法创建输出目录 ${OUTDIR}"; exit 1; }
+ 
+@@ -36,6 +37,10 @@ collect_system_logs() {
+ }
+ 
+ save_record() {
++	if [ "$RECORD_SAVED" -eq 1 ]; then
++		return 0
++	fi
++	RECORD_SAVED=1
+ 	local status="$1"; shift
+ 	local msg="$*"
+ 	echo "timestamp=${TIMESTAMP}" >> "${RECORD_FILE}"
+@@ -77,13 +82,13 @@ if [ "$hdd_fstype" = "tmpfs" ]; then
+ fi
+ 
+ log "启动 stress，持续时间 1小时"
+-stress --cpu $(nproc) --io 4 --vm 2 --vm-bytes 128M --hdd 2 --hdd-bytes 1G --timeout 3600s --verbose > "${OUTDIR}/stress_out.txt" 2>&1 &
++stress --cpu "$(nproc)" --io 4 --vm 2 --vm-bytes 128M --hdd 2 --hdd-bytes 1G --timeout 3600s --verbose > "${OUTDIR}/stress_out.txt" 2>&1 &
+ STRESS_PID=$!
+ 
+ log "stress PID=${STRESS_PID}"
+ 
+ # 监控循环：每 CHECK_INTERVAL 秒检查本机响应与收集快照日志
+-SECONDS_BEFORE=$(cat /proc/uptime | awk '{print $1}')
++SECONDS_BEFORE=$(awk '{print $1}' /proc/uptime)
+ end_time=$(( $(date +%s) + 3600 ))
+ failed=0
+ 
+
+
+===== FILE: ppu/collect_ppu_monitor.sh =====
+diff --git a/ppu/collect_ppu_monitor.sh b/ppu/collect_ppu_monitor.sh
+index 5ae38e6..277a27a 100644
+--- a/ppu/collect_ppu_monitor.sh
++++ b/ppu/collect_ppu_monitor.sh
+@@ -1,6 +1,6 @@
+ #!/bin/bash
+ 
+-set -uo pipefail
++set -euo pipefail
+ 
+ # 检查必要命令
+ for cmd in ppudbg; do
+@@ -17,8 +17,17 @@ LOG_DIR="ppu_stream_logs"
+ 
+ mkdir -p "$LOG_DIR"
+ 
+-# 捕获 Ctrl+C 退出
+-trap 'echo -e "\n[INFO] Stopping all monitors and closing files..."; exit 0' INT
++# 捕获退出并清理后台进程
++cleanup() {
++    echo -e "\n[INFO] Stopping all monitors and closing files..."
++    if [ ${#PIDS[@]} -gt 0 ]; then
++        kill "${PIDS[@]}" 2>/dev/null || true
++        for pid in "${PIDS[@]}"; do
++            wait "$pid" 2>/dev/null || true
++        done
++    fi
++}
++trap cleanup EXIT INT TERM
+ 
+ echo "[INFO] Starting continuous PPU monitoring (stream to files)."
+ echo "[INFO] Devices: ${DEVICES[*]}"
+@@ -34,29 +43,31 @@ for DEVICE_ID in "${DEVICES[@]}"; do
+ 
+     # CE/CU Stress
+     ppudbg --device "$DEVICE_ID" --monitor \
+-        >> "$LOG_DIR/dev${DEVICE_ID}_ce_cu_stress.txt" 2>&1 &
+-    PIDS+=($!)
++        > "$LOG_DIR/dev${DEVICE_ID}_ce_cu_stress.txt" 2>&1 &
++    PIDS+=("$!")
+ 
+     # Power Info
+     ppudbg --device "$DEVICE_ID" --monitor power \
+-        >> "$LOG_DIR/dev${DEVICE_ID}_power_info.txt" 2>&1 &
+-    PIDS+=($!)
++        > "$LOG_DIR/dev${DEVICE_ID}_power_info.txt" 2>&1 &
++    PIDS+=("$!")
+ 
+     # ICN Info
+     ppudbg --device "$DEVICE_ID" --monitor icn \
+-        >> "$LOG_DIR/dev${DEVICE_ID}_icn_info.txt" 2>&1 &
+-    PIDS+=($!)
++        > "$LOG_DIR/dev${DEVICE_ID}_icn_info.txt" 2>&1 &
++    PIDS+=("$!")
+ 
+     # Video Info
+     ppudbg --device "$DEVICE_ID" --monitor video \
+-        >> "$LOG_DIR/dev${DEVICE_ID}_video_info.txt" 2>&1 &
+-    PIDS+=($!)
++        > "$LOG_DIR/dev${DEVICE_ID}_video_info.txt" 2>&1 &
++    PIDS+=("$!")
+ done
+ 
+ echo "[INFO] All monitors are now streaming data to their respective files."
+ echo "[INFO] Running in background. Press Ctrl+C to stop."
+ 
+ # 等待所有后台进程（它们会一直运行直到被 kill 或 Ctrl+C）
+-wait "${PIDS[@]}" 2>/dev/null
++for pid in "${PIDS[@]}"; do
++    wait "$pid" 2>/dev/null || true
++done
+ 
+ echo "[INFO] Logging stopped."
+\ No newline at end of file
+
+
+===== FILE: ppu/trace_player_autorun.sh =====
+diff --git a/ppu/trace_player_autorun.sh b/ppu/trace_player_autorun.sh
+index 2add443..5a05b1c 100644
+--- a/ppu/trace_player_autorun.sh
++++ b/ppu/trace_player_autorun.sh
+@@ -1,5 +1,11 @@
+ #!/bin/bash
+ 
++set -euo pipefail
++
++SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
++TRACE_BIN="${SCRIPT_DIR}/trace_player"
++TRACE_STREAM="${SCRIPT_DIR}/multi_stream.txt"
++
+ #配置
+ DURATION=30000  #秒
+ 
+@@ -19,8 +25,8 @@ echo "----------------------------------------"
+     while [ "$(date +%s)" -lt $end_time ]; do
+         echo "[$(date)] loops started..."
+ 
+-        ./trace_player -s multi_stream.txt -n 22 -r 100000
+-        AlippuDeviceIndex=1 ./trace_player -s multi_stream.txt -n 22 -r 100000
++        "$TRACE_BIN" -s "$TRACE_STREAM" -n 22 -r 100000
++        AlippuDeviceIndex=1 "$TRACE_BIN" -s "$TRACE_STREAM" -n 22 -r 100000
+ 
+         echo "[$(date)] loop done..."
+     done
+
+
+===== FILE: universal-script/collect_system_logs.sh =====
+diff --git a/universal-script/collect_system_logs.sh b/universal-script/collect_system_logs.sh
+index 3cff6a7..786607e 100644
+--- a/universal-script/collect_system_logs.sh
++++ b/universal-script/collect_system_logs.sh
+@@ -68,13 +68,14 @@ collect_messages() {
+     )
+ 
+     local found=0
++    shopt -s nullglob
+     for pattern in "${candidates[@]}"; do
+         # 使用 glob 展开
+         for f in $pattern; do
+             [[ -f "$f" ]] || continue
+-            local basename
+-            basename="$(basename "${f}")"
+-            local out="${OUTPUT_DIR}/messages_${basename}_${TIMESTAMP}.log"
++            local base_name
++            base_name="$(basename "${f}")"
++            local out="${OUTPUT_DIR}/messages_${base_name}_${TIMESTAMP}.log"
+             cp "${f}" "${out}"
+             log_info "已复制: ${f} -> ${out} ($(wc -l < "${out}") 行)"
+             found=1
+@@ -202,7 +203,7 @@ collect_sysinfo() {
+         uptime
+         echo
+         echo "===== CPU 信息 ====="
+-        lscpu 2>/dev/null || cat /proc/cpuinfo | head -40
++        lscpu 2>/dev/null || head -40 /proc/cpuinfo
+         echo
+         echo "===== 内存信息 ====="
+         free -h
+
+
+===== FILE: universal-script/os-log-clean.sh =====
+diff --git a/universal-script/os-log-clean.sh b/universal-script/os-log-clean.sh
+index cbf47aa..c0b12d9 100644
+--- a/universal-script/os-log-clean.sh
++++ b/universal-script/os-log-clean.sh
+@@ -1,4 +1,5 @@
+ #!/bin/bash
++set -euo pipefail
+ # 清理日志用
+ # Author : Prz1y
+ 
+@@ -41,8 +42,8 @@ sudo find /var/log/audit -type f -exec truncate -s 0 {} \; 2>/dev/null
+ 
+ # 6. 清理临时日志目录
+ echo "[$(date)] 清理临时日志..."
+-sudo rm -rf /tmp/*.log* 2>/dev/null
+-sudo rm -rf /tmp/test* 2>/dev/null
++sudo find /tmp -maxdepth 1 -type f -name "sit-kit*.log*" -delete 2>/dev/null || true
++sudo find /tmp -maxdepth 1 \( -type f -o -type d \) -name "sit-kit-test*" -exec rm -rf {} + 2>/dev/null || true
+ 
+ # 7. 如果有 BMC/iLO 本地缓存日志
+ echo "[$(date)] 清理 BMC 相关缓存..."
+
+
