@@ -8,6 +8,7 @@ OUTDIR="${SCRIPT_DIR}/stress-test-${TIMESTAMP}"
 RECORD_FILE="${OUTDIR}/test_record.txt"
 CHECK_INTERVAL=60
 STRESS_TIMEOUT=3600s
+RECORD_SAVED=0
 
 mkdir -p "${OUTDIR}" || { echo "无法创建输出目录 ${OUTDIR}"; exit 1; }
 
@@ -36,6 +37,10 @@ collect_system_logs() {
 }
 
 save_record() {
+	if [ "$RECORD_SAVED" -eq 1 ]; then
+		return 0
+	fi
+	RECORD_SAVED=1
 	local status="$1"; shift
 	local msg="$*"
 	echo "timestamp=${TIMESTAMP}" >> "${RECORD_FILE}"
@@ -77,13 +82,13 @@ if [ "$hdd_fstype" = "tmpfs" ]; then
 fi
 
 log "启动 stress，持续时间 1小时"
-stress --cpu $(nproc) --io 4 --vm 2 --vm-bytes 128M --hdd 2 --hdd-bytes 1G --timeout 3600s --verbose > "${OUTDIR}/stress_out.txt" 2>&1 &
+stress --cpu "$(nproc)" --io 4 --vm 2 --vm-bytes 128M --hdd 2 --hdd-bytes 1G --timeout 3600s --verbose > "${OUTDIR}/stress_out.txt" 2>&1 &
 STRESS_PID=$!
 
 log "stress PID=${STRESS_PID}"
 
 # 监控循环：每 CHECK_INTERVAL 秒检查本机响应与收集快照日志
-SECONDS_BEFORE=$(cat /proc/uptime | awk '{print $1}')
+SECONDS_BEFORE=$(awk '{print $1}' /proc/uptime)
 end_time=$(( $(date +%s) + 3600 ))
 failed=0
 
