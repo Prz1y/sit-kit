@@ -87,7 +87,7 @@ filter_multi_nvme_sequence_log()
     for rw in read write
     do
         echo "${rw}_test_data" >> filter_multi_nvme_${rw}.csv
-        printf \'%s\n\' "Model|FW,128k_1_32,,,128k_1_64,,,128k_1_128,,,128k_1_256,,,128k_1_512,,,4k_2_32,,,64k_2_32,,,256k_2_32,,,1m_2_32,,," >> filter_multi_nvme_${rw}.csv
+        printf '%s\n' "Model|FW,128k_1_32,,,128k_1_64,,,128k_1_128,,,128k_1_256,,,128k_1_512,,,4k_2_32,,,64k_2_32,,,256k_2_32,,,1m_2_32,,," >> filter_multi_nvme_${rw}.csv
         echo -n "," >> filter_multi_nvme_${rw}.csv
         for i in $(seq 1 9)
         do
@@ -120,7 +120,7 @@ filter_multi_nvme_random_log()
     for rw in randread randwrite
     do
         echo "${rw}_test_data" >> filter_multi_nvme_${rw}.csv  
-        printf \'%s\n\' "Model|FW,4k_1_1,,,4k_1_32,,,4k_2_32,,,4k_2_256,,,4k_4_32,,,4k_4_64,,,4k_8_1,,,4k_8_32,,,4k_8_64,,,4k_8_256,,,4k_16_64,,,\
+        printf '%s\n' "Model|FW,4k_1_1,,,4k_1_32,,,4k_2_32,,,4k_2_256,,,4k_4_32,,,4k_4_64,,,4k_8_1,,,4k_8_32,,,4k_8_64,,,4k_8_256,,,4k_16_64,,,\
 	8k_1_32,,,8k_4_64,,,8k_8_1,,,8k_8_32,,,8k_8_64,,,64k_2_32,,,128k_2_64,,,256k_2_32,,,1m_2_32,,," >> filter_multi_nvme_${rw}.csv
         echo -n "," >> filter_multi_nvme_${rw}.csv
         for i in $(seq 1 20)
@@ -167,7 +167,7 @@ filter_multi_ssd_sequence_log()
     for rw in read write
     do
         echo "${rw}_test_data" >> filter_multi_ssd_${rw}.csv
-        printf \'%s\n\' "Model|FW,128k_1_32,,,128k_1_64,,,128k_1_128,,,128k_1_256,,,128k_1_512,,,4k_2_32,,,64k_2_32,,,256k_2_32,,,1m_2_32,,," >> filter_multi_ssd_${rw}.csv
+        printf '%s\n' "Model|FW,128k_1_32,,,128k_1_64,,,128k_1_128,,,128k_1_256,,,128k_1_512,,,4k_2_32,,,64k_2_32,,,256k_2_32,,,1m_2_32,,," >> filter_multi_ssd_${rw}.csv
         echo -n "," >> filter_multi_ssd_${rw}.csv
         for i in $(seq 1 9)
         do
@@ -200,7 +200,7 @@ filter_multi_ssd_random_log()
     for rw in randread randwrite
     do
         echo "${rw}_test_data" >> filter_multi_ssd_${rw}.csv        
-        printf \'%s\n\' "Model|FW,4k_1_1,,,4k_1_32,,,4k_2_32,,,4k_2_256,,,4k_4_32,,,4k_4_64,,,4k_8_1,,,4k_8_32,,,4k_8_64,,,4k_8_256,,,4k_16_64,,,\
+        printf '%s\n' "Model|FW,4k_1_1,,,4k_1_32,,,4k_2_32,,,4k_2_256,,,4k_4_32,,,4k_4_64,,,4k_8_1,,,4k_8_32,,,4k_8_64,,,4k_8_256,,,4k_16_64,,,\
         8k_1_32,,,8k_4_64,,,8k_8_1,,,8k_8_32,,,8k_8_64,,,64k_2_32,,,128k_2_64,,,256k_2_32,,,1m_2_32,,," >> filter_multi_ssd_${rw}.csv
         echo -n "," >> filter_multi_ssd_${rw}.csv
         for i in $(seq 1 20)
@@ -247,7 +247,7 @@ filter_multi_hdd_sequence_log()
     for rw in read write
     do
         echo "${rw}_test_data" >> filter_multi_hdd_${rw}.csv
-        printf \'%s\n\' "Model|FW,4k_2_32,,,64k_2_32,,,256k_2_32,,,1m_1_32,,,1m_2_32,,," >> filter_multi_hdd_${rw}.csv
+        printf '%s\n' "Model|FW,4k_2_32,,,64k_2_32,,,256k_2_32,,,1m_1_32,,,1m_2_32,,," >> filter_multi_hdd_${rw}.csv
         echo -n "," >> filter_multi_hdd_${rw}.csv
         for i in $(seq 1 5)
         do
@@ -279,7 +279,7 @@ filter_multi_hdd_random_log()
 {
     # filter multi hdd randread result
     echo "randread_test_data" >> filter_multi_hdd_randread.csv
-    printf \'%s\n\' "Model|FW,4k_1_1,,,4k_1_4,,,4k_1_8,,,4k_1_16,,,8k_1_1,,,8k_1_32,,,4k_1_32,,,4k_2_32,,,64k_2_32,,,256k_2_32,,,1m_2_32,,," >> filter_multi_hdd_randread.csv
+    printf '%s\n' "Model|FW,4k_1_1,,,4k_1_4,,,4k_1_8,,,4k_1_16,,,8k_1_1,,,8k_1_32,,,4k_1_32,,,4k_2_32,,,64k_2_32,,,256k_2_32,,,1m_2_32,,," >> filter_multi_hdd_randread.csv
     echo -n "," >> filter_multi_hdd_randread.csv
     for i in $(seq 1 11)
     do
@@ -307,7 +307,7 @@ filter_multi_hdd_random_log()
 
     # filter multi hdd randwrite result
     echo "randwrite_test_data" >> filter_multi_hdd_randwrite.csv
-    printf \'%s\n\' "Model|FW,4k_1_1,,,4k_2_32,,,64k_2_32,,,256k_2_32,,,1m_2_32,,," >> filter_multi_hdd_randwrite.csv
+    printf '%s\n' "Model|FW,4k_1_1,,,4k_2_32,,,64k_2_32,,,256k_2_32,,,1m_2_32,,," >> filter_multi_hdd_randwrite.csv
     echo -n "," >> filter_multi_hdd_randwrite.csv
     for i in $(seq 1 5)
     do

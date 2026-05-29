@@ -23,7 +23,6 @@ BMC_PID=""
 
 check_device_safety() {
     local dev="$1"
-    local dev_name="${dev##*/}"
 
     if [ ! -b "$dev" ]; then
         echo "错误: 设备 $dev 不存在或不是块设备"

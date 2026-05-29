@@ -70,6 +70,8 @@ do
 		IS_NVME_BIND_CPUS_BASE_SEQ=true;;
 		N)
 		IS_NVME_BIND_CPUS_BASE_RAND=true;;
+			*)
+			usage;;
 	esac
 done
 
