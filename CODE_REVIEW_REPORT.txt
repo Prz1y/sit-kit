@@ -1,0 +1,862 @@
+# SIT-Kit 代码库全量审查报告
+
+**审查日期**: 2026-05-27
+**审查范围**: sit-kit 全部脚本 (43 个 Shell 脚本 + 1 个 Python 脚本)
+**审查维度**: 语法错误、逻辑错误、安全问题、错误处理、资源管理、ShellCheck、可移植性、代码质量
+
+> **说明**: 本报告仅列出所有已确认的问题及对应的修复建议。每条修复建议均经过交叉验证，确保不会引入新问题。
+
+---
+
+## 一、全局共性问题
+
+以下问题在多个文件中反复出现，集中说明一次，后文各文件中引用编号即可。
+
+### G1. 缺少 `set -euo pipefail`
+
+大多数脚本仅有 `set -o pipefail`（缺少 `-e` 和 `-u`），或完全没有严格模式。命令失败时脚本静默继续。
+
+**修复**: 在 shebang 后添加 `set -euo pipefail`。对允许失败的命令显式使用 `|| true`。
+
+> **注意**: 添加 `set -e` 前需检查脚本中所有 `grep`（未匹配时返回 1）、`command -v`（不存在时返回 1）、`wait`（子进程失败时返回非零）等命令，确保它们都有 `|| true` 保护，否则脚本会在这些位置意外退出。
+
+**受影响文件**: `mixed_pressure_7x24.sh`(缺 `-e`)、`run_parallel_disk.sh`、`raw_disk_fio_test.sh`、`multi_disk_log_filter.sh`、`only_precondition_for_multi_ssd.sh`、`hdd_fio_stress_test.sh`、`hdd_raw_fio_test.sh`、`ssd_fio_stress_test.sh`、`ssd_raw_fio_test.sh`、`cpubind_for_running_parallel_nvme.sh`、`nvme_raw_fio_test_with_cpubind.sh`、`Sangfor_mem_test_autorun.sh`、`memtester_stress_ce_disabled.sh`、`stressapptest_stress_ce_disabled.sh`、`spdk_perf_multi.sh`、`nvme_snia_sss_pts_test_suite.sh`、`nvme-fw-upgrade-downgreade-test-no-io.sh`、`nvme_driver_visible_check.sh`、`nvme_hotplug_unified.sh`、`nvme_info_query.sh`(仅 `set -o pipefail`)、`stress1h.sh`、`run_iozone.sh`、`os_management_test.sh`、`network_perf_test.sh`、`fio_test.sh`、`iperf_test.sh`、`cli-test-cript.sh`、`cdm-fio-for-usb3test.sh`、`10G-cptime.sh`、`HCA_iperf_stress.sh`、`rdma_client.sh`、`rdma_server.sh`、`A_run.sh`(仅 `set -e`)、`B_run.sh`(仅 `set -e`)、`collect_system_logs.sh`、`ltp_stress_server.sh`、`os-log-clean.sh`、`trace_player_autorun.sh`、`collect_ppu_monitor.sh`(缺 `-e`)
+
+### G2. 变量引用未加双引号
+
+大量变量使用 `$var` 而非 `"$var"`，当变量含空格或特殊字符时会导致 word splitting 和 glob 展开（ShellCheck SC2086）。
+
+**修复**: 统一加双引号。对于**故意利用 word splitting** 的场景（如 `raw_disk_fio_test.sh` 中的 `PARA_LINE`），应改为数组。
+
+**受影响文件**: 几乎所有脚本。最严重的集中在 `raw_disk_fio_test.sh`、`run_parallel_disk.sh`、`A_run.sh`、`B_run.sh`、`HCA_iperf_stress.sh`、`mixed_pressure_7x24.sh`。
+
+### G3. 缺少 trap 信号处理
+
+多个脚本启动了后台进程（fio、iostat、memtester、stress-ng 等）但未设置 trap。脚本被中断后后台进程成为孤儿。
+
+**修复**: 在后台进程启动前添加 `trap 'cleanup' EXIT INT TERM`，`cleanup()` 函数中 kill 所有已注册的 PID。
+
+**受影响文件**: `nvme_storage_perf.sh`、`run_parallel_disk.sh`、`raw_disk_fio_test.sh`、`only_precondition_for_multi_ssd.sh`、`memtester_stress_ce_disabled.sh`、`stressapptest_stress_ce_disabled.sh`、`nvme-fw-upgrade-downgreade-test-no-io.sh`、`run_iozone.sh`、`os_management_test.sh`、`cli-test-cript.sh`、`cdm-fio-for-usb3test.sh`、`10G-cptime.sh`
+
+### G4. `cat file | grep pattern` 无用 cat (UUOC)
+
+**修复**: 改为 `grep pattern file`。
+
+**受影响文件**: `multi_disk_log_filter.sh`(大量)、`run_parallel_disk.sh`(多处)、`mixed_pressure_7x24.sh`、`memtester4h.sh`、`collect_system_logs.sh`、`stress1h.sh`
+
+### G5. 硬编码设备路径
+
+**受影响文件与修复**:
+| 文件 | 硬编码值 | 修复 |
+|------|---------|------|
+| `fio_test.sh` L8 | `/dev/sdb` | 改为 `${1:-/dev/sdb}` 支持参数传入 |
+| `cdm-fio-for-usb3test.sh` L6 | `/dev/sdb` | 同上 |
+| `nvme-fw-upgrade-downgreade-test-no-io.sh` L29 | `/dev/nvme0n1` | 改为可配置变量 |
+
+### G6. `sleep 30s` GNU 后缀
+
+`s` 后缀是 GNU coreutils 扩展，非 POSIX 标准。
+
+**修复**: 改为 `sleep 30`。
+
+**受影响文件**: `run_parallel_disk.sh`(多处)、`raw_disk_fio_test.sh`(大量)、`only_precondition_for_multi_ssd.sh`、`hdd_raw_fio_test.sh`、`ssd_raw_fio_test.sh`
+
+---
+
+## 二、ali-qual-script/
+
+---
+
+### 2.1 mixed_pressure_7x24.sh
+
+**文件**: `ali-qual-script/mixed_pressure_7x24.sh` (1228 行)
+
+| # | 行号 | 严重程度 | 类别 | 问题 | 修复建议 |
+|---|------|---------|------|------|---------|
+| MP-1 | 3 | Critical | 错误处理 | `set -uo pipefail` 缺少 `-e`。作为 root 权限下 168 小时长时间运行的压测脚本，命令失败后静默继续可能导致资源泄漏和测试结果不可信。 | 改为 `set -euo pipefail`。注意: 第 170 行 `swapon --noheadings`、第 174 行 `awk`、第 819 行 `swapoff -a` 已有 `\|\| true`，grep 调用也都通过管道到 awk 不会直接触发 errexit。 |
+| MP-2 | 60-62 | Critical | 安全性 | `source "$CONF_FILE"` 直接执行外部配置文件中的任意 shell 代码。如果配置文件被篡改或路径被注入，可以 root 权限执行任意命令。 | 在 `source` 前验证文件所有者: `conf_owner=$(stat -c '%U' "$CONF_FILE" 2>/dev/null); if [ "$conf_owner" != "root" ]; then log_warn "配置文件所有者非root: $conf_owner"; fi`。如果安全性要求更高，改用 `read` + 白名单解析替代 `source`。 |
+| MP-3 | 279 | Major | 安全性 | `echo "$d" \| grep -q "^${b}"` 中 `$b` 作为正则表达式使用。如果 `$SYSTEM_DISK_BASES` 被配置文件注入了含正则特殊字符的值（如 `.`、`*`），会导致非预期匹配。 | 改为 bash 前缀比较: `[[ "$d" == "${b}"* ]] && return 0`，完全不经过正则引擎。 |
+| MP-4 | 785, 967 | Major | 资源管理 | `exec &> >(tee -a ...)` 使用进程替换创建异步 tee 子进程。脚本退出时 tee 可能未刷新缓冲区，导致最后几行日志丢失。do_stop() 中 L967 再次执行 exec 重定向会创建第二个 tee 进程，旧的可能泄漏。 | do_stop() 中移除 L967 的 `exec &> >(...)` 调用（此时不需要重新重定向）。在 do_stop() 末尾添加 `sleep 1` 等待 tee 刷新。 |
+| MP-5 | 789-790, 955, 958-963 | Major | 竞态条件 | EXIT trap (L790) 与显式 do_stop() 调用 (L955) 共存。`__STOPPING` 全局变量作为互斥锁，但 trap 在子 shell 中执行时，对 `__STOPPING` 的修改是否对主进程可见取决于 bash 版本和执行上下文。如果锁失效，do_stop() 会执行两次。 | 改用文件锁: `local stop_lock="${LOG_DIR}/.stop_lock"; [ -f "$stop_lock" ] && return 0; touch "$stop_lock"`，函数末尾 `rm -f "$stop_lock"`。 |
+| MP-6 | 1114 | Major | ShellCheck | `date -d @$(cat "${LOG_DIR}/.end_timestamp")` 中 `$(cat ...)` 未加引号，如果文件内容含空格会被分词。 | 改为 `date -d "@$(cat "${LOG_DIR}/.end_timestamp")"` |
+| MP-7 | 1164-1170 | Major | ShellCheck | `do_status()` 中 L1164 声明 `local total_kb free_kb avail_kb swap_used_kb`，但 L1168-1169 使用的 `swap_total_kb` 和 `swap_free_kb` 未在 local 声明中。它们会成为隐式全局变量。 | 改为 `local total_kb free_kb avail_kb swap_total_kb swap_free_kb swap_used_kb` |
+| MP-8 | 265, 278, 298, 311, 851 | Minor | ShellCheck | 多个函数内 `for` 循环变量（`sd`、`b`、`disk`、`part`）未声明 `local`，会泄漏到函数外部成为全局变量。 | 在各函数开头添加 `local sd; local b; local disk; local part` 等声明。 |
+| MP-9 | 621, 652 | Minor | ShellCheck | `exit_code` 在 `start_stress_cpu` 和 `start_stress_vm` 中赋值但未声明 `local`。 | 添加 `local exit_code`。 |
+| MP-10 | 486, 490 | Minor | ShellCheck | `local start_ts=$(date '+%s')` 中 `local` 的退出码（始终为 0）会覆盖 `date` 命令的退出码。在 `set -e` 下，如果 `date` 失败不会被检测到。 | 分离声明和赋值: `local start_ts; start_ts=$(date '+%s')` |
+| MP-11 | 148, 155, 1057 | Minor | 可移植性 | 硬编码 `/var/log/messages`，这是 RHEL/CentOS 特有路径。Debian/Ubuntu 使用 `/var/log/syslog`。 | 当前已有 `-f` 检查，如果需要跨平台可增加 `/var/log/syslog` 检测。 |
+| MP-12 | 440-503, 1164-1176 | Minor | 代码重复 | 从 `/proc/meminfo` 读取内存信息的代码在 `collect_mem_stats`、`start_csv_monitor`、`do_status` 中重复了三次。 | 抽取公共函数 `read_meminfo_field()` 传入字段名返回值。 |
+| MP-13 | 820-822 | Minor | ShellCheck | `swap_total=$(free -m \| awk '/Swap/{print $2}')` 如果 `free` 命令失败 swap_total 为空，在 `set -u` 下后续 `[ "$swap_total" = "0" ]` 会报错。 | 改为 `[ "${swap_total:-0}" = "0" ]`。 |
+
+---
+
+### 2.2 nvme_storage_perf.sh
+
+**文件**: `ali-qual-script/nvme_storage_perf.sh` (407 行)
+
+| # | 行号 | 严重程度 | 类别 | 问题 | 修复建议 |
+|---|------|---------|------|------|---------|
+| SP-1 | 172-173, 187-188 | Critical | 资源管理 | `run_fio()` 在后台启动 iostat (L172)，fio 完成后 kill 它 (L187)。但如果脚本被 Ctrl+C 中断，iostat 成为孤儿进程持续写入磁盘。脚本未设置任何 trap。 | 在 `main()` 开头添加 `trap 'kill 0 2>/dev/null' EXIT INT TERM`。 |
+| SP-2 | 185 | Major | 错误处理 | `fio ... 2>&1 \|\| log_warn "fio 退出码非0"` 仅输出警告，不中断测试。如果设备故障导致 fio 失败，后续测试仍会继续，产生不可靠的结果。 | 改为: `fio ... 2>&1 \|\| { rc=$?; log_error "fio 失败 (退出码: ${rc}): ${json_out}"; kill "$iostat_pid" 2>/dev/null; wait "$iostat_pid" 2>/dev/null; return $rc; }` |
+| SP-3 | 134 | Minor | ShellCheck | `cat ${LOG_DIR}/os_log_clean_marker.txt` 中 `${LOG_DIR}` 未加引号。 | 改为 `cat "${LOG_DIR}/os_log_clean_marker.txt"` |
+| SP-4 | 106-127, 332-353 | Minor | 代码重复 | `smart_standard1_collect` 和 `smart_standard2_collect` 逻辑几乎完全相同，仅文件名前缀和日志消息不同。 | 合并为 `collect_smart_logs()` 函数，接受 `prefix` 和 `label` 参数。 |
+| SP-5 | 205-235, 260-290 | Minor | 代码重复 | `run_single_disk_tests` 和 `run_multi_disk_tests` 中构建测试矩阵的代码完全相同。 | 抽取 `build_test_matrix()` 函数返回测试数组。 |
+
+---
+
+### 2.3 kdump_auto_test/kdump_auto_test.py
+
+**文件**: `ali-qual-script/kdump_auto_test/kdump_auto_test.py` (711 行)
+
+| # | 行号 | 严重程度 | 类别 | 问题 | 修复建议 |
+|---|------|---------|------|------|---------|
+| KT-1 | 128, 181 | Critical | 安全性 | `sshpass -p self.ssh_pass` 和 `ipmitool -P self.bmc_pass` 将密码以明文传到命令行参数，同一台机器上执行 `ps aux` 的用户都能看到密码。 | SSH: 使用环境变量 `SSHPASS` + `sshpass -e`。ipmitool: 使用 `-f` 从密码文件读取，或 `-E` 从环境变量读取。 |
+| KT-2 | 292-314 | Major | 错误处理 | `step1_ensure_kdump_service()` 无论 kdump 是否正常启动都返回 `True` (L314)。后续 Step 4 的 crash 触发依赖 kdump 正常工作，如果 kdump 未启动，整个测试毫无意义地继续执行。 | L311-313 改为: `if ret != 0 and "active" not in out.lower(): logger.error("[Step 1] kdump 服务启动失败"); return False`。 |
+| KT-3 | 456-527 | Major | 错误处理 | `step5_trigger_crash()` 无论 crash 是否成功触发都返回 `True` (L527)。如果 ipmitool 执行失败或 SSH 连接断开，函数仍返回成功。 | L495 之后添加: `if ret != 0: logger.error(f"[Step 5] 带外触发失败: {err}"); return False` |
+| KT-4 | 198-236, 565-647 | Major | 资源管理 | `run_full_test()` 中如果在 Step 4 之后、Step 6 之前发生未捕获异常，SOL 会话不会被正确终止，`ipmitool sol activate` 进程残留。 | 将 `run_full_test` 中 try/finally 包裹: `try: ... finally: self.stop_sol_session()` |
+| KT-5 | 651-653 | Major | 输入验证 | `--sut-ip` 和 `--bmc-ip` 参数未做任何 IP 格式验证。无效 IP 会导致 SSH 和 ipmitool 命令长时间挂起（直到超时），浪费大量测试时间。 | 添加 `import ipaddress; try: ipaddress.ip_address(args.sut_ip) except ValueError: logger.error(...); sys.exit(1)` |
+| KT-6 | 694-704 | Major | 错误处理 | `--skip-config` 模式下忽略了 `step5`、`analyze_sol_log`、`wait_ssh_ready`、`step6_verify_vmcore` 的所有返回值。脚本退出码始终为 0（隐式），与非 skip-config 路径（返回 0 或 1）行为不一致。 | 改为跟踪 all_passed 变量，最后 `sys.exit(0 if all_passed else 1)`。 |
+| KT-7 | 183 | Major | 健壮性 | `full_cmd = base + command.split()` 使用字符串分割构建命令参数，不支持含空格的参数。 | 改为 `def ipmitool(self, args_list: list, timeout=30)`，调用处传入列表。 |
+| KT-8 | 87-92 | Minor | 日志质量 | 日志仅输出到 stdout，未写入文件。SOL 串口日志写入了文件，但测试控制机自身的日志仅存在于终端输出中。 | 添加 `logging.FileHandler("kdump_test.log")`。 |
+| KT-9 | 397-398, 449 | Minor | 可配置性 | `crashkernel=512M` 硬编码。对小内存系统（如 4GB）分配 512M 过多，对大内存系统（如 2TB）可能不够。 | 添加 `--crashkernel-size` 命令行参数，默认 512M。 |
+
+---
+
+## 三、modified_scripts/multi_disk_fio_scripts-V0.4/
+
+---
+
+### 3.1 run_parallel_disk.sh
+
+**文件**: `modified_scripts/multi_disk_fio_scripts-V0.4/run_parallel_disk.sh` (453 行)
+
+| # | 行号 | 严重程度 | 类别 | 问题 | 修复建议 |
+|---|------|---------|------|------|---------|
+| RP-1 | 232 | Critical | 数据安全 | `nvme format "/dev/$dev"` 会销毁设备上所有数据。虽有 `ALLOW_NVME_FORMAT` 环境变量控制，但无确认提示和审计日志。 | 添加操作前确认（非 --batch 模式下），记录格式化操作到审计日志文件。 |
+| RP-2 | 250, 276, 300, 320, 344, 368, 388, 412 | Major | ShellCheck | `nohup &>/dev/null ./ssd_raw_fio_test.sh $dev &` 中 `$dev` 未加引号。设备名来自文件内容，通常安全但不规范。 | 改为 `nohup ./ssd_raw_fio_test.sh "$dev" &>/dev/null &` |
+| RP-3 | 121-135 | Major | Bug | `ssd_cap_set()` 中 `diskCapDigit` 和 `diskCapUnit` 在 `if [[ $rotationRate =~ "Solid State Device" ]]` 分支内赋值，但在该分支外部使用。如果当前设备不是 SSD，变量保留上一次循环的值，导致 HDD 设备被写入错误容量到 `sata_ssd_cap`。 | 在循环开始处重置: `diskCapDigit=""; diskCapUnit=""` |
+| RP-4 | 248-252, 274-278 等多处 | Major | 错误处理 | 并行启动多个 `nohup ... &` 后调用 `wait`，但未检查任何子进程的退出状态。 | 改为: `pids=(); for dev in ...; do ... & pids+=($!); done; for pid in "${pids[@]}"; do wait "$pid" \|\| echo "WARNING: $pid failed" >&2; done` |
+| RP-5 | 250, 276 等 | Major | 路径安全 | 调用子脚本使用 `./ssd_raw_fio_test.sh` 相对路径，依赖 `cd "$CPWD"` 成功。 | 改为绝对路径 `"$CPWD/ssd_raw_fio_test.sh"`。 |
+| RP-6 | 119, 123, 144 | Major | ShellCheck | `grep -Evw $os_disk_symbol`、`smartctl -i $i`、`grep -v $os_nvme_symbol` 变量均未加引号。 | 统一加引号: `grep -Evw -- "$os_disk_symbol"`、`smartctl -i "$i"`、`grep -v -- "$os_nvme_symbol"` |
+| RP-7 | 11 | Minor | 错误处理 | `cd "$CPWD"` 未检查返回值。 | 改为 `cd "$CPWD" \|\| { echo "ERROR" >&2; exit 1; }` |
+| RP-8 | 27 | Minor | 命名 | `IS_NVME_PARALLER_WITH_CPUSBIND` 中 "PARALLER" 应为 "PARALLEL"。 | 修正拼写（注意同步修改 L59 和 L431 的引用）。 |
+| RP-9 | 87 | Minor | ShellCheck | `os_disk_symbol=$(echo $(lsblk \| ...))` 外层 `echo $(...)` 是无用的 echo。 | 移除外层 echo。 |
+| RP-10 | 107, 142 | Minor | 逻辑错误 | `os_nvme_symbol=null` 使用字符串 "null" 作为哨兵值传给 `grep -v -- "null"`。如果设备名或固件中包含 "null" 字样会被误排除。 | 改为 `os_nvme_symbol='^$'`（匹配空行，实际上不可能匹配设备名）。 |
+| RP-11 | 192 | Minor | ShellCheck | `ls -l /sys/class/nvme \| grep -w $dev` 中 `$dev` 未加引号。 | 加引号。 |
+| RP-12 | 427-452 | Minor | 可读性 | `if ${IS_NVME_PARALLEL};then` 使用布尔变量作为命令执行是 Bash 技巧，但可读性差。 | 改为 `if [[ "${IS_NVME_PARALLEL}" == "true" ]]; then`。 |
+
+---
+
+### 3.2 raw_disk_fio_test.sh
+
+**文件**: `modified_scripts/multi_disk_fio_scripts-V0.4/raw_disk_fio_test.sh` (677 行)
+
+| # | 行号 | 严重程度 | 类别 | 问题 | 修复建议 |
+|---|------|---------|------|------|---------|
+| RD-1 | 81-85 | Major | ShellCheck | `PARA_LINE` 和 `PARA_LINE1` 是字符串变量，设计为通过 word splitting 展开为多个 fio 参数。这种模式极其脆弱——如果参数值中包含空格或特殊字符会断裂。 | 改为数组: `PARA_LINE=(--end_fsync=0 --group_reporting --direct=1 "--ioengine=${IO_ENGINE}" --thread --time_based ...)`，使用时 `"${PARA_LINE[@]}"`。**注意**: 改为数组后需检查所有使用 `${PARA_LINE}` 的地方都改为 `"${PARA_LINE[@]}"`，不要遗漏。 |
+| RD-2 | 73 | Major | 安全性 | `$DEV_LIST` 来自用户输入 `-d` 参数，直接用于构造 `/dev/${DEV_LIST}` 路径，无任何合法性校验。 | 添加校验: `if [[ ! "$DEV_LIST" =~ ^(sd[a-z]+\|nvme[0-9]+n[0-9]+\|vd[a-z]+)$ ]]; then echo "Invalid device" >&2; exit 1; fi` |
+| RD-3 | 530 | Major | Bug | `rm -f hdd_${DEV_LIST}_randread.log ssd_${DEV_LIST}_randwrite.log` 中 randwrite 日志清理使用了 `ssd_` 前缀。这是拷贝粘贴错误，导致 HDD randwrite 旧日志不会被清理。 | 改为 `rm -f "hdd_${DEV_LIST}_randread.log" "hdd_${DEV_LIST}_randwrite.log"` |
+| RD-4 | 604-605 | Minor | 逻辑错误 | `--readwrite=randread` 但 `--name=${DEV_LIST}_4k_randwrite_stress`，name 与实际操作不匹配，会导致日志解析混淆。 | 改为 `--name=${DEV_LIST}_4k_randread_stress`。 |
+| RD-5 | 613 | Minor | 逻辑错误 | `--readwrite=randrw --rwmixread=70` 但 `--name=${DEV_LIST}_4k_randwrite_stress`，name 不匹配。 | 改为 `--name=${DEV_LIST}_4k_mixrw_stress`。 |
+| RD-6 | 629-630 | Minor | 逻辑错误 | 同 RD-4，`--readwrite=randread` 但 name 为 `randwrite`。 | 改为 `--name=${DEV_LIST}_4k_randread_stress`。 |
+| RD-7 | 21 | Minor | ShellCheck | `cd "$CPWD"` 未检查返回值。 | 添加 `\|\| exit 1`。 |
+| RD-8 | 89, 99 | Minor | ShellCheck | `local nvme_block_symbol=$1` 中 `local` 和赋值在同一行，`local` 会掩盖退出码。 | 分离声明和赋值。 |
+| RD-9 | 108, 119, 141, 157 | Minor | ShellCheck | `cat sata_ssd_cap \| sort -u \| wc -l` 等多处 UUOC。 | 改为 `sort -u sata_ssd_cap \| wc -l`。 |
+| RD-10 | 185, 227, 394, 502, 530 等大量行 | Minor | ShellCheck | `rm -f ssd_${DEV_LIST}_xxx.log` 等多处 `$DEV_LIST` 未加引号。 | 统一加引号。 |
+| RD-11 | 190, 232 | Minor | ShellCheck | `local bind_node_id=$(get_nvmebind_node_id $DEV_LIST)` 中 `$DEV_LIST` 未加引号。 | 加引号。 |
+| RD-12 | 203-204, 216-217 等大量行 | Minor | ShellCheck | `numactl -N $bind_node_id $numa_mem_opt $path_to_fio --readwrite=${RW} --bs=${BS} ...` 大量变量未加引号。 | 统一加引号。**注意**: `$numa_mem_opt` 如果为空字符串且加了引号，会传一个空参数给 numactl，可能导致错误。需要改为数组: `local -a numa_opts=(); if [[ "${ENABLE_NUMA_MEMBIND:-0}" == "1" ]]; then numa_opts=(-m "$bind_node_id"); fi; numactl -N "$bind_node_id" "${numa_opts[@]}" "$path_to_fio" ...` |
+| RD-13 | 647-676 | Minor | 可读性 | `if ${IS_SSD_STRESS};then` 使用布尔变量作为命令执行。 | 改为 `if [[ "${IS_SSD_STRESS}" == "true" ]]; then`。 |
+
+---
+
+### 3.3 multi_disk_log_filter.sh
+
+**文件**: `modified_scripts/multi_disk_fio_scripts-V0.4/multi_disk_log_filter.sh` (352 行)
+
+| # | 行号 | 严重程度 | 类别 | 问题 | 修复建议 |
+|---|------|---------|------|------|---------|
+| ML-1 | 102-107, 137-142, 182-187 等大量行 | Minor | ShellCheck | `cat ssd_${dev}_${rw}.log \| grep -A4 ...` 在每个 pattern 循环中重复读取同一日志文件，大量 UUOC，且性能差。 | 改为 `grep -A4 "${rw}_${pattern}:\ (groupid=" "ssd_${dev}_${rw}.log"` 直接读取文件。 |
+| ML-2 | 89, 122, 169, 202, 249, 281, 309 | Minor | 兼容性 | `echo -e` 在不同 Shell 上行为不一致。 | 改为 `printf '%s\n' "..."`。 |
+| ML-3 | 46 | Minor | ShellCheck | `os_disk_symbol=$(echo $(lsblk \| ...))` UUOE。 | 移除外层 echo。 |
+| ML-4 | 80, 160, 240 | Minor | 错误处理 | `cat file1 file2 ... > result.csv` 如果某个输入文件不存在会报错。 | 添加存在性检查或 `cat file1 file2 ... 2>/dev/null > result.csv`。 |
+| ML-5 | 281 | Minor | 命名 | `8k_1_1_` 中有尾部下划线，与列表中其他项（`8k_1_32`）风格不一致。 | 确认是否应为 `8k_1_1`，修正表头。 |
+
+---
+
+### 3.4 only_precondition_for_multi_ssd.sh
+
+**文件**: `modified_scripts/multi_disk_fio_scripts-V0.4/only_precondition_for_multi_ssd.sh` (155 行)
+
+| # | 行号 | 严重程度 | 类别 | 问题 | 修复建议 |
+|---|------|---------|------|------|---------|
+| OP-1 | 117 | Critical | 数据安全 | `nvme format "/dev/$dev"` 直接执行格式化，缺少审计日志。 | 同 RP-1 建议，添加审计日志。 |
+| OP-2 | 91, 98 | Minor | 日志 | `ssd_fragment_sequence "$dev" &>/dev/null &` 丢弃所有输出，失败时无诊断信息。 | 改为重定向到日志文件: `&>"sata_precondition_log/${dev}_fragment1.log" &`。 |
+| OP-3 | 56 | Minor | 逻辑错误 | `os_nvme_symbol=null` 哨兵值问题，同 RP-10。 | 同 RP-10 修复。 |
+
+---
+
+### 3.5 wrapper 脚本（6 个）
+
+**文件**: `hdd_fio_stress_test.sh`、`hdd_raw_fio_test.sh`、`ssd_fio_stress_test.sh`、`ssd_raw_fio_test.sh`、`cpubind_for_running_parallel_nvme.sh`、`nvme_raw_fio_test_with_cpubind.sh`
+
+| # | 文件 | 行号 | 严重程度 | 类别 | 问题 | 修复建议 |
+|---|------|------|---------|------|------|---------|
+| WP-1 | `hdd_raw_fio_test.sh`、`ssd_raw_fio_test.sh` | 15, 19 | Minor | 兼容性 | `sleep 30s` 使用 GNU 后缀。 | 改为 `sleep 30`。 |
+
+这 6 个 wrapper 脚本整体写法规范，仅有上述 `sleep` 后缀的小问题。
+
+---
+
+## 四、memory-test-script/
+
+---
+
+### 4.1 memory_pressure_test.sh
+
+**文件**: `memory-test-script/memory_pressure_test.sh`
+
+| # | 行号 | 严重程度 | 类别 | 问题 | 修复建议 |
+|---|------|---------|------|------|---------|
+| MPa-1 | 183 | Critical | 进程管理 | `pkill -f "memtester"` 会匹配系统中所有命令行包含 "memtester" 的进程，包括不属于本脚本的实例。 | 改为基于 PID 文件终止: 读取 `$MEMTESTER_PID_FILE` 中的 PID，先 `kill -- -"$pid"` 杀进程组（包括 timeout -> memtester -> pipe 链），再 `kill "$pid"` 作为兜底。 |
+| MPa-2 | 117-120 | Major | 进程管理 | `nohup timeout 172800 memtester ... 2>&1 \| tr -d '\b' \| grep -vE '...' > "$MEMTESTER_LOG" &` 中 `$!` 获取的是管道最后一个命令（grep）的 PID，而非 memtester 的 PID。用此 PID 执行 kill 时只会杀掉 grep，memtester 成为孤儿继续运行。 | 拆分为两步: 先直接启动 `timeout 172800 memtester "${test_mb}M" > "${LOG_DIR}/memtester_raw.log" 2>&1 &` 获取真实 PID 写入 PID 文件，再用独立的 `tail -f \| tr \| grep` 做后处理。 |
+| MPa-3 | 37 | Major | 竞态条件 | `pgrep -f "memtester"` 模糊匹配可能误判其他进程为本测试正在运行。 | 改为 PID 文件 + `kill -0` 验证，再用 `grep -q "memtester" "/proc/$pid/cmdline"` 确认进程身份。 |
+| MPa-4 | 59-60 | Major | 数据安全 | `dmesg -C` 和清空 `/var/log/messages` 在测试开始前清除了内核环形缓冲区。如果在此之前系统已发生内存错误，关键诊断信息永久丢失。 | 清除前先备份: `dmesg > "${LOG_DIR}/dmesg_before_clear.log" 2>/dev/null \|\| true`。 |
+| MPa-5 | 157-169 | Major | 竞态条件 | PID TOCTOU: 从 PID 文件读取 PID 后通过 `kill -0` 检查存活再 `kill`。在检查和杀死之间，PID 可能已被重用给不相关进程。 | 读取 PID 时同时验证 `/proc/$pid/cmdline` 是否包含 "memtester"。 |
+| MPa-6 | 93 | Minor | 测试正确性 | `swapoff -a 2>/dev/null \|\| true` 即使 swap 关闭失败也继续。内存压力测试需要 swap 关闭才能准确测试物理内存压力。 | 改为 swap 关闭失败时输出明确警告: `if ! swapoff -a 2>/dev/null; then echo "[WARN] swap 关闭失败，测试结果可能不准确" >&2; fi`。 |
+| MPa-7 | 247 | Minor | 日志质量 | `grep -ciE "error\|fail\|warn\|BUG\|Call Trace\|Oops"` 中 `warn` 过于宽泛，匹配 "firmware warning"、"thermal warning" 等正常日志。 | 改为 `\bwarn\b` 或移除 `warn` 仅保留 `warning\|WARN`。 |
+
+---
+
+### 4.2 Sangfor_mem_test_autorun.sh
+
+**文件**: `memory-test-script/Sangfor_mem_test_autorun.sh`
+
+| # | 行号 | 严重程度 | 类别 | 问题 | 修复建议 |
+|---|------|---------|------|------|---------|
+| SA-1 | 1 | Critical | 错误处理 | 完全无 `set -euo pipefail`。`cd` 失败后脚本继续在错误目录执行 `sed -i` 修改配置文件。 | 添加 `set -euo pipefail`。**注意**: 需要检查 L58-62 的条件赋值（`if [ -f /var/log/messages ]`）和 L106 的 `cp log/*.log` 等位置，确保 grep/ls 返回非零时不会意外退出。 |
+| SA-2 | 7 | Critical | 路径安全 | `cd common-all-all-server-hw-eccmem` 使用相对路径且无错误检查。如果从非预期目录运行脚本，`cd` 失败后后续 `sed -i` 和 `cp` 会在错误目录操作。 | 改为: `SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"; cd "${SCRIPT_DIR}/common-all-all-server-hw-eccmem" \|\| { echo "ERROR" >&2; exit 1; }` |
+| SA-3 | 50-91 | Major | 竞态条件 | 后台进程在 L50、L55、L61、L74 陆续启动，但 `trap on_interrupt INT TERM` 直到 L91 才设置。如果在 L50-90 之间收到信号，所有后台进程成为孤儿。 | 将 trap 移到第一个后台进程启动之前（L41 之前）。在 `on_interrupt` 中用 `${VAR:-}` 保护可能未初始化的变量。 |
+| SA-4 | 45 | Major | 数据安全 | `sed -i 's/scan_time = [0-9]*/scan_time = 0/' eccmem.conf` 直接原地修改配置文件无备份，测试中断后无法恢复原始值。 | 改为 `sed -i.bak` 创建备份，或在脚本结束时 `cp eccmem.conf.bak eccmem.conf` 恢复。 |
+| SA-4b | 34-39 | Major | 变量安全 | `cleanup_processes` 中 L35 使用了 `${MESSAGES_PID:-}` 默认值语法，但 L36-38 的 `$DMESG_PID`、`$ECCMEM_PID`、`$BMC_PID` 未使用。如果 trap 在变量赋值之前触发且启用 `set -u`，会报错退出。 | 统一使用 `${VAR:-}` 保护。 |
+| SA-5 | 49 | Minor | 兼容性 | `timeout 3h` 使用 GNU coreutils 的小时后缀。 | 改为 `timeout 10800`。 |
+| SA-6 | 79 | Minor | 变量安全 | `echo "messages 监控 PID: $MESSAGES_PID"` 如果变量未设置会在 `set -u` 下报错。 | 改为 `${MESSAGES_PID:-未启动}`。 |
+| SA-7 | 102 | Minor | 代码质量 | 步骤编号从 5 直接跳到 8，缺少步骤 6、7 的标注。 | 补全或重编号。 |
+
+---
+
+### 4.3 memtester_stress_ce_disabled.sh
+
+**文件**: `memory-test-script/memtester_stress_ce_disabled.sh`
+
+| # | 行号 | 严重程度 | 类别 | 问题 | 修复建议 |
+|---|------|---------|------|------|---------|
+| ME-1 | 全文 | Major | 资源管理 | 脚本没有设置 trap。`dmesg -C` 已清除内核缓冲区，测试中断后日志丢失。 | 添加 `trap 'dmesg > "${LOG_DIR:-/tmp}/dmesg.log" 2>/dev/null; exit 130' INT TERM`。 |
+| ME-2 | 104-105 | Major | 命令注入 | `awk "BEGIN {printf \"%d\", ${mem_total_mb} * ${MEM_RATIO}}"` 将 shell 变量直接嵌入 awk 程序字符串。如果变量包含非数字字符会导致 awk 表达式出错。 | 改为 `awk -v total="$mem_total_mb" -v ratio="$MEM_RATIO" 'BEGIN {printf "%d", total * ratio}'`。 |
+| ME-3 | 92 | Minor | ShellCheck | `echo -e "  CE阈值:   $(echo -e "$ce_status")"` 双重 echo -e 可能导致二次转义。 | 改为 `echo -e "  CE阈值:   ${ce_status}"`。 |
+| ME-4 | 113 | Minor | 自动化 | `read -p "确认已完成BIOS配置，按Enter继续..."` 阻塞自动化/CI 执行。 | 添加 `-y` 参数跳过: `if [ "${1:-}" != "-y" ]; then read -p "..."; fi`。 |
+| ME-5 | 全文 | Minor | 日志质量 | ANSI 颜色码在重定向到文件时不可读。 | 检测终端: `if [ -t 1 ]; then RED='\033[0;31m'; ... else RED=''; ... fi`。 |
+
+---
+
+### 4.4 stressapptest_stress_ce_disabled.sh
+
+**文件**: `memory-test-script/stressapptest_stress_ce_disabled.sh`
+
+| # | 行号 | 严重程度 | 类别 | 问题 | 修复建议 |
+|---|------|---------|------|------|---------|
+| ST-1 | 全文 | Major | 资源管理 | 同 ME-1，无 trap。 | 同 ME-1 建议。 |
+| ST-2 | 76-77 | Major | 命令注入 | 同 ME-2，awk 变量注入。 | 同 ME-2 建议。 |
+| ST-3 | 63 | Major | 路径安全 | `if [ -x "./stressapptest" ]` 依赖当前工作目录而非脚本所在目录。从其他目录运行时会找不到二进制。 | 改为 `SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"; if [ -x "${SCRIPT_DIR}/stressapptest" ]; then SAT_BIN="${SCRIPT_DIR}/stressapptest"`。 |
+| ST-4 | 116 | Minor | ShellCheck | 同 ME-3，双重 echo -e。 | 同 ME-3 建议。 |
+| ST-5 | 121 | Minor | 自动化 | 同 ME-4，read -p 阻塞。 | 同 ME-4 建议。 |
+| ST-6 | 全文 | Minor | 日志质量 | 同 ME-5，颜色码问题。 | 同 ME-5 建议。 |
+
+---
+
+### 4.5 memtester4h.sh
+
+**文件**: `os-test-script/memtester4h.sh`
+
+| # | 行号 | 严重程度 | 类别 | 问题 | 修复建议 |
+|---|------|---------|------|------|---------|
+| MH-1 | 6, 97 | Major | 错误处理 | `set -e` 下 `wait $MEMTESTER_PID` 如果 memtester 返回非零会导致脚本直接退出，后续日志收集不会执行。 | 改为 `wait "$MEMTESTER_PID" \|\| true`。 |
+| MH-2 | 86 | Minor | ShellCheck | `timeout $DURATION memtester $MEM_SIZE 0` 中变量未加引号。 | 改为 `timeout "$DURATION" memtester "$MEM_SIZE" 0`。 |
+| MH-3 | 43 | Minor | ShellCheck | `cat /proc/meminfo \| grep MemAvailable` UUOC。 | 改为 `grep MemAvailable /proc/meminfo`。 |
+| MH-4 | 119 | Minor | ShellCheck | `[ -f /var/log/messages ] && cp ... \|\| echo ...` 的 `&&`/`\|\|` 短路逻辑有陷阱: 如果 `cp` 失败也会执行 echo。 | 改为 `if/then/else` 结构。 |
+| MH-5 | 161 | Minor | 逻辑错误 | `cp "$MEMTESTER_LOG" "$LOG_DIR/"` 中 `$MEMTESTER_LOG` 已经在 `$LOG_DIR/` 目录下，复制到自身是冗余操作。 | 移除此行。 |
+
+---
+
+## 五、nvme-test-script/
+
+---
+
+### 5.1 nvme_secure_erase_test.sh
+
+**文件**: `nvme-test-script/functional test script/nvme_secure_erase_test.sh` (109 行)
+
+| # | 行号 | 严重程度 | 类别 | 问题 | 修复建议 |
+|---|------|---------|------|------|---------|
+| SE-1 | 102-107 | Critical | 数据安全 | `lsblk -dno NAME \| grep nvme` 获取所有 NVMe 设备后并行执行 `do_full_audit`，其中包括 `nvme format -s 1 --force`。没有任何系统盘检测保护，会擦除系统盘上所有数据。 | 添加系统盘检测: 排除承载已挂载分区的设备。添加用户确认提示。**注意**: 即使是受控测试环境，也应有系统盘保护防止误操作。 |
+| SE-2 | 19 | Major | 错误处理 | `local DEV_SIZE_BYTES=$(blockdev --getsize64 "${TARGET_DEV}")` 如果 blockdev 失败（设备不存在或无权限），`DEV_SIZE_BYTES` 为空，后续 `$((DEV_SIZE_BYTES - 1024))` 会报错。 | 改为: `DEV_SIZE_BYTES=$(blockdev --getsize64 "${TARGET_DEV}") \|\| { echo "blockdev failed" >&2; return 1; }` |
+| SE-3 | 104-106 | Major | 逻辑错误 | 所有设备并行执行全盘擦除和 hex dump。多盘同时擦除可能导致系统 I/O 过载，多个 hexdump 并行读取严重影响性能，错误消息会交错输出。 | 改为串行执行，或限制并行度。 |
+| SE-4 | 86 | Minor | ShellCheck | `printf '0x%x' ${DEV_SIZE_BYTES}` 未加引号，如果为空 printf 会缺少参数。 | 改为 `printf '0x%x' "${DEV_SIZE_BYTES}"`。 |
+| SE-5 | 64 | Minor | 逻辑错误 | `tail -n 1 "${HEX_DUMP_FILE}" \| awk '{print $1}'` 如果 hexdump 输出包含 `*`（重复行标记），`$1` 为 `*`，`16#*` 会报算术错误。 | 添加过滤: `awk '{if($1 != "*") print $1}'`。 |
+
+---
+
+### 5.2 spdk_perf_multi.sh
+
+**文件**: `nvme-test-script/spdk_perf_multi.sh`
+
+| # | 行号 | 严重程度 | 类别 | 问题 | 修复建议 |
+|---|------|---------|------|------|---------|
+| SPk-1 | 657-668 | Major | 命令注入 | 将 shell 变量 `${raw}` 直接嵌入 Python 代码字符串执行。如果变量包含引号或特殊字符会导致注入。 | 改用 `sys.argv` 传递: `cores=$(python3 -c "import sys; raw=sys.argv[1]; ..." "$raw")`。**注意**: 需同步修改 L867-873 的另一处相同模式。 |
+
+---
+
+### 5.3 nvme_driver_visible_check.sh
+
+**文件**: `nvme-test-script/functional test script/nvme_driver_visible_check.sh`
+
+| # | 行号 | 严重程度 | 类别 | 问题 | 修复建议 |
+|---|------|---------|------|------|---------|
+| DV-1 | 70 | Critical | 逻辑错误 | `CONTROLLERS=$(for f in /dev/nvme*; do [[ "$f" =~ n[0-9]]] \|\| echo "$f"; done)` 过滤逻辑有误: `[[ "/dev/nvme0" =~ n[0-9] ]]` 为 true（nvme0 包含 n0），导致所有设备都不会被选中，**CONTROLLERS 永远为空，整个脚本功能完全失效**。 | 改为排除分区而非排除控制器: `[[ "$f" =~ n[0-9]+p[0-9]+$ ]] \|\| echo "$f"`。这样 `/dev/nvme0` 不匹配（通过），`/dev/nvme0n1p1` 匹配（排除）。 |
+| DV-2 | 28, 64 | Major | 安全问题 | `$CMD_UNLOAD` 和 `$CMD_LOAD` 作为变量存储命令再执行（`$CMD_UNLOAD`），存在 word splitting 风险。 | 直接执行: `modprobe -r nvme` 和 `modprobe nvme`。 |
+| DV-3 | 26 | Major | 错误处理 | `modprobe -r nvme` 失败时脚本不检测退出码，继续执行检查会得出错误的"PASS"结论。 | 检查退出码: `if ! modprobe -r nvme 2>/dev/null; then echo "modprobe -r failed" >&2; fi`。 |
+| DV-4 | 100 | Minor | ShellCheck | `while read line` 缺少 `-r` 参数。 | 改为 `while read -r line`。 |
+
+---
+
+### 5.4 nvme_hotplug_unified.sh
+
+**文件**: `nvme-test-script/functional test script/nvme_hotplug_unified.sh`
+
+| # | 行号 | 严重程度 | 类别 | 问题 | 修复建议 |
+|---|------|---------|------|------|---------|
+| HP-1 | 163 | Major | 安全问题 | `while [ -b "$current_dev" ]; do sleep 1; done` 无限等待设备消失。如果用户不执行物理拔盘，脚本永远阻塞。 | 添加超时: `local waited=0; while [ -b "$current_dev" ]; do sleep 1; waited=$((waited+1)); [ $waited -gt 300 ] && { echo "Timeout" >&2; return 1; }; done`。 |
+| HP-2 | 45 | Minor | ShellCheck | `local dev_name=$(basename $1)` 中 `$1` 未加引号。 | 改为 `basename "$1"`。 |
+| HP-3 | 46 | Minor | ShellCheck | `2>/dev/null` 作用于整个赋值而非 readlink。 | 改为 `$(readlink -f "..." 2>/dev/null)`。 |
+| HP-4 | 69 | Minor | ShellCheck | `ls /dev/nvme*n1` 用 ls 赋值。 | 改为 `printf '%s\n' /dev/nvme*n1`。 |
+| HP-5 | 114 | Minor | 逻辑错误 | `${current_dev}*` glob 无匹配时返回字面值。 | 添加 `shopt -s nullglob`。 |
+
+---
+
+### 5.5 nvme-fw-upgrade-downgreade-test-no-io.sh
+
+**文件**: `nvme-test-script/functional test script/nvme-fw-upgrade-downgreade-test-no-io.sh`
+
+| # | 行号 | 严重程度 | 类别 | 问题 | 修复建议 |
+|---|------|---------|------|------|---------|
+| FW-1 | 全文 | Major | 错误处理 | 整个脚本没有 `set -e` 或 `set -o pipefail`。固件升级关键操作失败后脚本继续执行后续步骤。 | 添加 `set -euo pipefail`。**注意**: 需检查 L129 的 `((retry++))` 在 `set -e` 下的行为——当 retry=0 时 `((0++))` 返回 1 触发 errexit。改为 `retry=$((retry + 1))`。 |
+| FW-2 | 275-276 | Major | 逻辑错误 | `if dd ... 2>&1 \| tee ...` 中没有 `set -o pipefail`，`if` 检查的是 tee 的退出码而非 dd 的。dd 失败时 if 条件可能仍然为真。 | 添加 `set -o pipefail`（已在 FW-1 中），或使用 `PIPESTATUS`。 |
+| FW-3 | 307-309 | Minor | ShellCheck | `grep -v "$SCRIPT_PATH"` 中路径包含 `.` 会被解释为正则（匹配任意字符）。 | 改为 `grep -vF "$SCRIPT_PATH"`。 |
+
+---
+
+### 5.6 nvme_slot_power_test.sh
+
+**文件**: `nvme-test-script/functional test script/nvme_slot_power_test.sh`
+
+| # | 行号 | 严重程度 | 类别 | 问题 | 修复建议 |
+|---|------|---------|------|------|---------|
+| SL-1 | 22 | Major | 进程管理 | `kill 0` 在 trap 中会杀死当前进程组所有进程，包括可能不属于本脚本的后台任务。 | 改为记录本脚本启动的子进程 PID 到数组，trap 中只 kill 这些 PID。 |
+| SL-2 | 91 | Major | 安全问题 | `dd if=/dev/zero of="$dev_path"` 对 NVMe 设备直接写入 100MB 零数据，如果设备路径错误会导致数据丢失。 | 添加确认提示。 |
+| SL-3 | 104-117 | Major | 逻辑错误 | 所有盘并行执行下电上电测试。如果多盘共享物理 PCIe slot（某些主板设计），会导致 slot power 状态冲突。 | 添加 slot 去重逻辑。 |
+| SL-4 | 35 | Minor | 逻辑错误 | `basename "$(readlink -f "$pci_link")"` 如果链接不存在返回空，`basename ""` 返回 `.`。 | 添加非空检查。 |
+| SL-5 | 105 | Minor | ShellCheck | `ls /dev/nvme*n1` 无匹配时 ls 报错到 stderr。 | 添加 `2>/dev/null`。 |
+| SL-6 | 106, 109 | Minor | ShellCheck | `echo $drives \| wc -w` 和 `for d in $drives` 中 `$drives` 未加引号。 | 加引号或改用数组。 |
+
+---
+
+### 5.7 其他 NVMe 测试脚本
+
+#### nvme_info_query.sh
+
+| # | 行号 | 严重程度 | 类别 | 问题 | 修复建议 |
+|---|------|---------|------|------|---------|
+| IQ-1 | 31-36 | Major | 逻辑错误 | `get_nvme_devices()` 使用 `awk 'NR > 2'` 跳过头部行，但 `nvme list` 输出格式在不同 nvme-cli 版本中可能不同（头部行数不固定）。 | 改为 `nvme list -o json` 配合 `jq` 解析，或使用更健壮的行匹配。 |
+| IQ-2 | 372 | Minor | ShellCheck | `for dir in $(ls -d "${OUTPUT_ROOT}"/*/ 2>/dev/null \| sort)` 目录名含空格会断裂。 | 改为 `while IFS= read -r dir; do ... done < <(find "${OUTPUT_ROOT}" -maxdepth 1 -mindepth 1 -type d \| sort)`。 |
+
+#### nvme_snia_sss_pts_test_suite.sh
+
+该脚本未发现需要特别指出的问题，整体写法规范。
+
+---
+
+## 六、os-test-script/
+
+---
+
+### 6.1 fio_test.sh
+
+| # | 行号 | 严重程度 | 类别 | 问题 | 修复建议 |
+|---|------|---------|------|------|---------|
+| FT-1 | 8 | Critical | 数据安全 | `TARGET_DEVICE="/dev/sdb"` 硬编码设备路径。直接对块设备执行 fio randrw 测试会销毁所有数据。 | 改为 `TARGET_DEVICE="${1:-/dev/sdb}"` 支持参数传入。 |
+| FT-2 | 119-121 | Major | 数据安全 | fio 直接对 `$TARGET_DEVICE` 做 randrw，设备上所有数据被破坏。 | 在脚本开头添加醒目警告和确认提示。 |
+| FT-3 | 130-134 | Minor | ShellCheck | `$(basename $REPORT_FILE)` 等多处变量未加引号。 | 加引号。 |
+| FT-4 | 138 | Minor | 代码质量 | 输出包含 Unicode 字符 `✓`。 | 改为 `[OK]`。 |
+
+---
+
+### 6.2 cdm-fio-for-usb3test.sh
+
+| # | 行号 | 严重程度 | 类别 | 问题 | 修复建议 |
+|---|------|---------|------|------|---------|
+| CF-1 | 6 | Critical | 数据安全 | `DEV="/dev/sdb"` 硬编码。 | 改为 `${1:-/dev/sdb}`。 |
+| CF-2 | 55-62 | Minor | ShellCheck | `--ioengine=$ENGINE`、`--size=$SIZE` 等多处变量未加引号。 | 加引号。 |
+
+---
+
+### 6.3 os_management_test.sh
+
+| # | 行号 | 严重程度 | 类别 | 问题 | 修复建议 |
+|---|------|---------|------|------|---------|
+| OM-1 | 51 | Critical | 安全性 | `bash -c "$cmd"` 直接执行命令字符串，存在命令注入风险。 | 改为函数映射或数组直接执行。 |
+| OM-2 | 4 | Minor | 兼容性 | `export LC_ALL=zh_CN.UTF-8` 假设系统安装了中文 locale。 | 先检查: `locale -a 2>/dev/null \| grep -q zh_CN.UTF-8 \|\| export LC_ALL=C`。 |
+
+---
+
+### 6.4 run_iozone.sh
+
+| # | 行号 | 严重程度 | 类别 | 问题 | 修复建议 |
+|---|------|---------|------|------|---------|
+| IO-1 | 94 | Major | 逻辑错误 | `df -B1G` 不是标准用法。`-B` 选项需要一个参数指定块大小，`-B1G` 语义不明确。 | 改为 `df -BG`，与前面 L87 的 `df -BG` 保持一致。 |
+| IO-2 | 14 | Minor | 错误处理 | `mkdir -p "$TEST_DIR"` 未检查返回值。 | 添加 `\|\| { echo "ERROR" >&2; exit 1; }`。 |
+| IO-3 | 22-24 | Minor | 边界条件 | `SIZE_HALF` 当 `TOTAL_RAM_GB=1` 时为 0，iozone 测试文件大小为 0。 | 添加最小值: `[ "$SIZE_HALF" -lt 1 ] && SIZE_HALF=1`。 |
+| IO-4 | 112 | Minor | ShellCheck | `[ "$free_space_gb" -lt "$size_gb" ] 2>/dev/null` 如果变量为空或非数字，`2>/dev/null` 掩盖了错误判断。 | 先验证变量非空和数值类型。 |
+
+---
+
+### 6.5 network_perf_test.sh
+
+| # | 行号 | 严重程度 | 类别 | 问题 | 修复建议 |
+|---|------|---------|------|------|---------|
+| NP-1 | 121 | Minor | ShellCheck | `if [ $? -ne 0 ]` 应直接使用 `if ! netperf ...`。 | 重构为条件执行。 |
+| NP-2 | 255 | Minor | 进程管理 | `pkill netserver` 可能误杀其他用户的 netserver 进程。 | 使用更精确的匹配。 |
+| NP-3 | 260 | Minor | 安全问题 | `chmod -R a+rX "${RESULT_DIR}"` 将结果目录递归公开可读，包含系统信息。 | 移除或限制权限。 |
+
+---
+
+### 6.6 iperf_test.sh
+
+| # | 行号 | 严重程度 | 类别 | 问题 | 修复建议 |
+|---|------|---------|------|------|---------|
+| IP-1 | 8 | Minor | 输入验证 | `SERVER_IP=""` 为空时脚本会退出，但未支持命令行参数传入。 | 支持 `${1:?请指定服务器IP}`。 |
+| IP-2 | 119-122 | Minor | ShellCheck | `if [ $? -ne 0 ]` 应直接使用 `if ! iperf ...`。 | 重构为条件执行。 |
+| IP-3 | 144 | Minor | 错误处理 | `ipmitool sel elist` 未检查 ipmitool 是否存在。 | 添加 `command -v ipmitool` 检查。 |
+
+---
+
+### 6.7 cpupower_test.sh
+
+该脚本使用 `set -euo pipefail` 和 trap EXIT 恢复 governor，整体质量较高。
+
+| # | 行号 | 严重程度 | 类别 | 问题 | 修复建议 |
+|---|------|---------|------|------|---------|
+| CP-1 | 135 | Major | 资源泄漏 | `( while :; do :; done ) &` busy-loop 进程在脚本被 `kill -9` 时不会被清理。 | 记录 PID 到临时文件并加强清理逻辑。 |
+| CP-2 | 240 | Minor | ShellCheck | `for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do echo "$gov" > "$f"` glob 无匹配时会尝试写入字面路径。 | 添加 `shopt -s nullglob`。 |
+
+---
+
+### 6.8 cli-test-cript.sh
+
+| # | 行号 | 严重程度 | 类别 | 问题 | 修复建议 |
+|---|------|---------|------|------|---------|
+| CL-1 | 37 | Critical | 安全性 | `$cmd --help` 中 `$cmd` 未加引号。 | 改为 `"$cmd" --help`。 |
+| CL-2 | 1 | Minor | 命名 | 文件名 `cli-test-cript.sh` 有拼写错误。 | 重命名为 `cli-test-script.sh`。 |
+| CL-3 | 11, 37 | Minor | 逻辑错误 | `vi --help` 可能打开编辑器而非打印帮助。 | 添加 `command -v "$cmd" && "$cmd" --help` 检查。 |
+
+---
+
+### 6.9 10G-cptime.sh
+
+| # | 行号 | 严重程度 | 类别 | 问题 | 修复建议 |
+|---|------|---------|------|------|---------|
+| CG-1 | 35 | Major | 逻辑错误 | `dd bs=1M count=10240` 硬编码 10G，与 `FILE_SIZE` 变量不联动。如果修改 `FILE_SIZE` 但忘记改 `count`，测试大小不一致。 | 根据变量动态计算: `count=$((${FILE_SIZE%G} * 1024))`。 |
+| CG-2 | 全文 | Minor | 资源管理 | 无 trap，Ctrl+C 后 10G 测试文件不会被清理。 | 添加 `trap 'rm -f "$TEST_FILE" "$COPY_FILE" 2>/dev/null' EXIT INT TERM`。 |
+
+---
+
+### 6.10 stress1h.sh
+
+| # | 行号 | 严重程度 | 类别 | 问题 | 修复建议 |
+|---|------|---------|------|------|---------|
+| S1-1 | 80 | Minor | ShellCheck | `stress --cpu $(nproc)` 中 `$(nproc)` 未加引号。 | 改为 `"$(nproc)"`。 |
+| S1-2 | 86 | Minor | ShellCheck | `cat /proc/uptime \| awk '{print $1}'` UUOC。 | 改为 `awk '{print $1}' /proc/uptime`。 |
+| S1-3 | 53, 105, 112, 153 | Minor | 逻辑错误 | `save_record` 可能在 trap 路径和正常退出路径中被多次调用，导致记录文件出现重复条目。 | 使用标志变量防止重复记录。 |
+
+---
+
+## 七、network-test-script/
+
+---
+
+### 7.1 A_run.sh / B_run.sh
+
+两个脚本约 90% 代码相同，仅 NIC 名称、IP 和角色不同。
+
+| # | 行号 | 严重程度 | 类别 | 问题 | 修复建议 |
+|---|------|---------|------|------|---------|
+| AB-1 | 10 | Major | ShellCheck | `NIC_NUMA=$(cat /sys/class/net/$NIC1/device/numa_node)` 中 `$NIC1` 未加引号。 | 改为 `"/sys/class/net/${NIC1}/device/numa_node"`。 |
+| AB-2 | 42 | Major | ShellCheck | `PCI=$(basename $(readlink -f /sys/class/net/$NIC1/device))` 嵌套命令替换和变量未引号。 | 改为 `PCI=$(basename "$(readlink -f "/sys/class/net/${NIC1}/device")")`。 |
+| AB-3 | 26 | Minor | ShellCheck | `read APP_NUMA1 APP_NUMA2 <<< $(...)` here string 未加引号。 | 改为 `<<< "$(...)"`。 |
+| AB-4 | 113 | Minor | trap | `trap "kill $P1 $P2 2>/dev/null; echo '已停止'" EXIT INT TERM` 中 `$P1 $P2` 在 trap 设置时就被展开了。如果后续 PID 变化，trap 中的值不正确。 | 改为 `trap 'kill "${P1:-}" "${P2:-}" 2>/dev/null; echo "已停止"' EXIT INT TERM`（使用单引号延迟展开）。 |
+| AB-5 | 62-68 | Minor | ShellCheck | `ip addr flush dev $NIC1` 等多处 `$NIC1`、`$NIC2` 未加引号。 | 统一加引号。 |
+| AB-6 | 全文 | Minor | 代码重复 | A_run.sh 和 B_run.sh 约 90% 代码相同。 | 提取公共函数库，通过参数区分角色。 |
+
+---
+
+### 7.2 network_tune_test_v1.sh
+
+| # | 行号 | 严重程度 | 类别 | 问题 | 修复建议 |
+|---|------|---------|------|------|---------|
+| TV1-1 | 164 | Critical | 安全性 | `eval "sudo $cmd"` 使用 eval，如果 `$cmd` 包含特殊字符会导致命令注入。 | 改为数组执行: `local -a cmd_parts=($cmd); sudo "${cmd_parts[@]}"`。**注意**: 需要确保调用处传入的命令字符串不含恶意内容，或者改为全链路使用数组。 |
+| TV1-2 | 300 | Minor | 初始化 | `MONITOR_PIDS=()` 在函数使用后才声明。 | 移到脚本开头。 |
+| TV1-3 | 290 | Minor | 兼容性 | `strtonum("0x"$2)` 是 gawk 扩展，mawk 不支持。 | 改为 `printf "%d" "0x$2"`。 |
+
+---
+
+### 7.3 network_tune_test_v2.sh
+
+| # | 行号 | 严重程度 | 类别 | 问题 | 修复建议 |
+|---|------|---------|------|------|---------|
+| TV2-1 | 153 | Critical | 安全性 | 同 TV1-1，`eval "sudo $cmd"`。 | 同 TV1-1 建议。 |
+| TV2-2 | 322 | Minor | 代码质量 | `sudo pkill -9 irqbalance` 使用 SIGKILL。 | 先 SIGTERM 再 SIGKILL: `sudo pkill irqbalance; sleep 2; sudo pkill -9 irqbalance 2>/dev/null`。 |
+| TV2-3 | 388 | Minor | ShellCheck | `local cpu_tmp=($bind_cpus)` 未加引号的数组展开。 | 改为 `read -ra cpu_tmp <<< "$bind_cpus"`。 |
+
+---
+
+### 7.4 network_diag.sh
+
+| # | 行号 | 严重程度 | 类别 | 问题 | 修复建议 |
+|---|------|---------|------|------|---------|
+| ND-1 | 56, 84, 117, 121, 132, 139, 144 等 20+ 处 | Critical | 语法错误 | 在非函数作用域中大量使用 `local` 声明变量。`local` 只能在函数内使用，在全局作用域中会被 bash 忽略（变量成为全局），但语义完全错误。 | 将 L51-165 的 for 循环包装到函数中: `collect_nic_diagnostics() { local NICS=("$@"); for nic in "${NICS[@]}"; do local drv_ver fw_ver ... done; }; collect_nic_diagnostics "${NICS[@]}"`。 |
+| ND-2 | 171 | Minor | ShellCheck | `cat /proc/cmdline \| tr ' ' '\n'` UUOC。 | 改为 `tr ' ' '\n' < /proc/cmdline`。 |
+| ND-3 | 157 | Minor | ShellCheck | `while read line` 缺少 `-r`。 | 改为 `while read -r line`。 |
+| ND-4 | 401 | Minor | ShellCheck | `&>/dev/null 2>&1` 中 `2>&1` 是多余的。 | 移除 `2>&1`。 |
+| ND-5 | 494 | Minor | 逻辑错误 | `grep -qvE '^[0,]*$'` 中 `[0,]` 匹配 0 或逗号，意图可能是 `^[0]+$`（全零）。 | 确认意图后修正。 |
+
+---
+
+### 7.5 HCA_iperf_stress.sh
+
+| # | 行号 | 严重程度 | 类别 | 问题 | 修复建议 |
+|---|------|---------|------|------|---------|
+| HC-1 | 9, 16 | Critical | 输入验证 | `PORT1_DEV="这里必须填ip a查到的网卡名1"` 占位符文本，用户忘记修改会执行失败但无明确错误提示。 | 添加启动时校验: `if [[ "$PORT1_DEV" == *"这里"* ]]; then echo "请修改PORT1_DEV" >&2; exit 1; fi`。 |
+| HC-2 | 123 | Major | ShellCheck | `nohup $cmd > "$log_file" 2>&1 &` 中 `$cmd` 未加引号。 | 使用数组存储命令。 |
+| HC-3 | 51 | Minor | ShellCheck | `pci_id=$(basename $(readlink /sys/class/net/$dev/device))` 嵌套命令替换未引号。 | 改为 `pci_id=$(basename "$(readlink "/sys/class/net/$dev/device")")`。 |
+| HC-4 | 176 | Minor | 进程管理 | `pkill -9 iperf` 使用 SIGKILL 过于激进。 | 先 SIGTERM 再 SIGKILL。 |
+
+---
+
+### 7.6 rdma_client.sh / rdma_server.sh
+
+| # | 文件 | 行号 | 严重程度 | 类别 | 问题 | 修复建议 |
+|---|------|------|---------|------|------|---------|
+| RD-1 | rdma_client.sh | 27 | Minor | 进程管理 | `kill 0` 会杀死整个进程组包括可能的父进程。 | 改为只杀子进程: `kill "${CHILD_PIDS[@]}" 2>/dev/null`。 |
+| RD-2 | rdma_client.sh | 37 | Minor | ShellCheck | `ls "$net_dir" \| head -1` 用 ls 解析文件名。 | 改为 `find "$net_dir" -maxdepth 1 -mindepth 1 -printf '%f\n' \| head -1`。 |
+| RD-3 | rdma_server.sh | 34 | Minor | 进程管理 | `pkill -f "^(ib_read\|ib_send\|ib_write)"` 可能误杀其他用户的 RDMA 进程。 | 添加更精确的匹配或只 kill 本脚本记录的 PID。 |
+
+---
+
+## 八、universal-script/
+
+---
+
+### 8.1 ltp_stress_server.sh
+
+| # | 行号 | 严重程度 | 类别 | 问题 | 修复建议 |
+|---|------|---------|------|------|---------|
+| LS-1 | 312 | Critical | 安全性 | `eval "$CMD"` 使用 eval 执行构造的命令字符串。 | 改为数组: `local -a CMD=(stress-ng --cpu "$CPU_CORES" ...); "${CMD[@]}"`。 |
+| LS-2 | 65 | Major | 数据安全 | `find /tmp -maxdepth 1 -name "ltp_stress_*" -type d -exec rm -rf {} +` 可能删除其他用户的 LTP 测试目录。 | 使用带 PID 的唯一目录名: `LOGDIR="/tmp/ltp_stress_$$_$(date +%s)"`。 |
+| LS-3 | 34 | Major | 兼容性 | `df /tmp --output=avail -BG` 中 `--output` 是 GNU 扩展，在 BusyBox df 上不可用。 | 添加 fallback: `df -BG /tmp \| awk 'NR==2{print $4}' \| sed 's/G//'`。 |
+| LS-4 | 44 | Minor | 数据安全 | `sudo rm -rf /tmp/*.log*` 和 `sudo rm -rf /tmp/test*` 过于激进。 | 缩小清理范围。 |
+| LS-5 | 243 | Minor | 逻辑错误 | 如果 `MEM_GB` 为 0，`MEM_PER_PROC` 计算为 0 后被修正为 1MB，但 1MB 内存压力基本无效。 | 添加最小有效值检查和警告。 |
+| LS-6 | 29 | Minor | 逻辑错误 | `duration_to_secs` 如果输入为空，`${d: -1}` 返回空。 | 添加空值检查。 |
+
+---
+
+### 8.2 os-log-clean.sh
+
+| # | 行号 | 严重程度 | 类别 | 问题 | 修复建议 |
+|---|------|---------|------|------|---------|
+| OL-1 | 44-45 | Critical | 数据安全 | `sudo rm -rf /tmp/*.log*` 和 `sudo rm -rf /tmp/test*` 会删除 `/tmp` 下所有用户的匹配文件，可能破坏正在运行的程序的临时文件。 | 缩小范围或添加白名单。 |
+| OL-2 | 32-40 | Major | 数据安全 | `truncate -s 0` 清空 auth.log、wtmp、btmp、lastlog 和 audit 目录，可能违反安全合规要求。 | 在生产环境中应避免清理安全审计日志，或至少添加明确警告和确认。 |
+| OL-3 | 1 | Minor | 错误处理 | 缺少 `set -euo pipefail`。 | 添加。 |
+
+---
+
+### 8.3 collect_system_logs.sh
+
+| # | 行号 | 严重程度 | 类别 | 问题 | 修复建议 |
+|---|------|---------|------|------|---------|
+| CS-1 | 73 | Minor | ShellCheck | `for f in $pattern` glob 展开无匹配时返回字面值。 | 添加 `shopt -s nullglob`。 |
+| CS-2 | 205 | Minor | ShellCheck | `cat /proc/cpuinfo \| head -40` UUOC。 | 改为 `head -40 /proc/cpuinfo`。 |
+| CS-3 | 75 | Minor | 命名 | `local basename` 变量名与系统命令 `basename` 同名。 | 改为 `local base_name`。 |
+
+---
+
+## 九、ppu/
+
+---
+
+### 9.1 trace_player_autorun.sh
+
+| # | 行号 | 严重程度 | 类别 | 问题 | 修复建议 |
+|---|------|---------|------|------|---------|
+| TP-1 | 22 | Critical | 路径依赖 | `./trace_player` 使用相对路径，必须在 trace_player 所在目录执行。 | 改为 `SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"; "$SCRIPT_DIR/trace_player" ...`。 |
+| TP-2 | 22 | Major | 错误处理 | trace_player 命令没有检查退出码，失败时静默继续下一轮循环。 | 检查退出码并记录。 |
+| TP-3 | 1 | Minor | 错误处理 | 缺少 `set -euo pipefail`。 | 添加。 |
+
+---
+
+### 9.2 collect_ppu_monitor.sh
+
+| # | 行号 | 严重程度 | 类别 | 问题 | 修复建议 |
+|---|------|---------|------|------|---------|
+| CPu-1 | 21 | Major | 资源管理 | trap 仅捕获 INT，未捕获 TERM 和 EXIT。如果脚本被 `kill` 发送 SIGTERM，后台 ppudbg 进程不会被清理。 | 改为 `trap 'kill "${PIDS[@]}" 2>/dev/null; wait 2>/dev/null; exit 0' INT TERM`。 |
+| CPu-2 | 36-37 | Minor | 资源管理 | `>>` 追加模式导致多次运行数据累积在同一文件。 | 使用 `>` 覆盖或带时间戳文件名。 |
+| CPu-3 | 3 | Minor | 错误处理 | `set -uo pipefail` 缺少 `-e`。 | 添加。 |
+| CPu-4 | 60 | Minor | 逻辑错误 | `wait "${PIDS[@]}"` 如果某个进程退出，wait 会返回，其他进程仍在运行但不再被等待。 | 使用循环逐个等待。 |
+
+---
+
+*报告完毕。全部 43 个脚本已逐行审查。*
+
+# SIT-Kit 修复方案（对齐全量审查报告）
+
+**编写日期**: 2026-05-27  
+**对应报告**: `CODE_REVIEW_REPORT.md`  
+**原则**:  
+1) 不直接修改主代码，只提供可落地修复片段。  
+2) 每条方案均考虑“修一个问题不要引出更多问题”的约束（尤其是 `set -euo pipefail`、`trap`、变量引用、数组改造、管道 PID、进程组 kill 等易踩坑点）。  
+3) 对跨文件重复问题，只在“全局方案”统一说明一次，避免重复。
+
+---
+
+## 一、全局修复原则与模板（先读这段再改）
+
+### 1.1 添加 `set -euo pipefail` 的安全做法
+
+**错误处理会误杀的常见点（必须先修或加保护）**：
+- `grep` 未命中返回 1：改为 `grep ... || true` 或通过管道输出到下游。  
+- `command -v xxx` 不存在返回 1：改 `command -v xxx >/dev/null 2>&1 || true`。  
+- `wait $pid` 子进程失败返回非零：改 `wait "$pid" || true`。  
+- `local var=$(cmd)` 会掩盖命令退出码：改为声明与赋值分离。  
+- `((i++))` 当 i=0→1 时返回 1，可能触发 errexit：改 `i=$((i+1))`。
+
+### 1.2 trap 的安全做法
+
+- `trap '...' EXIT` 会在脚本任何退出路径触发（包括正常结束、`exit`、`Ctrl+C`），因此清理函数必须“幂等可重复执行、能容忍空变量”。  
+- 用 `kill 0` 会杀当前进程组，适合“父进程控制所有子进程”的场景，但会误伤同组其它任务；如果需要更精确，改成记录 PID 数组再逐个 kill。  
+- `exec &> >(tee ...)` 会产生异步 tee，末尾可能丢最后几行日志；在关键收尾路径前加 `sleep 1` 给 tee 刷新时间，或改 FIFO/同步写日志。
+
+### 1.3 变量引用与数组改造的安全做法
+
+- 对有意依赖 word splitting 的字符串参数（如 fio 参数串），必须改成数组；否则任何值里出现空格/特殊字符都会断裂。  
+- 可选参数（可能为空）不要硬拼进命令行：用数组条件追加，避免传空参数。
+
+---
+
+## 二、全局共性问题修复方案
+
+### G1. 缺少 `set -euo pipefail`（影响约 39 个脚本）
+
+**修复模板**（按文件逐点补齐 `|| true`）：
+```bash
+set -euo pipefail
+# 对 grep/command -v/wait 等按需加 || true
+```
+
+**需要特别注意的文件（报告中已点名）**：  
+- `memtester4h.sh`：`wait "$MEMTESTER_PID"` 需 `|| true`。  
+- `nvme-fw-upgrade-downgreade-test-no-io.sh`：`((retry++))` 需改 `retry=$((retry+1))`。  
+- `mixed_pressure_7x24.sh`：当前缺 `-e`，补上后需确认已有 `|| true` 的点足够。
+
+### G2. 变量未加双引号（影响极广）
+
+**修复规则**：  
+- 默认都加双引号。  
+- 对 `PARA_LINE` 这种“故意拆词”的旧写法，统一改数组。
+
+### G3. 缺少 trap（影响 12 个脚本）
+
+**修复模板**：
+```bash
+cleanup() {
+    # 只清理本脚本产生的子进程，避免误杀
+    kill "${PIDS[@]}" 2>/dev/null || true
+    wait 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
+```
+
+### G4. 无用 cat（UUOC）
+
+**修复规则**：`cat file | grep pat` → `grep pat file`。  
+仅涉及代码风格与性能，不会引入新问题。
+
+### G5. 硬编码设备路径
+
+**修复规则**：改成参数/变量，并做“块设备存在性校验”。
+
+### G6. `sleep 30s` 的 `s` 后缀
+
+**修复规则**：统一改 `sleep 30`（兼容性更好）。
+
+---
+
+## 三、ali-qual-script 修复方案
+
+### 3.1 mixed_pressure_7x24.sh
+
+- **MP-1 缺 `-e`**：改 `set -euo pipefail`。  
+  - 风险点：脚本里大量 grep/管道。该脚本已把很多失败点用 `|| true` 兜住；补 `-e` 后再跑一遍逻辑，确保没有裸 grep。  
+- **MP-2 source 配置文件**：建议加“所有者/root 权限”提示性校验（不改行为），避免误加载非受信文件。  
+- **MP-3 grep 正则注入**：`grep -q "^${b}"` 改前缀比较：`[[ "$d" == "${b}"* ]] && return 0`。  
+- **MP-4/MAP-5 tee + do_stop 互斥**：  
+  - `do_stop()` 里不要再 `exec &> >(tee ...)`（会多开 tee 进程）。  
+  - 互斥用文件锁比全局变量更稳（trap 子 shell 环境下变量状态不确定）。  
+- **MP-6 date 引号**：`date -d "@$(cat ...)"`。  
+- **MP-7 local 声明漏变量**：补齐 `swap_total_kb/swap_free_kb`。  
+- **MP-8~MP-13**：都是变量作用域/ShellCheck 规范项，按报告逐点改即可，风险低。
+
+### 3.2 nvme_storage_perf.sh
+
+- **SP-1 trap**：在 `main()` 前加 trap，确保 iostat 不会成孤儿。  
+- **SP-2 fio 失败处理**：`|| log_warn` 会掩盖错误；改成 `|| { rc=$?; ...; return $rc; }`，让上层知道失败。  
+- **SP-3~SP-5**：引号/去重，都是低风险。
+
+### 3.3 kdump_auto_test.py
+
+- **KT-1 密码暴露**：改 `sshpass -e` + `env["SSHPASS"]`；ipmitool 同理用环境/文件。  
+- **KT-2/KT-3/KT-6 返回值问题**：统一把“关键步骤失败”落到返回值，避免假 PASS。  
+- **KT-4 SOL 资源泄漏**：`try/finally` 保证 `stop_sol_session()`。  
+- **KT-7 ipmitool 参数**：改成接受 list，避免 `command.split()`。  
+- **KT-8/KT-9**：日志写文件、crashkernel 参数化（低风险）。
+
+---
+
+## 四、modified_scripts 修复方案
+
+### 4.1 run_parallel_disk.sh
+
+- **RP-1 nvme format 审计**：保持 `ALLOW_NVME_FORMAT` 开关，补充“记录到审计日志 + 打印受影响设备”。  
+- **RP-2 引号**：`"$dev"`。  
+- **RP-3 ssd_cap_set 变量作用域**：循环开头重置变量，修的是真实 bug。  
+- **RP-4 wait 结果检查**：收集 PID 再逐个 wait。  
+- **RP-5 相对路径**：改绝对路径。  
+- **RP-6 引号**：统一加引号，grep/smartctl 参数更稳。  
+- **RP-8 拼写**：`PARALLER` → `PARALLEL`（同步所有引用）。  
+- **RP-9~RP-12**：UUOE/哨兵值/布尔判断可读性，低风险。
+
+### 4.2 raw_disk_fio_test.sh
+
+- **RD-1 PARA_LINE 改数组**：这是最影响稳定性的改造。  
+  - 必须同步改所有展开点为 `"${PARA_LINE[@]}"`。  
+  - 建议先做“仅数组化”提交，再做后续引号修复，降低回归风险。  
+- **RD-2 设备名校验**：正则白名单。  
+- **RD-3 HDD log 前缀 bug**：`ssd_` → `hdd_`（逻辑硬伤）。  
+- **RD-4~RD-6 name/readwrite 不一致**：会导致日志解析混乱，按报告逐项修正。  
+- **RD-12 可选参数**：`$numa_mem_opt` 改数组追加，避免传空参数。
+
+### 4.3 multi_disk_log_filter.sh / only_precondition_for_multi_ssd.sh
+
+- UUOC、`echo -e`、日志解析空值保护、后台日志不再丢弃等，都是低风险改法。
+
+---
+
+## 五、memory-test-script 修复方案
+
+### 5.1 memory_pressure_test.sh
+
+- **MPa-1 pkill -f**：改成 PID 文件 + 进程组 kill（先 `-` 负号杀组，再兜底杀 PID）。  
+- **MPa-2 管道 PID**：拆成“真进程 + 后处理管道”，避免 `$!` 拿到 grep。  
+- **MPa-3/MAP-5 竞态**：PID 文件 + `/proc/$pid/cmdline` 验证进程身份。  
+- **MPa-4 dmesg -C 前备份**：先 dump 再 clear，保留前因证据。
+
+### 5.2 Sangfor_mem_test_autorun.sh
+
+- **SA-1 set -euo pipefail**：加后要检查 `cp log/*.log` 等 glob 失败点，必要时加 `|| true`。  
+- **SA-2 相对路径**：改成基于脚本目录的绝对路径。  
+- **SA-3 trap 时序**：trap 必须在第一个后台进程启动前设置。  
+- **SA-4 配置文件修改**：`sed -i.bak` 或退出时恢复，避免中断后留脏配置。
+
+### 5.3 memtester_stress_ce_disabled.sh / stressapptest_stress_ce_disabled.sh
+
+- **awk 变量注入**：改 `awk -v` 传参。  
+- **无 trap**：补 trap，确保中断时能收日志。  
+- **路径/终端检测**：按报告改，低风险。
+
+### 5.4 memtester4h.sh
+
+- **wait + set -e**：`wait "$MEMTESTER_PID" || true`，否则后续日志收集会丢失。
+
+---
+
+## 六、nvme-test-script 修复方案
+
+### 6.1 nvme_secure_erase_test.sh
+
+- **SE-1 系统盘保护**：先排除“已挂载/系统盘”，再列清单并要求确认。  
+- **SE-2 blockdev 失败**：失败直接 return，不要继续算术。  
+- **SE-3 并行擦除**：建议改串行或限制并发，避免 I/O 风暴与日志交错。  
+- **SE-5 hexdump `*` 行**：awk 过滤掉 `*` 行，避免 `16#*` 算术错。
+
+### 6.2 nvme_driver_visible_check.sh
+
+- **DV-1 逻辑错误（Critical）**：当前正则会导致控制器被误排除，脚本功能失效。改成只排除分区（如 `n[0-9]+p[0-9]+$`）。  
+- **DV-2 变量执行命令**：直接执行 `modprobe` 更稳。  
+- **DV-3 退出码**：`modprobe -r` 失败要记录，不能继续得出错误结论。
+
+### 6.3 nvme_slot_power_test.sh
+
+- **SL-1 kill 0**：改 PID 数组精确清理。  
+- **SL-2 dd 写入**：需确认提示。  
+- **SL-3 并行 slot 冲突**：加 slot 去重。
+
+### 6.4 nvme-fw-upgrade-downgreade-test-no-io.sh
+
+- **FW-1 set -euo pipefail**：配合把 `((retry++))` 改成 `retry=$((retry+1))`。  
+- **FW-2 dd|tee 退出码**：`set -o pipefail` 后会检 dd；或用 `PIPESTATUS`。
+
+### 6.5 spdk_perf_multi.sh / nvme_info_query.sh / nvme_hotplug_unified.sh
+
+- 嵌入 Python 改 `sys.argv`；`nvme list` 解析更健壮；热插拔脚本加超时与 nullglob。
+
+---
+
+## 七、os-test-script 修复方案
+
+- **fio_test.sh / cdm-fio-for-usb3test.sh**：硬编码 `/dev/sdb` 改参数并校验块设备存在。  
+- **os_management_test.sh**：`bash -c "$cmd"` 改直接执行/函数映射。  
+- **cli-test-cript.sh**：引号 + 文件名拼写。  
+- **memtester4h.sh**：`wait ... || true`。  
+- **run_iozone.sh**：`df -BG` 统一用法，边界值保护。  
+- **network_perf_test.sh / iperf_test.sh**：`if ! cmd ...` 替代 `$?` 检查，进程 kill 更精确。  
+- **cpupower_test.sh**：整体质量较高，仅 `shopt -s nullglob` 等细节。  
+- **10G-cptime.sh**：dd count 联动变量，补 trap 清理临时大文件。
+
+---
+
+## 八、network-test-script 修复方案
+
+- **A_run.sh / B_run.sh**：变量引号、trap 延迟展开、减少代码重复。  
+- **network_tune_test_v1/v2.sh**：`eval "sudo $cmd"` 改数组执行（需同步改调用处）。  
+- **network_diag.sh**：函数外 `local` 改成函数内声明。  
+- **HCA_iperf_stress.sh**：占位符校验 + 命令数组化。  
+- **rdma_client/server.sh**：`kill 0` 改更精确清理；`pkill -f` 改更精确匹配。
+
+---
+
+## 九、universal-script / ppu 修复方案
+
+- **ltp_stress_server.sh**：`eval "$CMD"` 改数组；`df --output` 增加兼容 fallback。  
+- **os-log-clean.sh**：缩小 `/tmp` 清理范围；安全审计日志清理加确认或保留。  
+- **collect_system_logs.sh**：`nullglob`、UUOC、变量命名。  
+- **trace_player_autorun.sh**：相对路径改绝对路径，补退出码检查。  
+- **collect_ppu_monitor.sh**：trap 捕获 TERM，日志追加/覆盖策略更清晰。
+
+---
+
+> **最后提醒**：修 shell 脚本时，优先“最小变更、单点修复、逐步提交”。尤其是 `set -euo pipefail`、`trap`、数组化三类改动，建议每改一类就做一次回归验证，避免连锁误杀或行为变化。
