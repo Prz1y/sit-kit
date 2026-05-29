@@ -30,6 +30,22 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 # 定义一个核心函数：创建独立文件夹、初始化日志并执行多个指令
+run_snippet() {
+    local snippet="$1"
+    local log_file="$2"
+    local tmp_script
+    tmp_script=$(mktemp)
+    printf "#!/bin/bash
+set -o pipefail
+%s
+" "$snippet" > "$tmp_script"
+    chmod +x "$tmp_script"
+    bash "$tmp_script" >> "$log_file" 2>&1
+    local exit_code=$?
+    rm -f "$tmp_script"
+    return "$exit_code"
+}
+
 run_test_item() {
     local folder_name="$1"
     local test_desc="$2"
@@ -53,7 +69,7 @@ run_test_item() {
         echo "[执行指令]: $cmd" >> "$log_file"
         echo "--------------------------------------------------" >> "$log_file"
         
-        bash -c "$cmd" >> "$log_file" 2>&1
+        run_snippet "$cmd" "$log_file"
 
         # 检查命令是否因权限问题失败
         local exit_code=$?
