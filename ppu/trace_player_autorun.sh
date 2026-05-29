@@ -1,5 +1,11 @@
 #!/bin/bash
 
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+TRACE_BIN="${SCRIPT_DIR}/trace_player"
+TRACE_STREAM="${SCRIPT_DIR}/multi_stream.txt"
+
 #配置
 DURATION=30000  #秒
 
@@ -19,8 +25,8 @@ echo "----------------------------------------"
     while [ "$(date +%s)" -lt $end_time ]; do
         echo "[$(date)] loops started..."
 
-        ./trace_player -s multi_stream.txt -n 22 -r 100000
-        AlippuDeviceIndex=1 ./trace_player -s multi_stream.txt -n 22 -r 100000
+        "$TRACE_BIN" -s "$TRACE_STREAM" -n 22 -r 100000
+        AlippuDeviceIndex=1 "$TRACE_BIN" -s "$TRACE_STREAM" -n 22 -r 100000
 
         echo "[$(date)] loop done..."
     done
