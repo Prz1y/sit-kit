@@ -1,0 +1,20 @@
+diff --git a/network-test-script/Performance Test for ConnectX-7 HCA on Hygon 74xx cpus/rdma_client.sh b/network-test-script/Performance Test for ConnectX-7 HCA on Hygon 74xx cpus/rdma_client.sh
+index b93521f..b06b585 100644
+--- a/network-test-script/Performance Test for ConnectX-7 HCA on Hygon 74xx cpus/rdma_client.sh	
++++ b/network-test-script/Performance Test for ConnectX-7 HCA on Hygon 74xx cpus/rdma_client.sh	
+@@ -57,7 +57,7 @@ echo " RDMA 客户端测试"
+ echo "============================================"
+ 
+ SUMMARY_FILE="${RESULT_DIR}/_summary.txt"
+-> "$SUMMARY_FILE"
++: > "$SUMMARY_FILE"
+ 
+ for cfg in "${TEST_PORTS[@]}"; do
+     read -r IFACE LOCAL_CIDR SERVER_IP <<< "$cfg"
+@@ -131,4 +131,4 @@ for cfg in "${TEST_PORTS[@]}"; do
+ done
+ 
+ echo ""
+-echo "全部完成，结果在 $RESULT_DIR"
+\ No newline at end of file
++echo "全部完成，结果在 $RESULT_DIR"

@@ -1,0 +1,59 @@
+diff --git a/os-test-script/fio_test.sh b/os-test-script/fio_test.sh
+index ca753da..4d97d4f 100644
+--- a/os-test-script/fio_test.sh
++++ b/os-test-script/fio_test.sh
+@@ -5,7 +5,7 @@ SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
+ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+ 
+ # 用户配置（直接修改这里）
+-TARGET_DEVICE="/dev/sdb"
++TARGET_DEVICE="${1:-/dev/sdb}"
+ DURATION=14400
+ FIO_SIZE="100G"               # 测试数据范围 per job；大容量盘建议设为全盘容量或更大
+ 
+@@ -23,7 +23,6 @@ BMC_PID=""
+ 
+ check_device_safety() {
+     local dev="$1"
+-    local dev_name="${dev##*/}"
+ 
+     if [ ! -b "$dev" ]; then
+         echo "错误: 设备 $dev 不存在或不是块设备"
+@@ -64,6 +63,7 @@ check_device_safety() {
+ }
+ 
+ check_device_safety "$TARGET_DEVICE"
++echo "[WARN] 即将对 $TARGET_DEVICE 执行随机读写测试，设备上的现有数据可能被覆盖"
+ 
+ start_log_collection() {
+     dmesg -w > "$DMESG_LOG" 2>&1 &
+@@ -118,7 +118,7 @@ start_log_collection
+ 
+ fio --name=rw_test --rw=randrw --rwmixread=70 --bs=4k --size="$FIO_SIZE" \
+     --numjobs=4 --runtime="$DURATION" --time_based --group_reporting \
+-    --filename="$TARGET_DEVICE" --output="$FIO_RESULT" 2>&1 || true
++    --filename="$TARGET_DEVICE" --output="$FIO_RESULT" 2>&1
+ 
+ sleep 2
+ stop_log_collection
+@@ -127,14 +127,14 @@ stop_log_collection
+     echo "测试结束时间: $(date '+%Y-%m-%d %H:%M:%S')"
+     echo "================================================"
+     echo "输出文件："
+-    echo "  - 测试报告: $(basename $REPORT_FILE)"
+-    echo "  - dmesg日志: $(basename $DMESG_LOG)"
+-    echo "  - message日志: $(basename $MESSAGE_LOG)"
+-    echo "  - BMC日志: $(basename $BMC_LOG)"
+-    echo "  - FIO结果: $(basename $FIO_RESULT)"
++    echo "  - 测试报告: $(basename "$REPORT_FILE")"
++    echo "  - dmesg日志: $(basename "$DMESG_LOG")"
++    echo "  - message日志: $(basename "$MESSAGE_LOG")"
++    echo "  - BMC日志: $(basename "$BMC_LOG")"
++    echo "  - FIO结果: $(basename "$FIO_RESULT")"
+     echo "================================================"
+ } >> "$REPORT_FILE" 2>&1
+ 
+ echo "✓ FIO 测试已完成"
+ echo "✓ 所有结果已保存至: $SCRIPT_DIR"
+-echo "✓ 报告文件: $(basename $REPORT_FILE)"
++echo "✓ 报告文件: $(basename "$REPORT_FILE")"

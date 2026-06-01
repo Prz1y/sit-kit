@@ -1,0 +1,56 @@
+diff --git a/nvme-test-script/functional test script/nvme-fw-upgrade-downgreade-test-no-io.sh b/nvme-test-script/functional test script/nvme-fw-upgrade-downgreade-test-no-io.sh
+index 8a47920..9133a15 100644
+--- a/nvme-test-script/functional test script/nvme-fw-upgrade-downgreade-test-no-io.sh	
++++ b/nvme-test-script/functional test script/nvme-fw-upgrade-downgreade-test-no-io.sh	
+@@ -1,4 +1,6 @@
+ #!/bin/bash
++
++set -euo pipefail
+ # ==============================================================================
+ # NVMe Firmware Upgrade/Downgrade Automated Test Script (Standalone)
+ # ==============================================================================
+@@ -126,7 +128,7 @@ get_fw_rev() {
+         [ -n "$out" ] && { echo "$out"; return 0; }
+ 
+         sleep 2
+-        ((retry++))
++        retry=$((retry + 1))
+     done
+     echo "UNKNOWN"
+     return 1
+@@ -218,7 +220,7 @@ do_fw_update() {
+         local waited=0
+         while [ ! -b "$NVME_DEVICE" ] && [ $waited -lt 30 ]; do
+             sleep 1
+-            ((waited++))
++            waited=$((waited + 1))
+         done
+         if [ -b "$NVME_DEVICE" ]; then
+             log "NVMe device $NVME_DEVICE is back after reset (waited ${waited}s)"
+@@ -285,7 +287,7 @@ do_io_test() {
+ 
+     # Wait for iostat to finish naturally (max 80s)
+     local w=0
+-    while kill -0 "$iostat_pid" 2>/dev/null && [ $w -lt 80 ]; do sleep 1; ((w++)); done
++    while kill -0 "$iostat_pid" 2>/dev/null && [ $w -lt 80 ]; do sleep 1; w=$((w + 1)); done
+     kill "$iostat_pid" 2>/dev/null || true
+ 
+     # Append iostat result
+@@ -305,7 +307,7 @@ handle_power_cycle() {
+     log "Checkpoint saved: $STATE_FILE (expected FW: ${expected_after})"
+ 
+     # Register cron @reboot to resume after reboot
+-        ( crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH" ; \
++        ( crontab -l 2>/dev/null | grep -vF "$SCRIPT_PATH" ; \
+             echo "@reboot bash \"$SCRIPT_PATH\"" ) | crontab -
+         log "Registered cron @reboot: bash \"$SCRIPT_PATH\""
+ 
+@@ -356,7 +358,7 @@ run_after_powercycle() {
+ 
+     # Remove checkpoint and cron entry immediately to prevent infinite reboot loop
+     rm -f "$STATE_FILE"
+-    ( crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH" ) | crontab -
++    ( crontab -l 2>/dev/null | grep -vF "$SCRIPT_PATH" ) | crontab -
+     log "Checkpoint and cron @reboot entry cleared (expected after reboot: ${expected_after})"
+ 
+     # ---- Point 4 (power cycle): verify FW version survives reboot ----
