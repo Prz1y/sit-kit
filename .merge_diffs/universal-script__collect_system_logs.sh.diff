@@ -1,0 +1,31 @@
+diff --git a/universal-script/collect_system_logs.sh b/universal-script/collect_system_logs.sh
+index 3cff6a7..786607e 100644
+--- a/universal-script/collect_system_logs.sh
++++ b/universal-script/collect_system_logs.sh
+@@ -68,13 +68,14 @@ collect_messages() {
+     )
+ 
+     local found=0
++    shopt -s nullglob
+     for pattern in "${candidates[@]}"; do
+         # 使用 glob 展开
+         for f in $pattern; do
+             [[ -f "$f" ]] || continue
+-            local basename
+-            basename="$(basename "${f}")"
+-            local out="${OUTPUT_DIR}/messages_${basename}_${TIMESTAMP}.log"
++            local base_name
++            base_name="$(basename "${f}")"
++            local out="${OUTPUT_DIR}/messages_${base_name}_${TIMESTAMP}.log"
+             cp "${f}" "${out}"
+             log_info "已复制: ${f} -> ${out} ($(wc -l < "${out}") 行)"
+             found=1
+@@ -202,7 +203,7 @@ collect_sysinfo() {
+         uptime
+         echo
+         echo "===== CPU 信息 ====="
+-        lscpu 2>/dev/null || cat /proc/cpuinfo | head -40
++        lscpu 2>/dev/null || head -40 /proc/cpuinfo
+         echo
+         echo "===== 内存信息 ====="
+         free -h

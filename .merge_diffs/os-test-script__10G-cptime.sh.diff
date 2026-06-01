@@ -1,0 +1,29 @@
+diff --git a/os-test-script/10G-cptime.sh b/os-test-script/10G-cptime.sh
+index 0b1f57f..d087d47 100644
+--- a/os-test-script/10G-cptime.sh
++++ b/os-test-script/10G-cptime.sh
+@@ -1,5 +1,7 @@
+ #!/bin/bash
+ 
++set -euo pipefail
++
+ # --- 配置参数 ---
+ FILE_SIZE="10G"              # 测试文件大小
+ TEST_DIR="."                 # 当前目录
+@@ -8,6 +10,7 @@ TEST_FILE="test_source_10G"
+ COPY_FILE="test_target_10G"
+ TIMESTAMP=$(date "+%Y%m%d_%H%M%S")
+ LOG_FILE="$LOG_DIR/copy_test_$TIMESTAMP.log"
++trap 'rm -f "$TEST_FILE" "$COPY_FILE" 2>/dev/null || true' EXIT INT TERM
+ 
+ # --- 创建日志目录 ---
+ mkdir -p "$LOG_DIR"
+@@ -32,7 +35,7 @@ log "==========================================="
+ # 1. 生成测试文件 (如果不存在)
+ if [ ! -f "$TEST_FILE" ]; then
+     log "[1/3] 正在生成 $FILE_SIZE 的测试文件..."
+-    dd if=/dev/zero of="$TEST_FILE" bs=1M count=10240 status=progress 2>&1 | tee -a "$LOG_FILE"
++    dd if=/dev/zero of="$TEST_FILE" bs=1M count=$(( ${FILE_SIZE%G} * 1024 )) status=progress 2>&1 | tee -a "$LOG_FILE"
+     sync
+ else
+     log "[1/3] 测试文件已存在，跳过创建。"

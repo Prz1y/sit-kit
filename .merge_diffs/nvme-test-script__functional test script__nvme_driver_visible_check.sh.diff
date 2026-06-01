@@ -1,0 +1,56 @@
+diff --git a/nvme-test-script/functional test script/nvme_driver_visible_check.sh b/nvme-test-script/functional test script/nvme_driver_visible_check.sh
+index 018ca48..63ca951 100644
+--- a/nvme-test-script/functional test script/nvme_driver_visible_check.sh	
++++ b/nvme-test-script/functional test script/nvme_driver_visible_check.sh	
+@@ -1,5 +1,7 @@
+ #!/bin/bash
+ 
++set -euo pipefail
++
+ # ================= Configuration =================
+ LOOP_COUNT=10
+ WAIT_TIME=10
+@@ -23,9 +25,11 @@ for ((i=1; i<=LOOP_COUNT; i++)); do
+     echo "############################################################"
+ 
+     # ================= Step 2: Unload Driver =================
+-    CMD_UNLOAD="modprobe -r nvme"
+-    echo "[Action] Executing: $CMD_UNLOAD"
+-    $CMD_UNLOAD
++    echo "[Action] Executing: modprobe -r nvme"
++    if ! modprobe -r nvme; then
++        echo "FATAL ERROR: modprobe -r nvme failed." >&2
++        exit 1
++    fi
+     
+     echo ""
+     echo "[Check 1] Executing command: ls -1 /dev/nvme*"
+@@ -58,16 +62,15 @@ for ((i=1; i<=LOOP_COUNT; i++)); do
+     sleep 2
+ 
+     # ================= Step 3: Load Driver =================
+-    CMD_LOAD="modprobe nvme"
+     echo ""
+-    echo "[Action] Executing: $CMD_LOAD"
+-    $CMD_LOAD
++    echo "[Action] Executing: modprobe nvme"
++    modprobe nvme
+     
+     echo "Waiting ${WAIT_TIME}s for devices to initialize..."
+     sleep $WAIT_TIME
+     
+     # Check if devices appeared
+-    CONTROLLERS=$(for f in /dev/nvme* ; do [[ "$f" =~ n[0-9] ]] || echo "$f"; done 2>/dev/null)
++    CONTROLLERS=$(for f in /dev/nvme*; do [[ "$f" =~ n[0-9]+p[0-9]+$ ]] || echo "$f"; done 2>/dev/null)
+     if [ -z "$CONTROLLERS" ]; then
+             echo "FATAL ERROR: No devices found after load."
+             exit 1
+@@ -97,7 +100,7 @@ for ((i=1; i<=LOOP_COUNT; i++)); do
+ 
+     # 4. Sort and Display
+     LAST_SIZE=""
+-    sort -V "$TMP_LOGS" | while read line; do
++    sort -V "$TMP_LOGS" | while read -r line; do
+         CURRENT_SIZE=${line%%__*}
+         LOG_TEXT=${line#*__}
+ 
