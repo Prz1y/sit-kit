@@ -1,0 +1,69 @@
+diff --git a/ali-qual-script/nvme_storage_perf.sh b/ali-qual-script/nvme_storage_perf.sh
+index f9498db..44f3a72 100644
+--- a/ali-qual-script/nvme_storage_perf.sh
++++ b/ali-qual-script/nvme_storage_perf.sh
+@@ -58,11 +58,21 @@ PERF_DIR="${BASE_DIR}/perf_data"
+ MON_DIR="${BASE_DIR}/monitor"
+ SEL_DIR="${BASE_DIR}/sel_logs"
+ RUN_LOG="${LOG_DIR}/run.log"
++PIDS=()
+ # 注: 目录创建移至 main() 中 require_root 之后，避免非 root 时在受保护路径上报错
+ log_info()  { echo "[INFO]  $(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "$RUN_LOG"; }
+ log_warn()  { echo "[WARN]  $(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "$RUN_LOG" >&2; }
+ log_error() { echo "[ERROR] $(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "$RUN_LOG" >&2; }
+ 
++cleanup() {
++    if [[ ${#PIDS[@]} -gt 0 ]]; then
++        kill "${PIDS[@]}" 2>/dev/null || true
++        for pid in "${PIDS[@]}"; do
++            wait "$pid" 2>/dev/null || true
++        done
++    fi
++}
++
+ require_root() {
+     if [[ $EUID -ne 0 ]]; then
+         log_error "请以 root 身份运行此脚本 (sudo bash $0)"
+@@ -131,7 +141,7 @@ os_log_clean() {
+     dmesg -C 2>/dev/null || log_warn "dmesg -C 失败"
+ 
+     echo "$(date '+%Y-%m-%d %H:%M:%S')" > "${LOG_DIR}/os_log_clean_marker.txt"
+-    log_info "OS 日志已清除，标记时间: $(cat ${LOG_DIR}/os_log_clean_marker.txt)"
++    log_info "OS 日志已清除，标记时间: $(cat "${LOG_DIR}/os_log_clean_marker.txt")"
+ }
+ 
+ sel_log_clean() {
+@@ -171,8 +181,9 @@ run_fio() {
+     local first_dev="${fio_filename%%:*}"
+     iostat -xmt 10 "$first_dev" > "$mon_out" 2>&1 &
+     local iostat_pid=$!
++    PIDS+=("$iostat_pid")
+ 
+-    fio --name="${job_name}" --filename="${fio_filename}" \
++    if ! fio --name="${job_name}" --filename="${fio_filename}" \
+         --rw="${rw}" --bs="${bs}" \
+         --iodepth="${iodepth}" --numjobs="${numjobs}" \
+         --direct=1 --ioengine=libaio --thread=1 \
+@@ -182,7 +193,13 @@ run_fio() {
+         --output-format=json --output="${json_out}" \
+         --end_fsync=0 --buffer_compress_percentage=0 \
+         --invalidate=1 --refill_buffers --exitall \
+-        ${extra_flags:+$extra_flags} 2>&1 || log_warn "fio 退出码非0，请检查日志: ${json_out}"
++        ${extra_flags:+$extra_flags} 2>&1; then
++        local rc=$?
++        log_error "fio 失败 (退出码: ${rc}): ${json_out}"
++        kill "$iostat_pid" 2>/dev/null || true
++        wait "$iostat_pid" 2>/dev/null || true
++        return "$rc"
++    fi
+ 
+     kill "$iostat_pid" 2>/dev/null || true
+     wait "$iostat_pid" 2>/dev/null || true
+@@ -358,6 +375,7 @@ smart_standard2_collect() {
+ 
+ main() {
+     require_root
++    trap cleanup EXIT INT TERM
+     mkdir -p "$LOG_DIR" "$SMART_DIR" "$PERF_DIR" "$MON_DIR" "$SEL_DIR"
+     check_deps
+     device_check

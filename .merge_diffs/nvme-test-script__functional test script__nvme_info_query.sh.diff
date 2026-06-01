@@ -1,0 +1,13 @@
+diff --git a/nvme-test-script/functional test script/nvme_info_query.sh b/nvme-test-script/functional test script/nvme_info_query.sh
+index 567c6a0..f961ed5 100644
+--- a/nvme-test-script/functional test script/nvme_info_query.sh	
++++ b/nvme-test-script/functional test script/nvme_info_query.sh	
+@@ -6,7 +6,7 @@
+ set -o pipefail
+ 
+ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+-cd "$SCRIPT_DIR"
++cd "$SCRIPT_DIR" || exit 1
+ 
+ OUTPUT_ROOT="nvme_info_output"
+ 
