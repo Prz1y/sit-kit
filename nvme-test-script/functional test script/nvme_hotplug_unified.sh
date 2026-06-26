@@ -1,4 +1,10 @@
 #!/bin/bash
+#
+# WARNING:
+#   This script will wipe partition tables, recreate partitions/filesystems,
+#   mount/unmount NVMe devices, write test data, and remove on-disk signatures.
+#   Run it only on RD/lab machines where data loss is acceptable.
+#
 
 set -euo pipefail
 shopt -s nullglob
@@ -18,6 +24,8 @@ if [[ -z "$DEVICE_A" || -z "$DEVICE_B" || -z "$MODE" || -z "$TOTAL_LOOPS" ]]; th
     echo "Example: $0 /dev/nvme0n1 /dev/nvme1n1 1 20"
     exit 1
 fi
+
+echo "WARNING: nvme_hotplug_unified.sh will repartition, reformat, mount, write test data, and wipe NVMe devices. Use only on RD/lab machines." >&2
 
 # 基础配置
 WORK_DIR="$(pwd)/Test_Report_Surprise_Mode${MODE}_$(date +%Y%m%d_%H%M%S)"
@@ -230,8 +238,7 @@ run_cycle() {
     
     log "  > Drive reappeared as: $new_dev"
     
-    mount "$new_p1_dev" "$MOUNT_DIR" 2>>"$loop_dir/mount_error.log"
-    if [ $? -ne 0 ]; then
+    if ! mount "$new_p1_dev" "$MOUNT_DIR" 2>>"$loop_dir/mount_error.log"; then
         log "${RED}FAIL: Mount failed${NC}"
         return 1
     fi
@@ -281,9 +288,7 @@ for (( i=1; i<=TOTAL_LOOPS; i++ )); do
     log "       ROUND $i / $TOTAL_LOOPS  [Testing Device $LABEL]"
     log "--------------------------------------------"
 
-    run_cycle "${i}_Dev${LABEL}" "$TARGET_DEV"
-    
-    if [ $? -ne 0 ]; then
+    if ! run_cycle "${i}_Dev${LABEL}" "$TARGET_DEV"; then
         log "${RED}CRITICAL: Test Failed on Device $LABEL at Loop $i${NC}"
         bg_io_control "stop"
         exit 1

@@ -163,12 +163,15 @@ set -e
 " "$cmd" > "$tmp_script"
     chmod +x "$tmp_script"
     echo -n -e "  执行: ${cmd} ... "
+    local rc=0
     if sudo bash "$tmp_script" >/dev/null 2>&1; then
         echo -e "${GREEN}[成功]${NC}"
     else
+        rc=$?
         echo -e "${RED}[失败或不支持]${NC}"
     fi
     rm -f "$tmp_script"
+    return $rc
 }
 
 #############################################################################

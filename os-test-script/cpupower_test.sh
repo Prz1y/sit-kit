@@ -49,7 +49,9 @@ else
 fi
 
 if [ "$(id -u)" -ne 0 ]; then
-  echo "建议以 root 或通过 sudo 运行此脚本以确保能设置 governor。"
+  echo "错误：此脚本需要 root 权限来设置 CPU governor 和读取 cpufreq 接口。" >&2
+  echo "请以 root 身份运行，或使用: sudo $0" >&2
+  exit 1
 fi
 
 # 创建结果目录（每个 governor 一个子目录）

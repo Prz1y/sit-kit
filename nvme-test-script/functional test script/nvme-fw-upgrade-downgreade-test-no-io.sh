@@ -29,7 +29,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH
 
 # --------------------------- Configuration (edit before running) -------------
 NVME_DEVICE="/dev/nvme0n1"
-FW_LOCAL_DIR="."                # Directory containing FW files (same dir as script)
+FW_LOCAL_DIR="."                # Directory containing FW files (resolved to abs path at start)
 VENDOR_TOOL=""              # Path to vendor tool (optional); leave empty to use nvme-cli only
 DD_BS="1024k"
 DD_COUNT="1000"
@@ -38,6 +38,12 @@ DD_OUTPUT="/root/test1.log" # DD destination file (as per test spec; deleted aft
 # Paths (auto-calculated, no need to modify)
 SCRIPT_PATH="$(realpath "$0")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
+
+# Resolve FW_LOCAL_DIR to absolute path: @reboot cron has different cwd than interactive shell
+FW_LOCAL_DIR="$(cd "$FW_LOCAL_DIR" 2>/dev/null && pwd)" || {
+    echo "[ERROR] FW_LOCAL_DIR '$FW_LOCAL_DIR' does not exist or is not accessible." >&2
+    exit 1
+}
 STATE_FILE="${SCRIPT_DIR}/fw_test.state"  # Checkpoint file: STAGE|RESULT_DIR
 RESULT_DIR=""               # Set in main() based on checkpoint
 LOG_FILE=""                 # Set in main() based on checkpoint
@@ -492,6 +498,10 @@ main() {
         exit 1
     fi
 
+    # Scan FW directory for firmware files, sorted lexicographically by filename.
+    # NOTE: Files are sorted by filename, not by embedded version number.
+    # If your naming convention doesn't sort correctly by version (e.g. v2, v10),
+    # rename files to include zero-padded version numbers (e.g. v02_..., v10_...).
     mapfile -t HISTORY_FW_LIST < <(find "$FW_LOCAL_DIR" -maxdepth 1 -type f \( -iname "*.bin" -o -iname "*.fw" \) | sort)
     if [ ${#HISTORY_FW_LIST[@]} -lt 2 ]; then
         log "ERROR: At least 2 firmware files required (latest + historical)"

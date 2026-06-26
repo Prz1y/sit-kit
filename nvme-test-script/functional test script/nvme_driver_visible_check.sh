@@ -36,7 +36,7 @@ for ((i=1; i<=LOOP_COUNT; i++)); do
     echo "------------------------------------------------"
     # 执行 ls 命令，并将 标准输出 和 错误输出 都捕获
     # 预期结果是看到 "No such file or directory"
-    LS_OUTPUT=$(ls -1 /dev/nvme* 2>&1)
+    LS_OUTPUT=$(ls -1 /dev/nvme* 2>&1 || true)
     echo "$LS_OUTPUT"
     echo "------------------------------------------------"
 
@@ -45,7 +45,7 @@ for ((i=1; i<=LOOP_COUNT; i++)); do
     echo "------------------------------------------------"
     # 执行 lsmod 命令
     # 预期结果是没有任何输出 (Empty)
-    LSMOD_OUTPUT=$(lsmod | grep "^nvme " 2>&1)
+    LSMOD_OUTPUT=$(lsmod | grep "^nvme " 2>&1 || true)
     if [ -z "$LSMOD_OUTPUT" ]; then
         echo "(No Output - Module is unloaded)"
     else

@@ -183,7 +183,7 @@ run_fio() {
     local iostat_pid=$!
     PIDS+=("$iostat_pid")
 
-    if ! fio --name="${job_name}" --filename="${fio_filename}" \
+    fio --name="${job_name}" --filename="${fio_filename}" \
         --rw="${rw}" --bs="${bs}" \
         --iodepth="${iodepth}" --numjobs="${numjobs}" \
         --direct=1 --ioengine=libaio --thread=1 \
@@ -193,8 +193,9 @@ run_fio() {
         --output-format=json --output="${json_out}" \
         --end_fsync=0 --buffer_compress_percentage=0 \
         --invalidate=1 --refill_buffers --exitall \
-        ${extra_flags:+$extra_flags} 2>&1; then
-        local rc=$?
+        ${extra_flags:+$extra_flags} 2>&1
+    local rc=$?
+    if [ "$rc" -ne 0 ]; then
         log_error "fio 失败 (退出码: ${rc}): ${json_out}"
         kill "$iostat_pid" 2>/dev/null || true
         wait "$iostat_pid" 2>/dev/null || true

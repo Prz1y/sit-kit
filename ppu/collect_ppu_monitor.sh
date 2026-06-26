@@ -44,7 +44,13 @@ for DEVICE_ID in "${DEVICES[@]}"; do
     # CE/CU Stress
     ppudbg --device "$DEVICE_ID" --monitor \
         > "$LOG_DIR/dev${DEVICE_ID}_ce_cu_stress.txt" 2>&1 &
-    PIDS+=("$!")
+    local _pid=$!
+    sleep 1
+    if kill -0 "$_pid" 2>/dev/null; then
+        PIDS+=("$_pid")
+    else
+        echo "[WARN] ppudbg --device $DEVICE_ID --monitor exited immediately" >&2
+    fi
 
     # Power Info
     ppudbg --device "$DEVICE_ID" --monitor power \

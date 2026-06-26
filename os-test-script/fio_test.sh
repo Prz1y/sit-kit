@@ -119,6 +119,7 @@ start_log_collection
 fio --name=rw_test --rw=randrw --rwmixread=70 --bs=4k --size="$FIO_SIZE" \
     --numjobs=4 --runtime="$DURATION" --time_based --group_reporting \
     --filename="$TARGET_DEVICE" --output="$FIO_RESULT" 2>&1
+FIO_EXIT=$?
 
 sleep 2
 stop_log_collection
@@ -134,6 +135,16 @@ stop_log_collection
     echo "  - FIO结果: $(basename "$FIO_RESULT")"
     echo "================================================"
 } >> "$REPORT_FILE" 2>&1
+
+if [ "$FIO_EXIT" -ne 0 ]; then
+    {
+        echo "错误: fio 测试失败 (退出码: $FIO_EXIT)"
+        echo "测试结束时间: $(date '+%Y-%m-%d %H:%M:%S')"
+    } >> "$REPORT_FILE" 2>&1
+    echo "✗ FIO 测试失败 (退出码: $FIO_EXIT)"
+    echo "✗ 详细结果请查看: $(basename "$FIO_RESULT")"
+    exit 1
+fi
 
 echo "✓ FIO 测试已完成"
 echo "✓ 所有结果已保存至: $SCRIPT_DIR"

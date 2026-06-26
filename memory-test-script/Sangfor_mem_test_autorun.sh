@@ -50,7 +50,8 @@ on_interrupt() {
   exit 130
 }
 
-trap on_interrupt INT TERM EXIT
+trap on_interrupt INT TERM
+trap cleanup_processes EXIT
 
 echo "[$(date)] ========== ECC 内存压测开始 =========="
 

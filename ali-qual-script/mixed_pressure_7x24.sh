@@ -1,4 +1,10 @@
 #!/bin/bash
+#
+# WARNING:
+#   This script may modify block devices, create partitions, run mkfs, disable
+#   swap, clear/backup logs, and generate sustained CPU/memory/IO pressure.
+#   Run it only on RD/lab machines where data loss and service interruption are acceptable.
+#
 
 set -uo pipefail
 
@@ -33,6 +39,8 @@ FIO_MOUNT_LIST_FILE="${LOG_DIR}/.fio_mount_points"
 
 __STOPPING=0
 
+echo "[WARN] mixed_pressure_7x24.sh may repartition/format test disks, disable swap, and clear or overwrite logs. Use only on RD/lab machines." >&2
+
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 log_info()  { log "[INFO]  $*"; }
 log_warn()  { log "[WARN]  $*"; }
@@ -56,6 +64,7 @@ load_config() {
     MEM_ACCESS_MODE="all"
     LOG_CLEANUP_MODE="backup"
     SYSTEM_LOG_ACTION="backup"
+    ALLOW_AUTO_PREPARE=false
 
     if [ -f "$CONF_FILE" ]; then
         log_info "加载配置文件: ${CONF_FILE}"
@@ -292,6 +301,26 @@ gather_block_devices() {
     return 0
 }
 
+is_safe_test_disk() {
+    local disk="$1"
+    local sig
+    sig=$(blkid -p -o value -s TYPE "$disk" 2>/dev/null || true)
+    case "$sig" in
+        "" ) return 0 ;;
+        LVM2_member|linux_raid_member|crypto_LUKS|swap) return 1 ;;
+        * ) return 1 ;;
+    esac
+}
+
+authorize_disk() {
+    local disk="$1"
+    [ "${ALLOW_AUTO_PREPARE:-false}" = "true" ] && return 0
+    local trimmed
+    trimmed=$(echo " ${FIO_DISKS:-} " | xargs)
+    [ -z "${trimmed}" ] && return 0
+    echo " ${trimmed} " | grep -q " ${disk} "
+}
+
 prepare_and_format_disk() {
     local disk="$1"
     local best_part=""
@@ -311,9 +340,20 @@ prepare_and_format_disk() {
     
     if [ -z "$best_part" ]; then
         if ! lsblk -nlo MOUNTPOINT "$disk" 2>/dev/null | grep -q "[a-zA-Z0-9]"; then
+            if ! is_safe_test_disk "$disk"; then
+                log_warn "非系统盘 ${disk} 检测到受保护签名(Raid/LVM/加密/swap)，跳过自动格式化" >&2
+                echo ""
+                return 0
+            fi
             log_info "非系统盘 ${disk} 无可用文件系统且未挂载，执行自动分区与 ext4 格式化..." >&2
-            wipefs -a "$disk" >/dev/null 2>&1 || true
-            parted -s "$disk" mklabel gpt mkpart primary ext4 0% 100% >/dev/null 2>&1 || true
+            if ! wipefs -a "$disk" >/dev/null 2>&1; then
+                log_error "wipefs 失败: ${disk}"
+                return 1
+            fi
+            if ! parted -s "$disk" mklabel gpt mkpart primary ext4 0% 100% >/dev/null 2>&1; then
+                log_error "parted 分区失败: ${disk}"
+                return 1
+            fi
             sleep 2
             
             local new_part=""
@@ -327,7 +367,15 @@ prepare_and_format_disk() {
             fi
             
             if [ -n "$new_part" ] && [ -b "$new_part" ]; then
-                mkfs.ext4 -F "$new_part" >/dev/null 2>&1 && best_part="$new_part"
+                if mkfs.ext4 -F "$new_part" >/dev/null 2>&1; then
+                    best_part="$new_part"
+                else
+                    log_error "mkfs.ext4 失败: ${new_part}"
+                    return 1
+                fi
+            else
+                log_error "自动分区后未发现可用分区: ${disk}"
+                return 1
             fi
         else
             log_warn "非系统盘 ${disk} 存在已挂载分区，跳过自动格式化" >&2
@@ -344,7 +392,10 @@ find_data_disks() {
             [ -b "$disk" ] || continue
             is_system_disk "$disk" && continue
             local bp
-            bp=$(prepare_and_format_disk "$disk")
+            if ! bp=$(prepare_and_format_disk "$disk"); then
+                log_error "指定测试盘准备失败: ${disk}"
+                return 1
+            fi
             [ -n "$bp" ] && valid_disks="${valid_disks} ${bp}"
         done
         valid_disks=$(echo "$valid_disks" | xargs)
@@ -357,8 +408,12 @@ find_data_disks() {
 
     for disk in $all_disks; do
         is_system_disk "$disk" && continue
+        authorize_disk "$disk" || { log_warn "未授权磁盘，跳过: ${disk}" >&2; continue; }
         local bp
-        bp=$(prepare_and_format_disk "$disk")
+        if ! bp=$(prepare_and_format_disk "$disk"); then
+            log_warn "自动发现磁盘准备失败，跳过: ${disk}" >&2
+            continue
+        fi
         [ -z "$bp" ] && continue
         valid_disks="${valid_disks} ${bp}"
         log_info "  数据盘/分区: ${bp} (ext4/xfs)" >&2
@@ -897,7 +952,10 @@ do_start() {
 
     log_info "Step 9: 查找可用数据盘..."
     local data_disks
-    data_disks=$(find_data_disks) || true
+    if ! data_disks=$(find_data_disks); then
+        log_warn "查找或准备数据盘失败，回退到文件级压测模式"
+        data_disks=""
+    fi
     data_disks=$(echo "$data_disks" | xargs)
 
     local fio_mode

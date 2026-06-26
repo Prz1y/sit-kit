@@ -3,12 +3,15 @@
 # 功能：查询OS下NVMe SSD的详细信息，按容量点分类存入不同文件夹
 # 依赖：nvme-cli, lspci(pciutils), lsblk(util-linux)
 # 用法：直接运行 ./nvme_info_query.sh
+# WARNING: This script deletes and recreates its output directory under the current path.
 set -o pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR" || exit 1
 
 OUTPUT_ROOT="nvme_info_output"
+
+echo "WARNING: nvme_info_query.sh will delete and recreate ${OUTPUT_ROOT} under the current directory." >&2
 
 # 检查依赖命令
 check_deps()

@@ -40,6 +40,40 @@ do
     esac
 done
 
+# require_log: exit with error if log file missing or empty
+require_log() {
+    local log_file="$1"
+    if [[ ! -s "$log_file" ]]; then
+        echo "ERROR: missing or empty log file: $log_file" >&2
+        exit 1
+    fi
+}
+
+# extract_metric: extract a single FIO metric from a log file block.
+# Usage: extract_metric <log_file> <pattern> <metric_type>
+# metric_type: iops | bandwidth | latency_value | latency_unit
+extract_metric() {
+    local log_file="$1"
+    local pattern="$2"
+    local metric_type="$3"
+    local block
+    block=$(grep -A4 "${pattern}: \\(groupid=" "$log_file" 2>/dev/null || true)
+    case "$metric_type" in
+        iops)
+            echo "$block" | grep IOPS | tr -d ' ' | awk -F"," '{print $1}' | awk -F"=" '{print $2}'
+            ;;
+        bandwidth)
+            echo "$block" | grep IOPS | grep -Eo "[0-9]+\.?[0-9]*[GgMmKk]?B/s" | head -1
+            ;;
+        latency_value)
+            echo "$block" | grep -w lat | tr -d ' ' | awk -F"," '{print $(NF-1)}' | awk -F"=" '{print $2}'
+            ;;
+        latency_unit)
+            echo "$block" | grep -w lat | tr -d ' ' | awk -F"," '{print $1}' | grep -Eo "[umn]?sec"
+            ;;
+    esac
+}
+
 
 filter_ssd_hdd_nvme_set()
 {
@@ -98,14 +132,14 @@ filter_multi_nvme_sequence_log()
         for dev in $(cat nvme_symbol_set)
         do
             echo -n "ssd_${dev}," >> filter_multi_nvme_${rw}.csv
+            local log_file="ssd_${dev}_${rw}.log"
+            require_log "$log_file"
             for pattern in 128k_1_32 128k_1_64 128k_1_128 128k_1_256 128k_1_512 4k_2_32 64k_2_32 256k_2_32 1m_2_32
             do
-                iops=$(grep -A4 "${rw}_${pattern}:\ (groupid=" |grep IOPS |tr -d ' ' |awk -F"," '{print $1}' |awk -F"=" '{print $2}')
-                bandWidth=$(grep -A4 "${rw}_${pattern}:\ (groupid=" |grep IOPS |grep -Eo "[0-9]+\.?[0-9]*[G|g|M|m|K|k]?B/s" | head -1)
-                avgLatValue=$(grep -A4 "${rw}_${pattern}:\ (groupid=" |grep -w lat |tr -d ' ' \
-				|awk -F"," '{print $(NF-1)}' |awk -F"=" '{print $2}')
-                avgLatUnit=$(grep -A4 "${rw}_${pattern}:\ (groupid=" |grep -w lat |tr -d ' ' \
-				|awk -F"," '{print $1}' |grep -Eo "[u|m|n]?sec")
+                iops=$(extract_metric "$log_file" "${rw}_${pattern}" iops)
+                bandWidth=$(extract_metric "$log_file" "${rw}_${pattern}" bandwidth)
+                avgLatValue=$(extract_metric "$log_file" "${rw}_${pattern}" latency_value)
+                avgLatUnit=$(extract_metric "$log_file" "${rw}_${pattern}" latency_unit)
                 avgLat=${avgLatValue}${avgLatUnit}
                 echo -n "${iops},${bandWidth},${avgLat}," >> filter_multi_nvme_${rw}.csv
             done
@@ -132,15 +166,15 @@ filter_multi_nvme_random_log()
         for dev in $(cat nvme_symbol_set)
         do
             echo -n "ssd_${dev}," >> filter_multi_nvme_${rw}.csv
+            local log_file="ssd_${dev}_${rw}.log"
+            require_log "$log_file"
             for pattern in 4k_1_1 4k_1_32 4k_2_32 4k_2_256 4k_4_32 4k_4_64 4k_8_1 4k_8_32 4k_8_64 4k_8_256 4k_16_64 \
 		8k_1_32 8k_4_64 8k_8_1 8k_8_32 8k_8_64 64k_2_32 128k_2_64 256k_2_32 1m_2_32
             do  
-                iops=$(grep -A4 "${rw}_${pattern}:\ (groupid=" |grep IOPS |tr -d ' ' |awk -F"," '{print $1}' |awk -F"=" '{print $2}')
-                bandWidth=$(grep -A4 "${rw}_${pattern}:\ (groupid=" |grep IOPS |grep -Eo "[0-9]+\.?[0-9]*[G|g|M|m|K|k]?B/s" | head -1)
-                avgLatValue=$(grep -A4 "${rw}_${pattern}:\ (groupid=" |grep -w lat |tr -d ' ' \
-                |awk -F"," '{print $(NF-1)}' |awk -F"=" '{print $2}')
-                avgLatUnit=$(grep -A4 "${rw}_${pattern}:\ (groupid=" |grep -w lat |tr -d ' ' \
-                |awk -F"," '{print $1}' |grep -Eo "[u|m|n]?sec")
+                iops=$(extract_metric "$log_file" "${rw}_${pattern}" iops)
+                bandWidth=$(extract_metric "$log_file" "${rw}_${pattern}" bandwidth)
+                avgLatValue=$(extract_metric "$log_file" "${rw}_${pattern}" latency_value)
+                avgLatUnit=$(extract_metric "$log_file" "${rw}_${pattern}" latency_unit)
                 avgLat=${avgLatValue}${avgLatUnit}
                 echo -n "${iops},${bandWidth},${avgLat}," >> filter_multi_nvme_${rw}.csv
             done
@@ -178,14 +212,14 @@ filter_multi_ssd_sequence_log()
         for dev in $(cat ssd_symbol_set)
         do
             echo -n "ssd_${dev}," >> filter_multi_ssd_${rw}.csv
+            local log_file="ssd_${dev}_${rw}.log"
+            require_log "$log_file"
             for pattern in 128k_1_32 128k_1_64 128k_1_128 128k_1_256 128k_1_512 4k_2_32 64k_2_32 256k_2_32 1m_2_32
             do  
-                iops=$(grep -A4 "${rw}_${pattern}:\ (groupid=" |grep IOPS |tr -d ' ' |awk -F"," '{print $1}' |awk -F"=" '{print $2}')
-                bandWidth=$(grep -A4 "${rw}_${pattern}:\ (groupid=" |grep IOPS |grep -Eo "[0-9]+\.?[0-9]*[G|g|M|m|K|k]?B/s" | head -1)
-                avgLatValue=$(grep -A4 "${rw}_${pattern}:\ (groupid=" |grep -w lat |tr -d ' ' \
-                |awk -F"," '{print $(NF-1)}' |awk -F"=" '{print $2}')
-                avgLatUnit=$(grep -A4 "${rw}_${pattern}:\ (groupid=" |grep -w lat |tr -d ' ' \
-                |awk -F"," '{print $1}' |grep -Eo "[u|m|n]?sec")
+                iops=$(extract_metric "$log_file" "${rw}_${pattern}" iops)
+                bandWidth=$(extract_metric "$log_file" "${rw}_${pattern}" bandwidth)
+                avgLatValue=$(extract_metric "$log_file" "${rw}_${pattern}" latency_value)
+                avgLatUnit=$(extract_metric "$log_file" "${rw}_${pattern}" latency_unit)
                 avgLat=${avgLatValue}${avgLatUnit}
                 echo -n "${iops},${bandWidth},${avgLat}," >> filter_multi_ssd_${rw}.csv
             done
@@ -212,15 +246,15 @@ filter_multi_ssd_random_log()
         for dev in $(cat ssd_symbol_set)
         do
             echo -n "ssd_${dev}," >> filter_multi_ssd_${rw}.csv
+            local log_file="ssd_${dev}_${rw}.log"
+            require_log "$log_file"
             for pattern in 4k_1_1 4k_1_32 4k_2_32 4k_2_256 4k_4_32 4k_4_64 4k_8_1 4k_8_32 4k_8_64 4k_8_256 4k_16_64 \
                 8k_1_32 8k_4_64 8k_8_1 8k_8_32 8k_8_64 64k_2_32 128k_2_64 256k_2_32 1m_2_32
             do  
-                iops=$(grep -A4 "${rw}_${pattern}:\ (groupid=" |grep IOPS |tr -d ' ' |awk -F"," '{print $1}' |awk -F"=" '{print $2}')
-                bandWidth=$(grep -A4 "${rw}_${pattern}:\ (groupid=" |grep IOPS |grep -Eo "[0-9]+\.?[0-9]*[G|g|M|m|K|k]?B/s" | head -1)
-                avgLatValue=$(grep -A4 "${rw}_${pattern}:\ (groupid=" |grep -w lat |tr -d ' ' \
-                |awk -F"," '{print $(NF-1)}' |awk -F"=" '{print $2}')
-                avgLatUnit=$(grep -A4 "${rw}_${pattern}:\ (groupid=" |grep -w lat |tr -d ' ' \
-                |awk -F"," '{print $1}' |grep -Eo "[u|m|n]?sec")
+                iops=$(extract_metric "$log_file" "${rw}_${pattern}" iops)
+                bandWidth=$(extract_metric "$log_file" "${rw}_${pattern}" bandwidth)
+                avgLatValue=$(extract_metric "$log_file" "${rw}_${pattern}" latency_value)
+                avgLatUnit=$(extract_metric "$log_file" "${rw}_${pattern}" latency_unit)
                 avgLat=${avgLatValue}${avgLatUnit}
                 echo -n "${iops},${bandWidth},${avgLat}," >> filter_multi_ssd_${rw}.csv
             done
@@ -258,14 +292,14 @@ filter_multi_hdd_sequence_log()
         for dev in $(cat hdd_symbol_set)
         do
             echo -n "hdd_${dev}," >> filter_multi_hdd_${rw}.csv
+            local log_file="hdd_${dev}_${rw}.log"
+            require_log "$log_file"
             for pattern in 4k_2_32 64k_2_32 256k_2_32 1m_1_32 1m_2_32
             do
-                iops=$(grep -A4 "${rw}_${pattern}:\ (groupid=" |grep IOPS |tr -d ' ' |awk -F"," '{print $1}' |awk -F"=" '{print $2}')
-                bandWidth=$(grep -A4 "${rw}_${pattern}:\ (groupid=" |grep IOPS |grep -Eo "[0-9]+\.?[0-9]*[G|g|M|m|K|k]?B/s" | head -1)
-                avgLatValue=$(grep -A4 "${rw}_${pattern}:\ (groupid=" |grep -w lat |tr -d ' ' \
-                |awk -F"," '{print $(NF-1)}' |awk -F"=" '{print $2}')
-                avgLatUnit=$(grep -A4 "${rw}_${pattern}:\ (groupid=" |grep -w lat |tr -d ' ' \
-                |awk -F"," '{print $1}' |grep -Eo "[u|m|n]?sec")
+                iops=$(extract_metric "$log_file" "${rw}_${pattern}" iops)
+                bandWidth=$(extract_metric "$log_file" "${rw}_${pattern}" bandwidth)
+                avgLatValue=$(extract_metric "$log_file" "${rw}_${pattern}" latency_value)
+                avgLatUnit=$(extract_metric "$log_file" "${rw}_${pattern}" latency_unit)
                 avgLat=${avgLatValue}${avgLatUnit}
                 echo -n "${iops},${bandWidth},${avgLat}," >> filter_multi_hdd_${rw}.csv
             done
@@ -290,14 +324,14 @@ filter_multi_hdd_random_log()
     for dev in $(cat hdd_symbol_set)
     do
         echo -n "hdd_${dev}," >> filter_multi_hdd_randread.csv
+        local log_file="hdd_${dev}_randread.log"
+        require_log "$log_file"
         for pattern in 4k_1_1 4k_1_4 4k_1_8 4k_1_16 8k_1_1 8k_1_32 4k_1_32 4k_2_32 64k_2_32 256k_2_32 1m_2_32
         do
-            iops=$(grep -A4 "randread_${pattern}:\ (groupid=" |grep IOPS |tr -d ' ' |awk -F"," '{print $1}' |awk -F"=" '{print $2}')
-            bandWidth=$(grep -A4 "randread_${pattern}:\ (groupid=" |grep IOPS |grep -Eo "[0-9]+\.?[0-9]*[G|g|M|m|K|k]?B/s" | head -1)
-            avgLatValue=$(grep -A4 "randread_${pattern}:\ (groupid=" |grep -w lat |tr -d ' ' \
-            |awk -F"," '{print $(NF-1)}' |awk -F"=" '{print $2}')
-            avgLatUnit=$(grep -A4 "randread_${pattern}:\ (groupid=" |grep -w lat |tr -d ' ' \
-            |awk -F"," '{print $1}' |grep -Eo "[u|m|n]?sec")
+            iops=$(extract_metric "$log_file" "randread_${pattern}" iops)
+            bandWidth=$(extract_metric "$log_file" "randread_${pattern}" bandwidth)
+            avgLatValue=$(extract_metric "$log_file" "randread_${pattern}" latency_value)
+            avgLatUnit=$(extract_metric "$log_file" "randread_${pattern}" latency_unit)
             avgLat=${avgLatValue}${avgLatUnit}
             echo -n "${iops},${bandWidth},${avgLat}," >> filter_multi_hdd_randread.csv
         done
@@ -318,14 +352,14 @@ filter_multi_hdd_random_log()
     for dev in $(cat hdd_symbol_set)
     do
         echo -n "hdd_${dev}," >> filter_multi_hdd_randwrite.csv
+        local log_file="hdd_${dev}_randwrite.log"
+        require_log "$log_file"
         for pattern in 4k_1_1 4k_2_32 64k_2_32 256k_2_32 1m_2_32
         do
-            iops=$(grep -A4 "randwrite_${pattern}:\ (groupid=" |grep IOPS |tr -d ' ' |awk -F"," '{print $1}' |awk -F"=" '{print $2}')
-            bandWidth=$(grep -A4 "randwrite_${pattern}:\ (groupid=" |grep IOPS |grep -Eo "[0-9]+\.?[0-9]*[G|g|M|m|K|k]?B/s" | head -1)
-            avgLatValue=$(grep -A4 "randwrite_${pattern}:\ (groupid=" |grep -w lat |tr -d ' ' \
-            |awk -F"," '{print $(NF-1)}' |awk -F"=" '{print $2}')
-            avgLatUnit=$(grep -A4 "randwrite_${pattern}:\ (groupid=" |grep -w lat |tr -d ' ' \
-            |awk -F"," '{print $1}' |grep -Eo "[u|m|n]?sec")
+            iops=$(extract_metric "$log_file" "randwrite_${pattern}" iops)
+            bandWidth=$(extract_metric "$log_file" "randwrite_${pattern}" bandwidth)
+            avgLatValue=$(extract_metric "$log_file" "randwrite_${pattern}" latency_value)
+            avgLatUnit=$(extract_metric "$log_file" "randwrite_${pattern}" latency_unit)
             avgLat=${avgLatValue}${avgLatUnit}
             echo -n "${iops},${bandWidth},${avgLat}," >> filter_multi_hdd_randwrite.csv
         done

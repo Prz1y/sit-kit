@@ -2,10 +2,14 @@
 # ==============================================================================
 # NVMe Parallel Physical Slot Power Cycle Test
 # Target: /sys/bus/pci/slots/ID/power (0=Off, 1=On)
+# WARNING: This script power-cycles NVMe slots and writes test data directly to
+# target devices. Run it only on RD/lab machines where data loss is acceptable.
 # ==============================================================================
 
 set -e
 set -o pipefail
+
+echo "WARNING: nvme_slot_power_test.sh will power-cycle NVMe slots and write test data directly to disks." >&2
 
 # --- 1. 环境准备 ---
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
@@ -112,9 +116,15 @@ for d in $drives; do
 done
 
 log "All threads launched. Waiting for completion..."
+failed_pids=()
 for pid in "${pids[@]}"; do
-    wait "$pid" || true
+    if ! wait "$pid"; then
+        failed_pids+=("$pid")
+    fi
 done
+if [ ${#failed_pids[@]} -gt 0 ]; then
+    log "ERROR: Some worker threads failed: ${failed_pids[*]}"
+fi
 
 # --- 4. 结果汇总矩阵 ---
 echo -e "\n======================================================================" | tee -a "$SUMMARY_LOG"
@@ -136,3 +146,6 @@ for d in $drives; do
 done
 
 log "Test complete. Detailed logs: $LOG_DIR/details/"
+if [ ${#failed_pids[@]} -gt 0 ]; then
+    exit 1
+fi

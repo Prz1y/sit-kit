@@ -3,7 +3,11 @@
 # LTP 服务器全负载压力测试脚本
 # 用途：通过 LTP 对服务器进行 CPU/内存/IO/网络综合压力测试
 #       CPU 目标占用 ~100%，内存目标占用 ~95%
+# WARNING: This script clears kernel/journal logs, removes prior stress logs in
+# /tmp, and drives the host to sustained high utilization. Run it only on RD/lab machines.
 # ============================================================
+
+echo "WARNING: ltp_stress_server.sh will clear logs, remove old /tmp stress artifacts, and push the host to sustained high load." >&2
 
 # -------- 基础配置 --------
 LTPROOT="/opt/ltp"
@@ -30,8 +34,10 @@ DURATION_SECS=$(duration_to_secs "$DURATION")
 
 # -------- 获取系统信息 --------
 CPU_COUNT=$(nproc)
-MEM_GB=$(free -g | awk '/^Mem:/{print $2}')
-DISK_FREE_GB=$(df /tmp --output=avail -BG | tail -1 | tr -d 'G')
+# Use portable memory/disk detection (not GNU-only free -g / df -BG)
+MEM_GB=$(free -g 2>/dev/null | awk '/^Mem:/{print $2}' || awk '/^MemTotal:/ {printf "%d", $2/1048576}' /proc/meminfo)
+DISK_FREE_GB=$(df /tmp --output=avail -BG 2>/dev/null | tail -1 | tr -d 'G' || \
+    awk '/\/tmp/ {printf "%d", $4/1024/1024}' /proc/mounts)
 
 echo "========================================"
 echo " LTP 服务器全负载压力测试"

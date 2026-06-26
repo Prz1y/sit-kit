@@ -171,13 +171,16 @@ set -e
 %s
 " "$cmd" > "$tmp_script"
     chmod +x "$tmp_script"
-    echo -n -e "  执行: ${cmd} ... "
+    echo -n -e "  ${cmd} ... "
+    local rc=0
     if sudo bash "$tmp_script" >/dev/null 2>&1; then
         echo -e "${GREEN}[成功]${NC}"
     else
+        rc=$?
         echo -e "${RED}[失败或不支持]${NC}"
     fi
     rm -f "$tmp_script"
+    return $rc
 }
 
 #############################################################################
@@ -332,8 +335,9 @@ stop_monitoring() {
     # softnet drops
     if [ -f "${LOG_DIR}/softnet_before.log" ] && [ -f "${LOG_DIR}/softnet_after.log" ]; then
         local sn_drop_b sn_drop_a
-        sn_drop_b=$(awk '{s+=strtonum("0x"$2)}END{print s}' "${LOG_DIR}/softnet_before.log" 2>/dev/null)
-        sn_drop_a=$(awk '{s+=strtonum("0x"$2)}END{print s}' "${LOG_DIR}/softnet_after.log" 2>/dev/null)
+        # NOTE: strtonum() requires GNU awk. On mawk (Debian default) the diff will report 0.
+        sn_drop_b=$(awk '{s+=strtonum("0x"$2)}END{print s}' "${LOG_DIR}/softnet_before.log" 2>/dev/null || echo 0)
+        sn_drop_a=$(awk '{s+=strtonum("0x"$2)}END{print s}' "${LOG_DIR}/softnet_after.log" 2>/dev/null || echo 0)
         echo ""
         log_info "softnet_stat 丢包 (全局): $((sn_drop_a - sn_drop_b))"
     fi

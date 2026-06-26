@@ -56,16 +56,14 @@ for nic in "${NICS[@]}"; do
     echo -e "  ${BOLD}--- $nic ---${NC}"
     
     # 驱动信息
-    drv_ver fw_ver
+    # (bare-word declarations removed; variables assigned below)
     drv_ver=$(ethtool -i "$nic" 2>/dev/null | grep 'version' | head -1)
     fw_ver=$(ethtool -i "$nic" 2>/dev/null | grep 'firmware' | head -1)
     echo "  $drv_ver"
     echo "  $fw_ver"
     
     # 链路状态
-    link_speed
     link_speed=$(ethtool "$nic" 2>/dev/null | grep 'Speed:' | awk '{print $2}')
-    link_status
     link_status=$(ethtool "$nic" 2>/dev/null | grep 'Link detected:' | awk '{print $3}')
     echo "  链路速率: $link_speed | 链路状态: $link_status"
     
@@ -79,16 +77,13 @@ for nic in "${NICS[@]}"; do
     fi
 
     # PCIe 带宽 (关键！)
-    pci_addr
     pci_addr=$(basename "$(readlink -f /sys/class/net/${nic}/device)" 2>/dev/null)
     if [ -n "$pci_addr" ]; then
         echo "  PCI 地址: $pci_addr"
         
-        pcie_speed pcie_width
         pcie_speed=$(lspci -vvs "$pci_addr" 2>/dev/null | grep "LnkSta:" | head -1 | grep -oP 'Speed \K[^,]+')
         pcie_width=$(lspci -vvs "$pci_addr" 2>/dev/null | grep "LnkSta:" | head -1 | grep -oP 'Width \K[^,]+')
         
-        pcie_cap_speed pcie_cap_width
         pcie_cap_speed=$(lspci -vvs "$pci_addr" 2>/dev/null | grep "LnkCap:" | head -1 | grep -oP 'Speed \K[^,]+')
         pcie_cap_width=$(lspci -vvs "$pci_addr" 2>/dev/null | grep "LnkCap:" | head -1 | grep -oP 'Width \K[^,]+')
         
@@ -106,7 +101,6 @@ for nic in "${NICS[@]}"; do
         fi
         
         # ASPM 状态 (应为 Disabled)
-        aspm
         aspm=$(lspci -vvs "$pci_addr" 2>/dev/null | grep "ASPM" | head -1)
         if echo "$aspm" | grep -qi "enabled\|L0s\|L1"; then
             warn "$nic PCIe ASPM 已启用 (省电模式会增加延迟): $aspm"
@@ -116,12 +110,10 @@ for nic in "${NICS[@]}"; do
     fi
 
     # NUMA 节点
-    nic_numa
     nic_numa=$(cat /sys/class/net/${nic}/device/numa_node 2>/dev/null)
     echo "  NUMA 节点: $nic_numa"
 
     # MTU
-    mtu
     mtu=$(cat /sys/class/net/${nic}/mtu 2>/dev/null)
     echo "  MTU: $mtu"
     if [ "$mtu" -lt 9000 ] 2>/dev/null; then
@@ -131,13 +123,11 @@ for nic in "${NICS[@]}"; do
     fi
 
     # Ring buffer
-    rx_ring tx_ring
     # 更可靠的方式
     echo "  Ring Buffer (ethtool -g):"
     ethtool -g "$nic" 2>/dev/null | grep -A1 "Current" | head -5 | sed 's/^/    /'
 
     # 队列数
-    combined_q
     combined_q=$(ethtool -l "$nic" 2>/dev/null | awk '/Current/{found=1} found && /Combined/{print $2; exit}')
     echo "  Combined 队列数: $combined_q"
 

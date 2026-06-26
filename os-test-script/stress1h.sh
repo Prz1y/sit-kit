@@ -143,12 +143,16 @@ while kill -0 "${STRESS_PID}" 2>/dev/null; do
 	fi
 done
 
+STRESS_EXIT=0
 if kill -0 "${STRESS_PID}" 2>/dev/null; then
-	wait "${STRESS_PID}" || true
+	set +e
+	wait "${STRESS_PID}"
+	STRESS_EXIT=$?
+	set -e
 fi
 
-if [ "${failed}" -eq 1 ]; then
-	log "检测到失败，退出码非零"
+if [ "${failed}" -eq 1 ] || [ "${STRESS_EXIT}" -ne 0 ]; then
+	log "检测到失败 (stress exit: ${STRESS_EXIT})"
 	echo "end_time=$(date +%F_%T)" >> "${RECORD_FILE}"
 	exit 1
 fi

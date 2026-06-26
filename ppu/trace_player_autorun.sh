@@ -19,19 +19,21 @@ echo "----------------------------------------"
 {
     start_time=$(date +%s)
     end_time=$((start_time + DURATION))
+    failed=0
 
     echo "[$(date)] 启动"
 
     while [ "$(date +%s)" -lt $end_time ]; do
         echo "[$(date)] loops started..."
 
-        "$TRACE_BIN" -s "$TRACE_STREAM" -n 22 -r 100000
-        AlippuDeviceIndex=1 "$TRACE_BIN" -s "$TRACE_STREAM" -n 22 -r 100000
+        "$TRACE_BIN" -s "$TRACE_STREAM" -n 22 -r 100000 || failed=1
+        AlippuDeviceIndex=1 "$TRACE_BIN" -s "$TRACE_STREAM" -n 22 -r 100000 || failed=1
 
         echo "[$(date)] loop done..."
     done
 
     echo "[$(date)] ALLDONE！"
+    exit $failed
 } 2>&1 | tee "$LOG_FILE"
 
 echo "----------------------------------------"

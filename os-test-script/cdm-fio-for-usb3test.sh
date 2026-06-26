@@ -3,6 +3,7 @@
 # ==========================================
 # 1. 基础配置
 # ==========================================
+FAILED_TESTS=0
 DEV="${1:-/dev/sdb}"               # 盘符
 RESULT_DIR="fio_results_$(date +%Y%m%d_%H%M%S)"
 SIZE="1G"                    # 测试数据范围；USB设备1G足够，NVMe/SATA SSD建议加大
@@ -92,6 +93,13 @@ run_fio "RND4K_Q1T1_Read"  "randread"  "4k" 1 1
 run_fio "RND4K_Q1T1_Write" "randwrite" "4k" 1 1
 
 echo "================================================"
-echo "所有测试已完成！"
-echo "请查看文件夹 $RESULT_DIR 获取详细报告。"
-ls -lh "$RESULT_DIR"
+if [ "$FAILED_TESTS" -gt 0 ]; then
+    echo "测试完成，但有 ${FAILED_TESTS} 项失败！"
+    echo "请查看文件夹 $RESULT_DIR 获取详细报告。"
+    ls -lh "$RESULT_DIR"
+    exit 1
+else
+    echo "所有测试已完成！"
+    echo "请查看文件夹 $RESULT_DIR 获取详细报告。"
+    ls -lh "$RESULT_DIR"
+fi

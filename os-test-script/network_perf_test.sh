@@ -169,7 +169,7 @@ parse_throughput() {
     local file="$1"
     [ -f "${file}" ] || { echo "N/A (文件不存在)"; return; }
     local val
-    val=$(awk 'NR>1 && /^[0-9]/' "${file}" | tail -n 1 | awk '{print $NF}')
+    val=$(awk 'NR>1 && /^[[:space:]]*[0-9]/' "${file}" | tail -n 1 | awk '{print $NF}')
     echo "${val:-N/A}"
 }
 
@@ -178,7 +178,7 @@ parse_rr_trans() {
     local file="$1"
     [ -f "${file}" ] || { echo "N/A (文件不存在)"; return; }
     local val
-    val=$(awk '/^[0-9]/ && NF>=5' "${file}" | tail -n 1 | awk '{print $NF}')
+    val=$(awk '/^[[:space:]]*[0-9]/ && NF>=5' "${file}" | tail -n 1 | awk '{print $NF}')
     echo "${val:-N/A}"
 }
 
@@ -188,7 +188,7 @@ parse_rr_latency() {
     [ -f "${file}" ] || { echo "N/A (文件不存在)"; return; }
     local val
     # 取数据行，字段数>=6时，倒数第二列为平均延迟
-    val=$(awk '/^[0-9]/ && NF>=6' "${file}" | tail -n 1 | awk '{print $(NF-1)}')
+    val=$(awk '/^[[:space:]]*[0-9]/ && NF>=6' "${file}" | tail -n 1 | awk '{print $(NF-1)}')
     echo "${val:-N/A}"
 }
 

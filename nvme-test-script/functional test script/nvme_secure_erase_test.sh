@@ -2,9 +2,13 @@
 # ==============================================================================
 # Script Name: nvme_full_disk_audit.sh
 # Description: 对 NVMe 进行全盘 Secure Erase 并生成覆盖全物理空间的 Hex Dump 审计报告
+# WARNING: This script issues secure erase commands against target NVMe devices
+# and destroys all data on those disks. Run it only on RD/lab machines.
 # ==============================================================================
 
 set -euo pipefail
+
+echo "WARNING: nvme_secure_erase_test.sh will issue secure erase commands and destroy all data on target NVMe devices." >&2
 
 # --- 参数配置 ---
 # 限制异常情况下的日志大小（例如擦除失败时，防止 Hex 文本撑爆系统盘）

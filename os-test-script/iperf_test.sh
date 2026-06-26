@@ -116,8 +116,10 @@ fi
 # 4. 执行 iPerf 测试
 # 参数说明：-c 客户端模式  -t 测试时长  -i 1 每秒输出一次报告  -f 单位
 log "[4/5] 开始执行 iPerf 测试 (服务器: ${SERVER_IP}, 时长: ${DURATION}s)..."
-if ! iperf -c "$SERVER_IP" -t "$DURATION" -i 1 -f "$IPERF_FORMAT" > "$IPERF_RAW" 2>&1; then
-    log "警告: iPerf 测试执行失败或返回非零值，请检查 $IPERF_RAW"
+IPERF_EXIT=0
+iperf -c "$SERVER_IP" -t "$DURATION" -i 1 -f "$IPERF_FORMAT" > "$IPERF_RAW" 2>&1 || IPERF_EXIT=$?
+if [ "$IPERF_EXIT" -ne 0 ]; then
+    log "错误: iPerf 测试执行失败 (退出码: $IPERF_EXIT)，请检查 $IPERF_RAW"
 fi
 
 # 停止本地 iperf 服务端（仅本脚本自行启动的情况）

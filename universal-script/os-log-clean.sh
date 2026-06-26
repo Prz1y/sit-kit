@@ -2,6 +2,11 @@
 set -euo pipefail
 # 清理日志用
 # Author : Prz1y
+# WARNING:
+#   This script truncates and deletes system logs under /var/log and /tmp.
+#   Run it only on RD/lab machines where loss of diagnostic history is acceptable.
+
+echo "WARNING: os-log-clean.sh will truncate or delete system logs and temporary log directories." >&2
 
 echo "[$(date)] ========== 开始清理日志 =========="
 

@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# WARNING:
+#   This script can issue nvme format commands when ALLOW_NVME_FORMAT=1 and will
+#   overwrite prior fio logs/results in the working directory. Use only on RD/lab machines.
 set -euo pipefail
 #****************************************************************#
 # Author: zhouq32@chinatelecom.cn
@@ -6,6 +9,8 @@ set -euo pipefail
 # add log filter function after fio test 
 # add multi nvme ssds fio with cpusbind functions
 #****************************************************************#
+
+echo "WARNING: run_parallel_disk.sh may format NVMe devices when ALLOW_NVME_FORMAT=1 and will replace prior local result files." >&2
 
 CPWD="$(cd -- "$(dirname -- "$0")" && pwd)"
 cd "$CPWD" || { echo "ERROR: failed to enter $CPWD" >&2; exit 1; }
@@ -19,6 +24,24 @@ move_glob()
     mapfile -t files < <(compgen -G "$pattern" || true)
     if [[ ${#files[@]} -gt 0 ]]; then
         mv -- "${files[@]}" "$dest"
+    fi
+}
+
+# wait_all_or_fail: wait for all child PIDs, return non-zero if any failed.
+# Outputs failed PIDs to stderr.
+wait_all_or_fail()
+{
+    local -a pids=("$@")
+    local -a failed=()
+    local pid
+    for pid in "${pids[@]}"; do
+        if ! wait "$pid"; then
+            failed+=("$pid")
+        fi
+    done
+    if [[ ${#failed[@]} -gt 0 ]]; then
+        printf 'ERROR: parallel child failed, PID: %s\n' "${failed[@]}" >&2
+        return 1
     fi
 }
 
@@ -258,9 +281,11 @@ nvme_parallel_fio_test()
             nohup "$CPWD/ssd_raw_fio_test.sh" "$dev" &>/dev/null &
             pids+=("$!")
         done
-        for pid in "${pids[@]}"; do
-            wait "$pid" || echo "WARNING: child failed: $pid" >&2
-        done
+        if ! wait_all_or_fail "${pids[@]}"; then
+            echo "ERROR: nvme parallel fio failed, skip result aggregation" >&2
+            cd "$CPWD" || exit 1
+            return 1
+        fi
         sleep 30
         move_glob "ssd_nvme*_*.log" "nvme_fio_log"
         cp multi_disk_log_filter.sh nvme_symbol_set nvme_fio_log
@@ -288,9 +313,11 @@ nvme_parallel_fio_test_with_cpusbind()
             nohup "$CPWD/nvme_raw_fio_test_with_cpubind.sh" "$dev" &>/dev/null &
             pids+=("$!")
         done
-        for pid in "${pids[@]}"; do
-            wait "$pid" || echo "WARNING: child failed: $pid" >&2
-        done
+        if ! wait_all_or_fail "${pids[@]}"; then
+            echo "ERROR: nvme cpusbind parallel fio failed, skip result aggregation" >&2
+            cd "$CPWD" || exit 1
+            return 1
+        fi
         sleep 30
         move_glob "ssd_nvme*_*.log" "cpusbind_nvme_fio_log"
         cp multi_disk_log_filter.sh nvme_symbol_set cpusbind_nvme_fio_log
@@ -316,9 +343,11 @@ nvme_parallel_fio_stress_test()
             nohup "$CPWD/ssd_fio_stress_test.sh" "$dev" &>/dev/null &
             pids+=("$!")
         done
-        for pid in "${pids[@]}"; do
-            wait "$pid" || echo "WARNING: child failed: $pid" >&2
-        done
+        if ! wait_all_or_fail "${pids[@]}"; then
+            echo "ERROR: nvme parallel stress test failed" >&2
+            cd "$CPWD" || exit 1
+            return 1
+        fi
         sleep 30
         move_glob "ssd_nvme*_stress.log" "nvme_fio_stress_log"
     fi
@@ -340,9 +369,11 @@ raid_parallel_fio_test()
             nohup "$CPWD/ssd_raw_fio_test.sh" "$dev" &>/dev/null &
             pids+=("$!")
         done
-        for pid in "${pids[@]}"; do
-            wait "$pid" || echo "WARNING: child failed: $pid" >&2
-        done
+        if ! wait_all_or_fail "${pids[@]}"; then
+            echo "ERROR: raid parallel fio failed, skip result aggregation" >&2
+            cd "$CPWD" || exit 1
+            return 1
+        fi
         sleep 30
         move_glob "raid_sd*_*.log" "ssd_raid_fio_log"
         cp multi_disk_log_filter.sh raid_symbol_set ssd_raid_fio_log
@@ -368,9 +399,11 @@ ssd_parallel_fio_test()
             nohup "$CPWD/ssd_raw_fio_test.sh" "$dev" &>/dev/null &
             pids+=("$!")
         done
-        for pid in "${pids[@]}"; do
-            wait "$pid" || echo "WARNING: child failed: $pid" >&2
-        done
+        if ! wait_all_or_fail "${pids[@]}"; then
+            echo "ERROR: ssd parallel fio failed, skip result aggregation" >&2
+            cd "$CPWD" || exit 1
+            return 1
+        fi
         sleep 30
         move_glob "ssd_sd*_*.log" "ssd_fio_log"
         cp multi_disk_log_filter.sh ssd_symbol_set ssd_fio_log
@@ -396,9 +429,11 @@ ssd_parallel_fio_stress_test()
             nohup "$CPWD/ssd_fio_stress_test.sh" "$dev" &>/dev/null &
             pids+=("$!")
         done
-        for pid in "${pids[@]}"; do
-            wait "$pid" || echo "WARNING: child failed: $pid" >&2
-        done
+        if ! wait_all_or_fail "${pids[@]}"; then
+            echo "ERROR: ssd parallel stress test failed" >&2
+            cd "$CPWD" || exit 1
+            return 1
+        fi
         sleep 30
         move_glob "ssd*_stress.log" "ssd_fio_stress_log"
     fi
@@ -420,9 +455,11 @@ hdd_parallel_fio_test()
             nohup "$CPWD/hdd_raw_fio_test.sh" "$dev" &>/dev/null &
             pids+=("$!")
         done
-        for pid in "${pids[@]}"; do
-            wait "$pid" || echo "WARNING: child failed: $pid" >&2
-        done
+        if ! wait_all_or_fail "${pids[@]}"; then
+            echo "ERROR: hdd parallel fio failed, skip result aggregation" >&2
+            cd "$CPWD" || exit 1
+            return 1
+        fi
         sleep 30
         move_glob "hdd_sd*_*.log" "hdd_fio_log"
         cp multi_disk_log_filter.sh hdd_symbol_set hdd_fio_log
@@ -448,9 +485,11 @@ hdd_parallel_fio_stress_test()
             nohup "$CPWD/hdd_fio_stress_test.sh" "$dev" &>/dev/null &
             pids+=("$!")
         done
-        for pid in "${pids[@]}"; do
-            wait "$pid" || echo "WARNING: child failed: $pid" >&2
-        done
+        if ! wait_all_or_fail "${pids[@]}"; then
+            echo "ERROR: hdd parallel stress test failed" >&2
+            cd "$CPWD" || exit 1
+            return 1
+        fi
         sleep 30
         move_glob "hdd*_stress.log" "hdd_fio_stress_log"
     fi

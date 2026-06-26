@@ -4,6 +4,8 @@
 # 版本   : 3.0
 # 作者   : SIT-Kit / Prz1y
 # 更新   : 2026-05
+# WARNING: This suite includes fio preconditioning and secure erase related
+# operations that can destroy data on target NVMe devices. Run it only on RD/lab machines.
 # ----------------------------------------------------------------------------
 # 说明:
 #   面向云场景的 NVMe 存储性能自动化测试套件。
@@ -31,6 +33,8 @@
 # ============================================================================
 
 set -euo pipefail
+
+echo "WARNING: nvme_snia_sss_pts_test_suite.sh may overwrite or secure-erase target NVMe devices during qualification." >&2
 
 # ============================================================================
 # 全局信号处理 (trap) -- 确保 Ctrl+C / kill 时清理所有 FIO 子进程
@@ -942,7 +946,8 @@ chmod +x "$PYTHON_ENGINE"
 
 echo "[INFO] Starting Python FIO test engine..."
 
-# 将 Bash 配置变量传递给 Python 引擎
+# Disable errexit before Python call so post-test diagnostics always run
+set +e
 python3 "$PYTHON_ENGINE" \
     --base_dir "$BASE_DIR" \
     --raw_dir "$RAW_DIR" \

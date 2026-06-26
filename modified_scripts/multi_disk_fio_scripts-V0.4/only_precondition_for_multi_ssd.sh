@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
+# WARNING:
+#   This script can issue nvme format commands when ALLOW_NVME_FORMAT=1 and runs
+#   preconditioning workloads that overwrite device contents. Use only on RD/lab machines.
 set -euo pipefail
+
+echo "WARNING: only_precondition_for_multi_ssd.sh may format NVMe devices and overwrite drive contents during preconditioning." >&2
 
 CPWD="$(cd -- "$(dirname -- "$0")" && pwd)"
 cd "$CPWD" || exit 1

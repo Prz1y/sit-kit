@@ -71,7 +71,8 @@ declare -A ALLOC_CACHE=()          # 预计算的核心分配缓存: [bdf:num]=c
 declare -a SPDK_PIDS=()            # 全局：后台 spdk_nvme_perf 进程 PID，用于 Ctrl+C 清理
                                    # 每次 run_spdk_test 结束后自动清空，避免积累已退出 PID
 declare -a SYSTEM_BDFS=()          # 全局：系统盘所在 NVMe 设备的 BDF 列表，严禁解绑
-declare -a BOUND_BDFS=()           # 全局：成功绑定到用户态驱动的设备 BDF 列表，用于退出时恢复
+declare -A ORIGINAL_DRIVER=()      # 全局：脚本执行前每个 NVMe BDF 的原始驱动快照，退出时按此恢复
+declare -A DRIVER_CHANGED=()       # 全局：标记脚本本次是否实际改绑了该设备，只有 true 才纳入退出恢复
 declare -a SAVED_GOVERNORS=()      # 全局：保存的 CPU governor 状态，用于退出时恢复
 declare -A SAVED_HUGEPAGES=()      # 全局：保存的大页初始值 (key: "node:dir")，退出时原值还原
 
@@ -89,35 +90,75 @@ log_err()   { echo -e "${RED}[ERROR]${NC} $*"; }
 log_step()  { echo -e "${CYAN}[====]${NC} ${BOLD}$*${NC}"; }
 
 # ===================== 信号处理与系统恢复 =====================
-# 将已绑定到用户态驱动的 NVMe 设备恢复为内核 nvme 驱动
+# 在驱动绑定前，为所有 NVME_BDFS 拍下原始驱动快照
+# 退出恢复时仅回滚脚本本次真正改动过的设备，避免误改已有的 SPDK 现场
+snapshot_driver_state() {
+    for bdf in "${NVME_BDFS[@]}"; do
+        if [ -L "/sys/bus/pci/devices/${bdf}/driver" ]; then
+            ORIGINAL_DRIVER[$bdf]=$(basename "$(readlink "/sys/bus/pci/devices/${bdf}/driver")" 2>/dev/null || echo "")
+        else
+            ORIGINAL_DRIVER[$bdf]=""
+        fi
+        DRIVER_CHANGED[$bdf]=false
+    done
+}
+
+# 将脚本本次改绑的 NVMe 设备恢复到执行前驱动状态
 restore_spdk_driver() {
-    if [ ${#BOUND_BDFS[@]} -eq 0 ]; then
+    local changed_count=0
+    for bdf in "${NVME_BDFS[@]}"; do
+        [ "${DRIVER_CHANGED[$bdf]:-false}" = "true" ] && changed_count=$((changed_count + 1))
+    done
+    if [ "$changed_count" -eq 0 ]; then
         return 0
     fi
-    log_info "正在恢复 NVMe 设备到内核 nvme 驱动..."
-    modprobe nvme 2>/dev/null || true   # 确保 nvme 内核模块已加载，防止 bind 路径不存在
-    for bdf in "${BOUND_BDFS[@]}"; do
+
+    log_info "正在恢复 NVMe 设备驱动到执行前状态..."
+    modprobe nvme 2>/dev/null || true
+
+    for bdf in "${NVME_BDFS[@]}"; do
+        [ "${DRIVER_CHANGED[$bdf]:-false}" = "true" ] || continue
+
+        local orig_drv="${ORIGINAL_DRIVER[$bdf]:-}"
+        log_info "  $bdf: 恢复为 $orig_drv ..."
+
+        # 先解绑当前驱动
         local cur_drv
         cur_drv=$(basename "$(readlink "/sys/bus/pci/devices/${bdf}/driver" 2>/dev/null)" 2>/dev/null || echo "")
-        if [[ "$cur_drv" == "vfio-pci" || "$cur_drv" == "uio_pci_generic" ]]; then
+        if [ -n "$cur_drv" ]; then
             echo "$bdf" > "/sys/bus/pci/devices/${bdf}/driver/unbind" 2>/dev/null || true
-            echo "" > "/sys/bus/pci/devices/${bdf}/driver_override" 2>/dev/null || true
-            echo "$bdf" > "/sys/bus/pci/drivers/nvme/bind" 2>/dev/null || true
-            local restored
-            restored=$(basename "$(readlink "/sys/bus/pci/devices/${bdf}/driver" 2>/dev/null)" 2>/dev/null || echo "")
-            if [ "$restored" = "nvme" ]; then
-                log_info "  $bdf 已恢复到 nvme 驱动"
-            else
-                log_warn "  $bdf 恢复失败，当前驱动: $restored"
-            fi
+        fi
+        echo "" > "/sys/bus/pci/devices/${bdf}/driver_override" 2>/dev/null || true
+
+        case "$orig_drv" in
+            nvme)
+                echo "$bdf" > "/sys/bus/pci/drivers/nvme/bind" 2>/dev/null || true
+                ;;
+            vfio-pci|uio_pci_generic)
+                echo "$bdf" > "/sys/bus/pci/drivers/${orig_drv}/bind" 2>/dev/null || {
+                    local vendor device
+                    vendor=$(cat "/sys/bus/pci/devices/${bdf}/vendor" 2>/dev/null || true)
+                    device=$(cat "/sys/bus/pci/devices/${bdf}/device" 2>/dev/null || true)
+                    if [ -n "$vendor" ] && [ -n "$device" ]; then
+                        echo "${vendor#0x} ${device#0x}" > "/sys/bus/pci/drivers/${orig_drv}/new_id" 2>/dev/null || true
+                        echo "$bdf" > "/sys/bus/pci/drivers/${orig_drv}/bind" 2>/dev/null || true
+                    fi
+                }
+                ;;
+            *)
+                log_warn "    $bdf: 原始驱动未知 ($orig_drv)，跳过恢复"
+                continue
+                ;;
+        esac
+
+        local restored
+        restored=$(basename "$(readlink "/sys/bus/pci/devices/${bdf}/driver" 2>/dev/null)" 2>/dev/null || echo "")
+        if [ "$restored" = "$orig_drv" ]; then
+            log_info "    $bdf 已恢复到 $orig_drv"
+        else
+            log_warn "    $bdf 恢复未达预期，当前驱动: $restored (目标: $orig_drv)"
         fi
     done
-    # SPDK setup.sh reset 与上方 BOUND_BDFS 逐设备恢复功能 100% 重叠，
-    # 保留精确的 BDF 恢复逻辑（可控性更强），setup.sh reset 仅作注释保留
-    # if [ -n "${SPDK_SETUP:-}" ] && [ -x "${SPDK_SETUP:-}" ]; then
-    #     "$SPDK_SETUP" reset 2>/dev/null || true
-    #     log_info "已执行 SPDK setup.sh reset"
-    # fi
 }
 
 # 恢复 CPU governor
@@ -402,6 +443,9 @@ setup_hugepages() {
 setup_spdk_driver() {
     log_step "SPDK 驱动绑定"
 
+    # 驱动快照：在 setup.sh 和 FORCE_BIND_ALL 之前记录每块盘原始驱动
+    snapshot_driver_state
+
     if [ -n "$SPDK_SETUP" ] && [ -x "$SPDK_SETUP" ]; then
         log_info "执行 SPDK setup.sh 绑定 NVMe 设备到用户态驱动..."
         # HUGEMEM 单位是 MB: 1GB 模式 8*1024=8192MB; 2MB 模式 4096*2=8192MB
@@ -433,7 +477,6 @@ setup_spdk_driver() {
         log_info "强制绑定模式: 目标用户态驱动 = $target_drv"
         modprobe "$target_drv" 2>/dev/null || true
 
-        BOUND_BDFS=()
         for bdf in "${NVME_BDFS[@]}"; do
             local sysfs_drv="/sys/bus/pci/devices/${bdf}/driver"
             local drv_name=""
@@ -472,7 +515,7 @@ setup_spdk_driver() {
                 new_drv=$(basename "$(readlink "/sys/bus/pci/devices/${bdf}/driver" 2>/dev/null)" 2>/dev/null || echo "未绑定")
                 if [ "$new_drv" = "$target_drv" ]; then
                     log_info "    $bdf 已成功绑定到 $target_drv"
-                    BOUND_BDFS+=("$bdf")
+                    DRIVER_CHANGED[$bdf]=true
                 else
                     log_warn "    $bdf 绑定失败，当前驱动: $new_drv"
                 fi
@@ -504,12 +547,11 @@ setup_spdk_driver() {
             valid_bdfs+=("$bdf")
             valid_numas+=("$numa")
             log_info "  $bdf -> 驱动: $drv_name"
-            # 记录所有成功绑定的设备（用于退出时恢复）
-            local already_tracked=false
-            for t in "${BOUND_BDFS[@]}"; do
-                [ "$t" = "$bdf" ] && already_tracked=true && break
-            done
-            $already_tracked || BOUND_BDFS+=("$bdf")
+            # 检测驱动是否被本次脚本改动（对比快照），纳入退出恢复
+            if [ "${DRIVER_CHANGED[$bdf]:-false}" != "true" ] && \
+               [ "$drv_name" != "${ORIGINAL_DRIVER[$bdf]:-}" ]; then
+                DRIVER_CHANGED[$bdf]=true
+            fi
         else
             log_warn "  $bdf -> 驱动: nvme (仍绑定内核驱动，已跳过; 如需强制绑定请设置 FORCE_BIND_ALL=true)"
         fi

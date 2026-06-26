@@ -94,8 +94,11 @@ while kill -0 "$MEMTESTER_PID" 2>/dev/null; do
     sleep 60
 done
 
-wait "$MEMTESTER_PID" || true
-echo "[Step 3] memtester finished."
+set +e
+wait "$MEMTESTER_PID" 2>/dev/null
+MEMTESTER_EXIT=$?
+set -e
+echo "[Step 3] memtester finished (exit code: $MEMTESTER_EXIT)."
 
 echo "--------------------------------------------------"
 echo "Step 4: Collect BMC Log During / After Test"
@@ -145,8 +148,8 @@ echo "--------------------------------------------------"
 echo "[Step 6] Checking memtester result..."
 if [ -f "$MEMTESTER_LOG" ]; then
     FAILURES=$(grep -i "FAILURE\|fail\|error" "$MEMTESTER_LOG" | head -10 || true)
-    if [ -n "$FAILURES" ]; then
-        echo "  [WARN] Failures/Errors found in memtester log:"
+    if [ -n "$FAILURES" ] || [ "$MEMTESTER_EXIT" -ne 0 ]; then
+        echo "  [WARN] Failures/Errors found or non-zero exit (${MEMTESTER_EXIT}):"
         echo "$FAILURES" | tee "$LOG_DIR/memtester_failures.log"
         TEST_RESULT="FAIL"
     else

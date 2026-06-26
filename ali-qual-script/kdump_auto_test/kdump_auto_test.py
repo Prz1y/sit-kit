@@ -423,7 +423,7 @@ class KdumpAutoTest:
             )
             # 重新添加 crashkernel 参数
             self.ssh_cmd(
-                'sed -i \'s/GRUB_CMDLINE_LINUX="/GRUB_CMDLINE_LINUX="crashkernel=512M /\''
+                'sed -i \'s/GRUB_CMDLINE_LINUX="/GRUB_CMDLINE_LINUX="crashkernel=' + self.crashkernel_size + ' /\''
                 ' /etc/default/grub'
             )
 
@@ -533,6 +533,7 @@ class KdumpAutoTest:
         # 监测 SOL 日志
         start = time.time()
         last_size = 0
+        reboot_detected = False
         while time.time() - start < self.crash_timeout:
             time.sleep(5)
 
@@ -551,11 +552,15 @@ class KdumpAutoTest:
                         line_lower = line.lower()
                         if any(kw in line_lower for kw in ["restarting", "reboot:", "booting", "linux version"]):
                             logger.info(f"[Step 5] SOL 检测到重启信号: {line.strip()}")
+                            reboot_detected = True
                             break
                 except Exception:
                     pass
 
-        return True
+            if reboot_detected:
+                break
+
+        return reboot_detected
 
     def cleanup(self):
         self.stop_sol_session()
