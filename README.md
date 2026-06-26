@@ -1,2 +1,2 @@
 This repo used for cloning to SUT during my working....
-And this repo contains content generated or refined by AI.
+And this repo contains content generated or refined by AI stuff.
