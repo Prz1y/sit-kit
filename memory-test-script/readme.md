@@ -25,7 +25,6 @@
 │   ├── kkmmap/  memscan/  libcommon/   # 内核模块源码 / Python 扫描实现 / 公共库
 │   ├── modules/                        # 编译产物（kkmmap.ko；memmap 缺失见注意事项）
 │   └── eccmem.conf                     # 配置（threshold=2, scan_time=1）
-├── eccmem_作者日志/                    # eccmem 缺 memmap 证据链文档 + 作者 9 份运行日志
 └── 使用说明.md                         # 本文档
 ```
 
@@ -323,6 +322,5 @@ ssh root@<IP> 'tmux new -s eccmem12h "cd /root/eccmem_test && IPMITOOL=\"ipmitoo
 6. **stressapptest 收尾阶段**：测试结束前约 2 秒做结果校验，CPU 会短暂下降（内存未释放），属正常现象，脚本统计已排除该窗口
 7. **eccmem 日志处理策略不同**：eccmem_12h_test.sh 不截断 messages/不清空 journald/不清空 BMC SEL，只做基线对比（dmesg 会清空，清空前备份到 logs_before/）
 8. **eccmem killall 影响面**：`killall -9 python3` 会杀所有 python3 进程（含系统 pcp 代理），测试后确认 `systemctl is-active pmcd`，非 active 则 `systemctl restart pmcd`
-9. **eccmem memmap 缺失不影响默认使用**：详见第四章"已知缺陷"；若需启用写测试（WRITE_TEST=True），需向作者索要或自行编译兼容版 memmap 二进制
 
 ---
