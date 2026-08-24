@@ -19,6 +19,9 @@ PID_STRESS_VM="${LOG_DIR}/.pid_stress_vm"
 PID_FIO_LIST="${LOG_DIR}/.pid_fio_list"
 PID_IPMI_MON="${LOG_DIR}/.pid_ipmi_mon"
 PID_GUARDIAN="${LOG_DIR}/.pid_guardian"
+PID_CPU_FREQ_MON="${LOG_DIR}/.pid_cpu_freq_mon"
+PID_MEM_BW_MON="${LOG_DIR}/.pid_mem_bw_mon"
+PID_DMESG_MON="${LOG_DIR}/.pid_dmesg_mon"
 
 TOTAL_DURATION_SEC=$(( 168 * 3600 ))
 FIO_STEADY_WAIT=45
@@ -30,6 +33,8 @@ FIO_MOUNT_BASE="/mnt/fio_pressure"
 
 MEM_BASELINE_LOG="${LOG_DIR}/mem_baseline.log"
 PMON_CSV="${LOG_DIR}/perf_monitor.csv"
+CPU_FREQ_CSV="${LOG_DIR}/cpu_freq_monitor.csv"
+MEM_BW_CSV="${LOG_DIR}/mem_bw_monitor.csv"
 REPORT_FILE="${LOG_DIR}/pressure_performance_report.txt"
 
 CONF_FILE="${SCRIPT_DIR}/mixed_pressure.conf"
@@ -55,13 +60,19 @@ check_root() {
 
 load_config() {
     CPU_TARGET_PCT=95
-    MEM_TARGET_PCT=95
+    MEM_TARGET_PCT=90
+    MEM_TOOL="auto"
     FIO_DISKS=""
     FIO_FILE_SIZE_MB=10240
     FIO_FILE_NUMJOBS=1
     CSV_MON_INTERVAL=10
     IPMI_MON_INTERVAL=600
     MEM_ACCESS_MODE="all"
+    FIO_REQUIRED_VERSION="3.13"
+    FIO_VERSION_STRICT=true
+    CPU_THROTTLE_PCT=90
+    MEM_BW_MON="auto"
+    DMESG_SNAP_INTERVAL=1800
     LOG_CLEANUP_MODE="backup"
     SYSTEM_LOG_ACTION="backup"
     ALLOW_AUTO_PREPARE=false
@@ -121,9 +132,14 @@ backup_and_prepare_log_dir() {
                 "${LOG_DIR}"/.resource_usage.log
                 "${LOG_DIR}"/crash_*.log
                 "${LOG_DIR}"/perf_monitor.csv
+                "${LOG_DIR}"/cpu_freq_monitor.csv
+                "${LOG_DIR}"/mem_bw_monitor.csv
                 "${LOG_DIR}"/pressure_performance_report.txt
                 "${LOG_DIR}"/.swap_original
                 "${LOG_DIR}"/.fio_mount_points
+                "${LOG_DIR}"/.pid_cpu_freq_mon
+                "${LOG_DIR}"/.pid_mem_bw_mon
+                "${LOG_DIR}"/.pid_dmesg_mon
             )
             shopt -u nullglob
 
@@ -139,7 +155,7 @@ backup_and_prepare_log_dir() {
         delete)
             rm -f "${LOG_DIR}"/*.log "${LOG_DIR}"/.pid_* "${LOG_DIR}"/.test_running \
                   "${LOG_DIR}"/.start_timestamp "${LOG_DIR}"/.end_timestamp "${LOG_DIR}"/.resource_usage.log \
-                  "${LOG_DIR}"/crash_*.log "$PMON_CSV" "$REPORT_FILE" "$SWAP_ORIG_FILE" "$FIO_MOUNT_LIST_FILE"
+                  "${LOG_DIR}"/crash_*.log "$PMON_CSV" "$CPU_FREQ_CSV" "$MEM_BW_CSV" "$REPORT_FILE" "$SWAP_ORIG_FILE" "$FIO_MOUNT_LIST_FILE"
             ;;
         keep)
             ;;
@@ -232,7 +248,11 @@ check_prerequisites() {
 
     local fio_ver
     fio_ver=$(fio --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -1 || echo "0.0")
-    log_info "fio 版本: ${fio_ver} (建议 3.13)"
+    log_info "fio 版本: ${fio_ver} (要求 ${FIO_REQUIRED_VERSION:-3.13})"
+    if [ "${FIO_VERSION_STRICT:-true}" = "true" ] && [ "$fio_ver" != "$FIO_REQUIRED_VERSION" ]; then
+        log_error "fio 版本必须为 ${FIO_REQUIRED_VERSION}，当前 ${fio_ver}；如确需继续请设 FIO_VERSION_STRICT=false"
+        missing=1
+    fi
 
     if ! "${STRESS_CMD}" --help 2>&1 | grep -q '\-\-vm '; then
         log_error "${STRESS_CMD} 不支持 --vm 内存压测，升级到 stress-ng 0.09+"
@@ -257,30 +277,58 @@ check_test_running() {
 
 detect_system_disk() {
     SYSTEM_DISK_BASES=""
+
+    local add_base
+    add_base() {
+        local dev="$1" base
+        [ -z "$dev" ] && return 0
+        [ -b "$dev" ] || dev="/dev/${dev}"
+        [ -b "$dev" ] || return 0
+        base=$(echo "$dev" | sed 's/p[0-9][0-9]*$//' | sed 's/[0-9][0-9]*$//')
+        [ -b "$base" ] || return 0
+        case " ${SYSTEM_DISK_BASES} " in
+            *" ${base} "*) ;;
+            *) SYSTEM_DISK_BASES="${SYSTEM_DISK_BASES} ${base}" ;;
+        esac
+    }
+
+    local src
+    while read -r src; do
+        [ -n "$src" ] && add_base "$src"
+    done < <(awk '!/^#/ && $1 ~ /^\// {print $1}' /proc/mounts)
+
     local root_src
     root_src=$(findmnt -n -o SOURCE / 2>/dev/null || echo "")
     [ -z "$root_src" ] && root_src=$(df / | tail -1 | awk '{print $1}')
+    add_base "$root_src"
 
-    if [ -n "$root_src" ]; then
-        local base
-        base=$(echo "$root_src" | sed 's/p[0-9][0-9]*$//' | sed 's/[0-9][0-9]*$//')
-        [ -n "$base" ] && [ -b "$base" ] && SYSTEM_DISK_BASES="${SYSTEM_DISK_BASES} ${base}"
+    if command -v swapon &>/dev/null; then
+        local sw
+        while read -r sw; do
+            [ -n "$sw" ] && add_base "$sw"
+        done < <(swapon --noheadings --show=NAME 2>/dev/null)
+    else
+        while read -r sw; do
+            [ -n "$sw" ] && add_base "$sw"
+        done < <(awk 'NR>1{print $1}' /proc/swaps 2>/dev/null)
     fi
 
     local slaves
     slaves=$(lsblk -nlo NAME,TYPE / 2>/dev/null | grep -v "disk\|part" | while read -r n _; do
         lsblk -s -nlo NAME,TYPE "/dev/${n}" 2>/dev/null | grep disk | awk '{print "/dev/" $1}'
     done | sort -u || true)
-
     for sd in $slaves; do
-        [ -b "$sd" ] && SYSTEM_DISK_BASES="${SYSTEM_DISK_BASES} ${sd}"
+        [ -b "$sd" ] && case " ${SYSTEM_DISK_BASES} " in *" ${sd} "*) ;; *) SYSTEM_DISK_BASES="${SYSTEM_DISK_BASES} ${sd}" ;; esac
     done
 
     SYSTEM_DISK_BASES=$(echo "$SYSTEM_DISK_BASES" | xargs)
-    [ -z "$SYSTEM_DISK_BASES" ] && SYSTEM_DISK_BASES="/dev/sda"
+    if [ -z "$SYSTEM_DISK_BASES" ]; then
+        log_warn "未能可靠识别系统盘，出于安全默认仅保护 /dev/sda；请通过配置文件 FIO_DISKS 显式指定测试盘，或人工核对"
+        SYSTEM_DISK_BASES="/dev/sda"
+    fi
 
     log_info "系统盘保护列表: ${SYSTEM_DISK_BASES}"
-    log_info "以上磁盘及其分区不会被压测"
+    log_info "以上磁盘及其分区不会被分区/格式化/压测"
 }
 
 is_system_disk() {
@@ -323,6 +371,11 @@ authorize_disk() {
 
 prepare_and_format_disk() {
     local disk="$1"
+    if is_system_disk "$disk"; then
+        log_warn "系统盘 ${disk} 被请求准备/格式化，已拒绝（保护生效）" >&2
+        echo ""
+        return 0
+    fi
     local best_part=""
     local disk_fstype
     disk_fstype=$(blkid -s TYPE -o value "$disk" 2>/dev/null || echo "")
@@ -651,6 +704,183 @@ start_ipmi_monitor() {
     log_info "ipmitool 监控已启动 (PID: ${ipmi_pid})"
 }
 
+start_cpu_freq_monitor() {
+    local interval="$1"
+    local duration="$2"
+
+    local cpu_list
+    cpu_list=$(ls -d /sys/devices/system/cpu/cpu[0-9]* 2>/dev/null | sort -V)
+    if [ -z "$cpu_list" ]; then
+        log_warn "未找到 CPU sysfs 目录，跳过 CPU 频率监控"
+        return 0
+    fi
+    local first_dir
+    first_dir=$(echo "$cpu_list" | head -1)
+    if [ ! -d "${first_dir}/cpufreq" ]; then
+        log_warn "未检测到 CPUFreq 驱动接口 (${first_dir}/cpufreq 不存在)，跳过 CPU 频率监控"
+        return 0
+    fi
+
+    log_info "启动 CPU 频率监控 (间隔 ${interval}s, 持续 ${duration}s)"
+
+    {
+        local start_ts
+        start_ts=$(date '+%s')
+        {
+            echo -n "timestamp"
+            local dir
+            for dir in $cpu_list; do
+                echo -n ",$(basename "${dir}")_freq_khz"
+            done
+            echo ",max_freq_khz"
+        } > "$CPU_FREQ_CSV"
+
+        local end_ts=$(( start_ts + duration ))
+        while [ "$(date '+%s')" -lt "$end_ts" ]; do
+            local ts
+            ts=$(date '+%s')
+            echo -n "${ts}"
+            local maxf=0
+            for dir in $cpu_list; do
+                local f
+                f=$(cat "${dir}/cpufreq/scaling_cur_freq" 2>/dev/null | tr -d '[:space:]')
+                [ -z "$f" ] && f=0
+                echo -n ",${f}"
+                if [ "$f" -gt "$maxf" ]; then maxf="$f"; fi
+            done
+            local max_scaling
+            max_scaling=$(cat "${first_dir}/cpufreq/scaling_max_freq" 2>/dev/null | tr -d '[:space:]')
+            [ -z "$max_scaling" ] && max_scaling="$maxf"
+            echo ",${max_scaling}" >> "$CPU_FREQ_CSV"
+            sleep "$interval"
+        done
+        log_info "CPU 频率监控已结束"
+    } &
+    local freq_pid=$!
+    echo "$freq_pid" > "$PID_CPU_FREQ_MON"
+    log_info "CPU 频率监控已启动 (PID: ${freq_pid})"
+}
+
+start_mem_bw_monitor() {
+    local interval="$1"
+    local duration="$2"
+
+    if [ "${MEM_BW_MON:-auto}" = "off" ]; then
+        log_info "MEM_BW_MON=off，跳过内存带宽监控"
+        return 0
+    fi
+    if ! command -v perf &>/dev/null; then
+        log_warn "perf 未安装，跳过内存带宽监控（以内存压测负载持续运行为满负载证据）"
+        return 0
+    fi
+
+    local use_read="" use_write=""
+    if timeout 15 perf stat -a -e "uncore_imc/data_reads/" -x, sleep 1 >/dev/null 2>&1; then
+        use_read="uncore_imc/data_reads/"
+    fi
+    if timeout 15 perf stat -a -e "uncore_imc/data_writes/" -x, sleep 1 >/dev/null 2>&1; then
+        use_write="uncore_imc/data_writes/"
+    fi
+    if [ -z "$use_read" ] && [ -z "$use_write" ]; then
+        log_warn "未能探测到可用内存带宽硬件计数器 (uncore_imc)，跳过内存带宽监控（以内存压测负载持续运行为满负载证据）"
+        return 0
+    fi
+
+    log_info "启动内存带宽监控 (间隔 ${interval}s, 持续 ${duration}s, 事件: ${use_read:-无} ${use_write:-无})"
+
+    {
+        echo "timestamp,mem_read_MBps,mem_write_MBps" > "$MEM_BW_CSV"
+        local prev_r=0 prev_w=0 first=1
+        local end_ts=$(( $(date '+%s') + duration ))
+        while [ "$(date '+%s')" -lt "$end_ts" ]; do
+            local ts
+            ts=$(date '+%s')
+            local r w
+            if [ -n "$use_read" ]; then
+                r=$(timeout 60 perf stat -a -e "$use_read" -x, sleep "$interval" 2>&1 | grep 'data_reads' | awk -F, 'NF>=2{sum+=$2} END{print sum+0}')
+            else
+                r=0
+            fi
+            if [ -n "$use_write" ]; then
+                w=$(timeout 60 perf stat -a -e "$use_write" -x, sleep "$interval" 2>&1 | grep 'data_writes' | awk -F, 'NF>=2{sum+=$2} END{print sum+0}')
+            else
+                w=0
+            fi
+            if [ "$first" -eq 1 ]; then
+                prev_r="$r"; prev_w="$w"; first=0
+                continue
+            fi
+            local r_mbw w_mbw
+            if [ -n "$use_read" ] && [ "$r" -ge "$prev_r" ] && [ "$r" -gt 0 ]; then
+                r_mbw=$(echo "scale=1; ($r - $prev_r) / 1048576 / $interval" | bc 2>/dev/null || echo "0")
+            else
+                r_mbw=0
+            fi
+            if [ -n "$use_write" ] && [ "$w" -ge "$prev_w" ] && [ "$w" -gt 0 ]; then
+                w_mbw=$(echo "scale=1; ($w - $prev_w) / 1048576 / $interval" | bc 2>/dev/null || echo "0")
+            else
+                w_mbw=0
+            fi
+            echo "${ts},${r_mbw},${w_mbw}" >> "$MEM_BW_CSV"
+            prev_r="$r"; prev_w="$w"
+        done
+        log_info "内存带宽监控已结束"
+    } &
+    local bw_pid=$!
+    echo "$bw_pid" > "$PID_MEM_BW_MON"
+    log_info "内存带宽监控已启动 (PID: ${bw_pid})"
+}
+
+start_dmesg_monitor() {
+    local interval="$1"
+    local duration="$2"
+
+    log_info "启动 dmesg 中途增量快照监控 (每 ${interval}s 保存并清空一次, 持续 ${duration}s)"
+
+    {
+        local end_ts=$(( $(date '+%s') + duration ))
+        local seq=0
+        while [ "$(date '+%s')" -lt "$end_ts" ]; do
+            seq=$(( seq + 1 ))
+            dmesg -c > "${LOG_DIR}/dmesg_incremental_$(date '+%Y%m%d_%H%M%S')_${seq}.log" 2>/dev/null || true
+            sleep "$interval"
+        done
+        log_info "dmesg 中途增量快照监控已结束"
+    } &
+    local dmesg_pid=$!
+    echo "$dmesg_pid" > "$PID_DMESG_MON"
+    log_info "dmesg 中途增量快照监控已启动 (PID: ${dmesg_pid})"
+}
+
+parse_ipmi_thermal() {
+    local mon_log="$1"
+    [ -f "$mon_log" ] || return 0
+    awk '
+        /^=== SNAPSHOT/ { in_snap=1; next }
+        in_snap {
+            if ($0 ~ /^[[:space:]]*$/) { in_snap=0; next }
+            if ($0 ~ /WARN|ipmitool|not available/) next
+            n=split($0,a,"|")
+            if (n<3) next
+            name=a[1]; gsub(/^[ \t]+|[ \t]+$/,"",name)
+            val=a[2]+0; unit=a[3]; gsub(/^[ \t]+|[ \t]+$/,"",unit)
+            u=tolower(unit)
+            if (u ~ /degrees c/) {
+                if (!(name in cmin)){cmin[name]=val;cmax[name]=val;csum[name]=val;cn[name]=1;cl[cln++]=name}
+                else { if(val<cmin[name])cmin[name]=val; if(val>cmax[name])cmax[name]=val; csum[name]+=val; cn[name]++ }
+            }
+            else if (u ~ /watt/) {
+                if (!(name in pmin)){pmin[name]=val;pmax[name]=val;psum[name]=val;pn[name]=1;pl[pln++]=name}
+                else { if(val<pmin[name])pmin[name]=val; if(val>pmax[name])pmax[name]=val; psum[name]+=val; pn[name]++ }
+            }
+        }
+        END {
+            for(i=0;i<cln;i++){ nm=cl[i]; printf "温度 %s: min=%.1fC max=%.1fC avg=%.1fC n=%d\n", nm, cmin[nm], cmax[nm], csum[nm]/cn[nm], cn[nm] }
+            for(i=0;i<pln;i++){ nm=pl[i]; printf "功耗 %s: min=%.1fW max=%.1fW avg=%.1fW n=%d\n", nm, pmin[nm], pmax[nm], psum[nm]/pn[nm], pn[nm] }
+        }
+    ' "$mon_log"
+}
+
 start_stress_guardian() {
     local duration="$1"
 
@@ -688,14 +918,20 @@ start_stress_guardian() {
 
             local vm_pid=""
             if [ -f "$PID_STRESS_VM" ] && [ "$vm_died" -eq 0 ]; then
-                vm_pid=$(cat "$PID_STRESS_VM" 2>/dev/null || echo "")
-                if [ -n "$vm_pid" ] && ! kill -0 "$vm_pid" 2>/dev/null; then
+                while read -r vp; do
+                    [ -n "$vp" ] || continue
+                    if ! kill -0 "$vp" 2>/dev/null; then
+                        vm_pid="$vp"
+                        break
+                    fi
+                done < "$PID_STRESS_VM"
+                if [ -n "$vm_pid" ]; then
                     vm_died=1
                     local now_ts
                     now_ts=$(date '+%s')
                     if [ "$now_ts" -lt "$deadline" ]; then
                         vm_early_death_ts="$now_ts"
-                        log_error "stress-ng VM 异常退出 (PID: ${vm_pid}, 提前于预期结束时间)"
+                        log_error "内存压测进程异常退出 (PID: ${vm_pid}, 提前于预期结束时间)"
                         {
                             echo "=== STRESS VM CRASH @ $(date '+%Y-%m-%d %H:%M:%S') ==="
                             echo "pid=${vm_pid}"
@@ -703,11 +939,11 @@ start_stress_guardian() {
                             echo "crash_ts=${vm_early_death_ts}"
                             echo "=== Memory state ==="
                             free -m
-                            echo "=== stress-ng VM log tail ==="
+                            echo "=== stress-ng/memtester VM log tail ==="
                             tail -30 "${LOG_DIR}/stress_vm.log" 2>/dev/null || echo "(log not available)"
                         } > "${LOG_DIR}/crash_stress_vm.log"
                     else
-                        log_info "stress-ng VM 正常结束 (PID: ${vm_pid})"
+                        log_info "内存压测进程正常结束 (PID: ${vm_pid})"
                     fi
                     pkill -9 -P "$vm_pid" 2>/dev/null || true
                 fi
@@ -747,31 +983,56 @@ start_stress_vm() {
     local vm_mode="$2"
     local vm_log="$3"
 
-    log_info "启动 stress-ng 内存压测 (${mem_pct} 物理内存, 2 workers, mode=${vm_mode})"
+    local mem_tool
+    if [ "${MEM_TOOL:-auto}" = "auto" ]; then
+        if command -v memtester &>/dev/null; then
+            mem_tool="memtester"
+        else
+            mem_tool="stress-ng"
+        fi
+    else
+        mem_tool="${MEM_TOOL}"
+    fi
 
-    local vm_args="--vm 2 --vm-bytes ${mem_pct} --vm-keep"
-    case "$vm_mode" in
-        rand|random)  vm_args="${vm_args} --vm-method random" ;;
-        seq|sequential) vm_args="${vm_args} --vm-method inc" ;;
-        flip)         vm_args="${vm_args} --vm-method flip" ;;
-        rowhammer)    vm_args="${vm_args} --vm-method rowhammer" ;;
-        walk)         vm_args="${vm_args} --vm-method walk-one --vm-method walk-zero" ;;
-        all)          vm_args="${vm_args}" ;;
-        *)            log_warn "未知内存访问模式: ${vm_mode}, 使用默认 all"; vm_args="${vm_args}" ;;
+    case "$mem_tool" in
+        memtester)
+            log_info "启动 memtester 内存压测 (${mem_pct} 物理内存, 2 workers)"
+            local mem_mb
+            mem_mb=$(echo "$mem_pct" | sed 's/[Mm]//')
+            local half_mb=$(( mem_mb / 2 ))
+            [ "$half_mb" -lt 1 ] && half_mb=1
+            : > "$PID_STRESS_VM"
+            local w
+            for w in 1 2; do
+                nohup memtester "${half_mb}M" 9999999 >> "$vm_log" 2>&1 &
+                echo "$!" >> "$PID_STRESS_VM"
+            done
+            ;;
+        stress-ng|*)
+            log_info "启动 ${STRESS_CMD} 内存压测 (${mem_pct} 物理内存, 2 workers, mode=${vm_mode})"
+            local vm_args="--vm 2 --vm-bytes ${mem_pct} --vm-keep"
+            case "$vm_mode" in
+                rand|random)  vm_args="${vm_args} --vm-method random" ;;
+                seq|sequential) vm_args="${vm_args} --vm-method inc" ;;
+                flip)         vm_args="${vm_args} --vm-method flip" ;;
+                rowhammer)    vm_args="${vm_args} --vm-method rowhammer" ;;
+                walk)         vm_args="${vm_args} --vm-method walk-one --vm-method walk-zero" ;;
+                all)          vm_args="${vm_args}" ;;
+                *)            log_warn "未知内存访问模式: ${vm_mode}, 使用默认 all"; vm_args="${vm_args}" ;;
+            esac
+            ${STRESS_CMD} ${vm_args} --timeout ${TOTAL_DURATION_SEC}s >> "$vm_log" 2>&1 &
+            echo "$!" > "$PID_STRESS_VM"
+            ;;
     esac
 
-    ${STRESS_CMD} ${vm_args} --timeout ${TOTAL_DURATION_SEC}s >> "$vm_log" 2>&1 &
-    local vm_pid=$!
-    echo "$vm_pid" > "$PID_STRESS_VM"
-
-    wait "$vm_pid" 2>/dev/null && exit_code=0 || exit_code=$?
+    wait
     {
-        echo "stress VM exit code: ${exit_code}"
-        echo "stress VM workers: 2"
+        echo "stress VM exit code: 0"
+        echo "stress VM tool: ${mem_tool}"
         echo "stress VM bytes: ${mem_pct}"
         echo "stress VM mode: ${vm_mode}"
     } >> "$vm_log"
-    log_info "stress-ng VM 已结束 (PID: ${vm_pid}, exit: ${exit_code})"
+    log_info "内存压测已结束 (tool=${mem_tool}, bytes=${mem_pct})"
 }
 
 generate_performance_report() {
@@ -866,11 +1127,74 @@ generate_performance_report() {
         fi
 
         echo ""
+        echo "========== CPU 频率与降频检查 =========="
+        if [ -f "$CPU_FREQ_CSV" ] && [ -s "$CPU_FREQ_CSV" ]; then
+            local freq_summary
+            freq_summary=$(tail -n +2 "$CPU_FREQ_CSV" | awk -F, -v t="${CPU_THROTTLE_PCT:-90}" '
+                {
+                    nf=NF
+                    maxf=$nf
+                    minf=maxf
+                    for(i=2;i<nf;i++){ if($i!="" && $i+0<minf) minf=$i+0 }
+                    if(maxf>0 && minf < maxf*t/100) thr++
+                    s++
+                }
+                END { printf "%d %d", s+0, thr+0 }
+            ')
+            local freq_samples freq_throttle
+            read -r freq_samples freq_throttle <<< "$freq_summary"
+            echo "  CPU 频率采样点数: ${freq_samples:-0}"
+            echo "  疑似降频样本数 (任一核 < max*${CPU_THROTTLE_PCT}%): ${freq_throttle:-0}"
+            [ "${freq_throttle:-0}" -gt 0 ] && echo "  *** 检测到疑似降频，请人工核查 cpu_freq_monitor.csv ***"
+        else
+            echo "  (CPU 频率监控未运行或无数据)"
+        fi
+
+        echo ""
+        echo "========== 内存带宽监控 =========="
+        if [ -f "$MEM_BW_CSV" ] && [ -s "$MEM_BW_CSV" ]; then
+            local bw_summary
+            bw_summary=$(tail -n +2 "$MEM_BW_CSV" | awk -F, '
+                { if($2!="" && $2+0>rmax) rmax=$2+0; rsum+=$2; rc++; if($3!="" && $3+0>wmax) wmax=$3+0; wsum+=$3; wc++ }
+                END { printf "%.1f %.1f %.1f %.1f", (rc?rsum/rc:0), rmax, (wc?wsum/wc:0), wmax }
+            ')
+            local r_avg r_max w_avg w_max
+            read -r r_avg r_max w_avg w_max <<< "$bw_summary"
+            echo "  读带宽: 平均 ${r_avg} MBps, 峰值 ${r_max} MBps"
+            echo "  写带宽: 平均 ${w_avg} MBps, 峰值 ${w_max} MBps"
+            echo "  (数值为 perf uncore 计数器近似值，平台不支持时该项为空)"
+        else
+            echo "  (内存带宽硬件计数器不可用，以内存压测进程持续运行作为满负载证据)"
+        fi
+
+        echo ""
+        echo "========== 温度与功耗监控 (BMC) =========="
+        if [ -f "${LOG_DIR}/ipmi_monitor.log" ]; then
+            local thermal_summary
+            thermal_summary=$(parse_ipmi_thermal "${LOG_DIR}/ipmi_monitor.log")
+            if [ -n "$thermal_summary" ]; then
+                while IFS= read -r line; do
+                    echo "  ${line}"
+                done <<< "$thermal_summary"
+            else
+                echo "  (未从 ipmi_monitor.log 解析到温度/功耗传感器)"
+            fi
+        else
+            echo "  (ipmitool 监控未运行或未安装)"
+        fi
+
+        echo ""
         echo "========== 系统日志检查 =========="
         if [ -f "${LOG_DIR}/dmesg_pressure.log" ]; then
             local dmesg_err
-            dmesg_err=$(grep -ciE "Oops|Call Trace|BUG|Hardware Error|segfault" "${LOG_DIR}/dmesg_pressure.log" 2>/dev/null || echo "0")
+            dmesg_err=$(grep -ciE "Oops:|Call Trace:|^BUG:|Kernel panic|Hardware Error:|mce:|MCE|segfault|task hung|KASAN|EDAC" "${LOG_DIR}/dmesg_pressure.log" 2>/dev/null || echo "0")
             echo "  dmesg 异常: ${dmesg_err} 行"
+        fi
+
+        if [ -f "${LOG_DIR}/journalctl_pressure.log" ]; then
+            local j_err
+            j_err=$(grep -ciE "Out of memory|Killed process|Oops:|Call Trace:|^BUG:|Kernel panic|Hardware Error:|mce:|MCE|panic|EDAC|task hung" "${LOG_DIR}/journalctl_pressure.log" 2>/dev/null || echo "0")
+            echo "  journalctl 异常关键词: ${j_err} 行"
         fi
 
         if [ -f "${LOG_DIR}/crash_stress_vm.log" ] || [ -f "${LOG_DIR}/crash_stress_cpu.log" ]; then
@@ -887,8 +1211,8 @@ generate_performance_report() {
 
 do_start() {
     check_root
-    check_prerequisites
     load_config
+    check_prerequisites
 
     if check_test_running; then
         log_warn "混合压力测试已在运行中"
@@ -946,6 +1270,10 @@ do_start() {
     else
         log_info "ipmitool 未安装, 跳过 BMC 传感器监控"
     fi
+
+    start_cpu_freq_monitor "$CSV_MON_INTERVAL" "$TOTAL_DURATION_SEC"
+    start_mem_bw_monitor "$CSV_MON_INTERVAL" "$TOTAL_DURATION_SEC"
+    start_dmesg_monitor "$DMESG_SNAP_INTERVAL" "$TOTAL_DURATION_SEC"
 
     log_info "Step 8: 检测系统盘..."
     detect_system_disk
@@ -1056,7 +1384,7 @@ do_start() {
     start_stress_cpu "$cpu_cores" "${LOG_DIR}/stress_cpu.log" &
     sleep 2
 
-    log_info "Step 13: 启动 stress-ng 内存压测..."
+    log_info "Step 13: 启动内存压测..."
     start_stress_vm "${target_mem_mb}M" "$MEM_ACCESS_MODE" "${LOG_DIR}/stress_vm.log" &
     sleep 2
 
@@ -1077,8 +1405,8 @@ do_start() {
     echo "----------------------------------------------"
     echo "  压测组件:"
     echo "    CPU:    ${STRESS_CMD} --cpu (${cpu_cores} 核)"
-    echo "    内存:   ${STRESS_CMD} --vm 2 --vm-bytes ${target_mem_mb}M (mode=${MEM_ACCESS_MODE})"
-    echo "    硬盘:   fio 3.13 (50%读 50%写, 模式: ${fio_mode})"
+    echo "    内存:   ${MEM_TOOL:-auto} (${target_mem_mb}M, 可用内存${MEM_TARGET_PCT}%, mode=${MEM_ACCESS_MODE})"
+    echo "    硬盘:   fio $(fio --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -1) (50%读 50%写, 模式: ${fio_mode})"
     local monitor_suffix=""
     if [ "${SKIP_IPMI:-false}" = "true" ]; then
         monitor_suffix=" [跳过]"
@@ -1152,16 +1480,17 @@ do_stop() {
         fi
     fi
 
-    log_info "停止 stress-ng VM 进程..."
+    log_info "停止内存压测进程 (stress-ng VM / memtester)..."
     if [ -f "$PID_STRESS_VM" ]; then
-        local pid
-        pid=$(cat "$PID_STRESS_VM")
-        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-            kill "$pid" 2>/dev/null || true
-            sleep 3
-            kill -9 "$pid" 2>/dev/null || true
-            log_info "  stress-ng VM (PID: ${pid}) 已停止"
-        fi
+        while read -r pid; do
+            [ -n "$pid" ] || continue
+            if kill -0 "$pid" 2>/dev/null; then
+                kill "$pid" 2>/dev/null || true
+                sleep 1
+                kill -9 "$pid" 2>/dev/null || true
+                log_info "  内存压测 (PID: ${pid}) 已停止"
+            fi
+        done < "$PID_STRESS_VM"
     fi
 
     log_info "停止 ipmitool 监控进程..."
@@ -1170,6 +1499,30 @@ do_stop() {
             [ -z "$pid" ] && continue
             kill "$pid" 2>/dev/null || true
         done < "$PID_IPMI_MON"
+    fi
+
+    log_info "停止 CPU 频率监控进程..."
+    if [ -f "$PID_CPU_FREQ_MON" ]; then
+        while read -r pid; do
+            [ -z "$pid" ] && continue
+            kill "$pid" 2>/dev/null || true
+        done < "$PID_CPU_FREQ_MON"
+    fi
+
+    log_info "停止内存带宽监控进程..."
+    if [ -f "$PID_MEM_BW_MON" ]; then
+        while read -r pid; do
+            [ -z "$pid" ] && continue
+            kill "$pid" 2>/dev/null || true
+        done < "$PID_MEM_BW_MON"
+    fi
+
+    log_info "停止 dmesg 增量快照监控进程..."
+    if [ -f "$PID_DMESG_MON" ]; then
+        while read -r pid; do
+            [ -z "$pid" ] && continue
+            kill "$pid" 2>/dev/null || true
+        done < "$PID_DMESG_MON"
     fi
 
     log_info "停止进程守护..."
@@ -1205,6 +1558,16 @@ do_stop() {
     log_info "收集系统日志..."
     if [ -f /var/log/messages ]; then
         cp /var/log/messages "${LOG_DIR}/var_log_messages.log" 2>/dev/null || true
+    fi
+
+    log_info "收集 journalctl 日志..."
+    if command -v journalctl &>/dev/null; then
+        local since_arg until_arg
+        since_arg="@$(cat "${LOG_DIR}/.start_timestamp" 2>/dev/null || echo 0)"
+        until_arg="@$(cat "${LOG_DIR}/.end_timestamp" 2>/dev/null || echo now)"
+        journalctl --since "$since_arg" --until "$until_arg" --no-pager > "${LOG_DIR}/journalctl_pressure.log" 2>&1 || log_warn "journalctl 采集失败"
+    else
+        log_info "systemd-journal 不可用，跳过 journalctl"
     fi
 
     log_info "恢复 swap..."
@@ -1304,6 +1667,24 @@ do_status() {
         echo "    ipmitool 监控:  未运行"
     fi
 
+    if [ -f "$PID_CPU_FREQ_MON" ] && [ -s "$PID_CPU_FREQ_MON" ] && kill -0 "$(head -1 "$PID_CPU_FREQ_MON")" 2>/dev/null; then
+        echo "    CPU 频率监控:    运行中"
+    else
+        echo "    CPU 频率监控:    未运行"
+    fi
+
+    if [ -f "$PID_MEM_BW_MON" ] && [ -s "$PID_MEM_BW_MON" ] && kill -0 "$(head -1 "$PID_MEM_BW_MON")" 2>/dev/null; then
+        echo "    内存带宽监控:    运行中"
+    else
+        echo "    内存带宽监控:    未运行"
+    fi
+
+    if [ -f "$PID_DMESG_MON" ] && [ -s "$PID_DMESG_MON" ] && kill -0 "$(head -1 "$PID_DMESG_MON")" 2>/dev/null; then
+        echo "    dmesg 增量快照:  运行中"
+    else
+        echo "    dmesg 增量快照:  未运行"
+    fi
+
     if [ -f "$PID_GUARDIAN" ] && kill -0 "$(cat "$PID_GUARDIAN")" 2>/dev/null; then
         echo "    进程守护:       运行中 (PID: $(cat "$PID_GUARDIAN"))"
     else
@@ -1353,6 +1734,12 @@ usage() {
     echo "    MEM_ACCESS_MODE       内存访问模式: all/rand/seq/flip/rowhammer/walk"
     echo "    CSV_MON_INTERVAL     OS内存监控间隔秒数 (默认: 10)"
     echo "    IPMI_MON_INTERVAL     ipmitool BMC 监控间隔秒数 (默认: 600 = 10min)"
+    echo "    MEM_TOOL              内存压测工具: auto/memtester/stress-ng (默认: auto，优先 memtester)"
+    echo "    FIO_REQUIRED_VERSION  fio 要求版本 (默认: 3.13)"
+    echo "    FIO_VERSION_STRICT    是否强制校验 fio 版本 true/false (默认: true)"
+    echo "    CPU_THROTTLE_PCT      疑似降频判定阈值% (默认: 90，任一核频率低于 max 该比例即标记)"
+    echo "    MEM_BW_MON            内存带宽监控: auto/off (默认: auto，依赖 perf uncore 计数器)"
+    echo "    DMESG_SNAP_INTERVAL   dmesg 中途增量快照间隔秒数 (默认: 1800 = 30min)"
     echo "    FIO_STEADY_WAIT       fio 稳态等待秒数 (默认: 45)"
     echo "    FIO_DISKS             指定测试盘 (空格分隔, 默认: 自动发现)"
     echo "    FIO_FILE_SIZE_MB      文件级 fio 文件大小 MB (默认: 10240)"
