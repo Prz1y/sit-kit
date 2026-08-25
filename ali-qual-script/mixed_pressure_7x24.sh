@@ -22,6 +22,7 @@ PID_GUARDIAN="${LOG_DIR}/.pid_guardian"
 PID_CPU_FREQ_MON="${LOG_DIR}/.pid_cpu_freq_mon"
 PID_MEM_BW_MON="${LOG_DIR}/.pid_mem_bw_mon"
 PID_DMESG_MON="${LOG_DIR}/.pid_dmesg_mon"
+STOPPING_FLAG="${LOG_DIR}/.stopping"
 
 TOTAL_DURATION_SEC=$(( 168 * 3600 ))
 FIO_STEADY_WAIT=45
@@ -41,6 +42,7 @@ CONF_FILE="${SCRIPT_DIR}/mixed_pressure.conf"
 
 SWAP_ORIG_FILE="${LOG_DIR}/.swap_original"
 FIO_MOUNT_LIST_FILE="${LOG_DIR}/.fio_mount_points"
+FIO_START_TS_FILE="${LOG_DIR}/.fio_start_ts"
 
 __STOPPING=0
 
@@ -888,9 +890,25 @@ start_stress_guardian() {
         local end_ts=$(( $(date '+%s') + duration + 30 ))
         local cpu_died=0 vm_died=0
         local cpu_early_death_ts=0 vm_early_death_ts=0
-        local deadline=$(( $(date '+%s') + duration - 5 ))
+        local fio_start_ts=""
+        [ -f "$FIO_START_TS_FILE" ] && fio_start_ts=$(cat "$FIO_START_TS_FILE" 2>/dev/null || echo "")
+        local deadline
+        if [ -n "$fio_start_ts" ] && [ "$fio_start_ts" -gt 0 ] 2>/dev/null; then
+            deadline=$(( fio_start_ts + duration - 5 ))
+        else
+            deadline=$(( $(date '+%s') + duration - 5 ))
+        fi
+        local fio_initial="" fio_alive=0 recorded_fio=""
+        if [ -s "$PID_FIO_LIST" ]; then
+            fio_initial=$(awk 'NF{print $1}' "$PID_FIO_LIST" | paste -sd ' ' -)
+            fio_alive=$(echo "$fio_initial" | wc -w)
+        fi
 
         while [ "$(date '+%s')" -lt "$end_ts" ]; do
+            if [ -f "$STOPPING_FLAG" ]; then
+                log_info "检测到停止标志，进程守护静默退出"
+                break
+            fi
             local stress_pid=""
             if [ -f "$PID_STRESS" ] && [ "$cpu_died" -eq 0 ]; then
                 stress_pid=$(cat "$PID_STRESS" 2>/dev/null || echo "")
@@ -950,6 +968,50 @@ start_stress_guardian() {
             fi
 
             [ "$cpu_died" -eq 1 ] && [ "$vm_died" -eq 1 ] && break
+            [ -n "$fio_initial" ] && [ "$fio_alive" -eq 0 ] && break
+
+            if [ -n "$fio_initial" ]; then
+                local new_alive=0
+                for fpid in $fio_initial; do
+                    if kill -0 "$fpid" 2>/dev/null; then
+                        new_alive=$(( new_alive + 1 ))
+                    elif ! echo "$recorded_fio" | grep -qw "$fpid"; then
+                        recorded_fio="${recorded_fio} ${fpid}"
+                        local fnow_ts
+                        fnow_ts=$(date '+%s')
+                        if [ "$fnow_ts" -lt "$deadline" ]; then
+                            local fio_cmd="" fio_dir fio_name
+                            if [ -r "/proc/${fpid}/cmdline" ]; then
+                                fio_cmd=$(tr '\0' ' ' < "/proc/${fpid}/cmdline" 2>/dev/null || echo "")
+                            fi
+                            fio_dir=$(echo "$fio_cmd" | grep -oE -- '--directory=[^ ]+' | cut -d= -f2 || echo "N/A")
+                            fio_name=$(echo "$fio_cmd" | grep -oE -- '--name=[^ ]+' | cut -d= -f2 || echo "N/A")
+                            [ -n "$fio_dir" ] || fio_dir="N/A"
+                            [ -n "$fio_name" ] || fio_name="N/A"
+                            log_error "fio 进程异常退出 (PID: ${fpid}, job: ${fio_name}, directory: ${fio_dir}, 提前于预期结束时间)"
+                            {
+                                echo "=== FIO CRASH @ $(date '+%Y-%m-%d %H:%M:%S') ==="
+                                echo "pid=${fpid}"
+                                echo "job=${fio_name}"
+                                echo "directory=${fio_dir}"
+                                echo "expected_end_ts=${deadline}"
+                                echo "crash_ts=${fnow_ts}"
+                                echo "=== matching fio log tail ==="
+                                local fio_log_match=""
+                                fio_log_match=$(ls -t "${LOG_DIR}"/fio_pressure_*.log 2>/dev/null | head -3)
+                                for f in $fio_log_match; do
+                                    echo "----- $f -----"
+                                    tail -15 "$f" 2>/dev/null
+                                done
+                                echo "=== Memory state ==="
+                                free -m
+                            } >> "${LOG_DIR}/crash_fio.log"
+                        fi
+                    fi
+                done
+                fio_alive="$new_alive"
+            fi
+
             sleep 5
         done
         log_info "进程守护已退出"
@@ -1197,7 +1259,7 @@ generate_performance_report() {
             echo "  journalctl 异常关键词: ${j_err} 行"
         fi
 
-        if [ -f "${LOG_DIR}/crash_stress_vm.log" ] || [ -f "${LOG_DIR}/crash_stress_cpu.log" ]; then
+        if [ -f "${LOG_DIR}/crash_stress_vm.log" ] || [ -f "${LOG_DIR}/crash_stress_cpu.log" ] || [ -f "${LOG_DIR}/crash_fio.log" ]; then
             echo ""
             echo "  *** 检测到异常终止记录，请检查 crash_*.log ***"
         fi
@@ -1290,6 +1352,7 @@ do_start() {
     local disk_index=0
     : > "$PID_FIO_LIST"
     : > "$FIO_MOUNT_LIST_FILE"
+    date '+%s' > "$FIO_START_TS_FILE"
 
     if [ -n "$data_disks" ]; then
         fio_mode="block"
@@ -1448,6 +1511,8 @@ do_stop() {
     fi
 
     log_info "========== 停止 7x24H 混合压力测试 =========="
+
+    touch "$STOPPING_FLAG"
 
     log_info "停止 fio 进程..."
     if [ -f "$PID_FIO_LIST" ]; then
@@ -1636,11 +1701,15 @@ do_status() {
 
     echo "  进程状态:"
     if [ -f "$PID_FIO_LIST" ] && [ -s "$PID_FIO_LIST" ]; then
-        local fio_count=0
+        local fio_count=0 fio_total=0
+        fio_total=$(awk 'NF{n++} END{print n+0}' "$PID_FIO_LIST")
         while read -r pid; do
             [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && fio_count=$(( fio_count + 1 ))
         done < "$PID_FIO_LIST"
-        echo "    fio:            ${fio_count} 进程"
+        echo "    fio:            ${fio_count}/${fio_total} 进程运行中"
+        if [ "$fio_total" -gt 0 ] && [ "$fio_count" -lt "$fio_total" ]; then
+            echo "    *** 警告: $(( fio_total - fio_count )) 个 fio 进程已提前退出，请检查 ${LOG_DIR}/crash_fio.log ***"
+        fi
     else
         echo "    fio:            未运行"
     fi
