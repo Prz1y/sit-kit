@@ -131,6 +131,7 @@ backup_and_prepare_log_dir() {
                 "${LOG_DIR}"/.test_running
                 "${LOG_DIR}"/.start_timestamp
                 "${LOG_DIR}"/.end_timestamp
+                "${LOG_DIR}"/.stopping
                 "${LOG_DIR}"/.resource_usage.log
                 "${LOG_DIR}"/crash_*.log
                 "${LOG_DIR}"/perf_monitor.csv
@@ -156,7 +157,7 @@ backup_and_prepare_log_dir() {
             ;;
         delete)
             rm -f "${LOG_DIR}"/*.log "${LOG_DIR}"/.pid_* "${LOG_DIR}"/.test_running \
-                  "${LOG_DIR}"/.start_timestamp "${LOG_DIR}"/.end_timestamp "${LOG_DIR}"/.resource_usage.log \
+                  "${LOG_DIR}"/.start_timestamp "${LOG_DIR}"/.end_timestamp "${LOG_DIR}"/.stopping "${LOG_DIR}"/.resource_usage.log \
                   "${LOG_DIR}"/crash_*.log "$PMON_CSV" "$CPU_FREQ_CSV" "$MEM_BW_CSV" "$REPORT_FILE" "$SWAP_ORIG_FILE" "$FIO_MOUNT_LIST_FILE"
             ;;
         keep)
