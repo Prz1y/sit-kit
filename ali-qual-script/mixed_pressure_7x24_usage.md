@@ -1,0 +1,226 @@
+# mixed_pressure_7x24.sh 使用说明
+
+整机混合压力稳定性测试脚本（CPU / 内存 / 磁盘 并行加压，默认 7x24H = 168 小时）。
+按测试用例要求实现：全部逻辑 CPU 加压、内存加压至可用内存 90%、fio 3.13 文件级 50%读/50%写带宽压测（ext4）、CPU 频率 / 内存带宽 / 温度功耗 / 系统日志全程监控。不含网卡与 GPU 加压功能。
+
+> 警告：脚本可能对测试盘执行 wipefs / 重新分区 / mkfs.ext4，会临时关闭 swap，并产生持续高压。仅允许在 RD/实验室机器上运行。
+
+---
+
+## 1. 环境要求
+
+| 依赖 | 是否必需 | 说明 |
+|---|---|---|
+| root 权限 | 必需 | 启动/停止均需 root |
+| bash | 必需 | Linux bash 环境 |
+| bc / dmidecode | 必需 | 计算 / 内存信息采集 |
+| fio 3.13 | 必需 | 版本强校验（`FIO_VERSION_STRICT=true` 时必须精确 3.13） |
+| stress-ng | 必需 | CPU 与内存压测（需支持 `--vm`，0.09+） |
+| ipmitool | 可选 | 缺失时跳过 BMC 温度/功耗监控 |
+| perf | 可选 | 缺失时跳过内存带宽监控（以内存负载持续运行为证据） |
+| memtester | 可选 | 仅 `MEM_TOOL=memtester` 或 `auto` 时使用 |
+
+---
+
+## 2. 部署与快速开始
+
+脚本与配置文件放在同一目录；日志输出到脚本同目录下的 `mixed_pressure_7x24_logs/`。
+
+```bash
+# 1. 上传（Windows/WSL 经 ssh stdin 管道，规避 scp 中文路径问题；上传前先去掉 CRLF）
+tr -d '\r' < mixed_pressure_7x24.sh | ssh root@<host> "cat > /root/mixed_pressure_7x24.sh"
+tr -d '\r' < mixed_pressure.conf     | ssh root@<host> "cat > /root/mixed_pressure.conf"
+
+# 2. 语法检查
+ssh root@<host> "bash -n /root/mixed_pressure_7x24.sh && chmod +x /root/mixed_pressure_7x24.sh"
+
+# 3. 建议先跑短时冒烟（见配置范例 B），确认无误后再正式 7x24
+
+# 4. 正式运行放 tmux，避免 ssh 断开影响
+ssh root@<host>
+tmux new-session -s pressure
+/root/mixed_pressure_7x24.sh start
+# Ctrl+B D 脱离 tmux；之后随时可:
+#   tmux attach -t pressure        # 回到压测前台
+#   /root/mixed_pressure_7x24.sh status   # 另开终端查看状态
+```
+
+首次启动建议核对控制台输出的 `系统盘保护列表: ...` 一行，确认真实的系统盘（如 `/dev/nvme0n1`）在列表内。
+
+---
+
+## 3. 命令
+
+```
+用法: mixed_pressure_7x24.sh {start|stop|status}
+```
+
+| 命令 | 说明 |
+|---|---|
+| `start` | 启动测试。前台运行（监控进程在后台），到时自动 stop 并生成报告；Ctrl+C / kill 会触发 trap 自动收尾。若测试已在运行会拒绝重复启动 |
+| `stop` | 停止测试：杀压测与监控进程、采集收尾日志（dmesg/journalctl/传感器复位值）、恢复 swap、卸载 fio 挂载点、生成性能报告 |
+| `status` | 查看运行状态：各压测进程存活数、已运行时长（目标时长读自上次启动记录）、内存快照、日志清单 |
+
+运行中任一压测进程提前退出或发生掉盘时，由进程守护记录到 `crash_*.log`。
+
+---
+
+## 4. 启动流程（start 内部步骤）
+
+1. 处理系统日志（默认 backup：压测前快照，不清空）
+2. 记录开始时间；dmidecode 内存信息；内存基线；BMC 传感器基线
+3. 记录并关闭 swap（结束时按原列表恢复）
+4. 启动监控：OS 内存（默认 10s）、BMC 传感器（默认 600s）、CPU 频率（10s）、内存带宽（perf，10s）、dmesg 增量快照（默认 1800s）
+5. 检测系统盘 → 生成保护列表
+6. 查找数据盘：优先用配置 `FIO_DISKS`；否则自动发现。找到则挂载到 `FIO_MOUNT_BASE` 下并启动块设备级 fio（4 线程，占盘 90% 空闲空间，iodepth 64）；**显式指定的盘准备失败会直接中止，不会回退**；未指定且无可用数据盘时回退为系统盘 `/var/tmp` 文件级压测（预留 5GB 安全空间）
+7. 等 fio 稳态（默认 45s）→ 按"总核数 × CPU_TARGET_PCT% − fio 占用"计算 stress-ng CPU 核数；按"可用内存 × MEM_TARGET_PCT%"计算内存加压量（2 个 worker 均分，避免 --vm-bytes 按 worker 计导致的超卖）
+8. 启动 stress-ng CPU / 内存压测 / 进程守护，睡眠到总时长后自动 stop
+
+---
+
+## 5. 配置文件
+
+- 路径：脚本同目录下 `mixed_pressure.conf`（不存在则全部用默认值）
+- 格式：bash 语法，启动时 `source` 加载，可加注释
+- 注意：`status`/`stop` 是独立调用，不加载配置文件；目标时长等信息以启动时落盘的 `.resource_usage.log` 为准
+
+### 参数总表
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `TOTAL_DURATION_SEC` | `604800`（168H） | 测试持续秒数 |
+| `CPU_TARGET_PCT` | `95` | CPU 压测目标百分比（总核数口径） |
+| `MEM_TARGET_PCT` | `90` | 内存压测目标（按可用内存百分比） |
+| `MEM_TOOL` | `stress-ng` | 内存压测工具：`stress-ng` / `memtester` / `auto`（auto=优先 memtester） |
+| `MEM_ACCESS_MODE` | `all` | 内存访问模式：`all` / `rand` / `seq` / `flip` / `rowhammer` / `walk` |
+| `FIO_DISKS` | 空（自动发现） | 指定测试盘，空格分隔，如 `"/dev/nvme1n1 /dev/nvme2n1"`。**指定后准备失败即中止，不回退** |
+| `FIO_MOUNT_BASE` | `/mnt/fio_pressure` | fio 挂载基础路径（第 2 块盘起追加 `_2`、`_3`…） |
+| `FIO_FILE_SIZE_MB` | `10240` | 文件级（回退模式）fio 单线程文件大小 MB |
+| `FIO_FILE_NUMJOBS` | `1` | 文件级 fio 并发数 |
+| `FIO_REQUIRED_VERSION` | `3.13` | fio 要求版本 |
+| `FIO_VERSION_STRICT` | `true` | 是否强制校验 fio 版本 |
+| `CPU_THROTTLE_PCT` | `90` | 疑似降频判定阈值%（任一核低于 max 频率该比例即标记） |
+| `MEM_BW_MON` | `auto` | 内存带宽监控：`auto` / `off`（auto 依赖 perf uncore 计数器） |
+| `CSV_MON_INTERVAL` | `10` | OS 内存 / CPU 频率 / 内存带宽监控间隔秒 |
+| `IPMI_MON_INTERVAL` | `600` | ipmitool BMC 监控间隔秒 |
+| `DMESG_SNAP_INTERVAL` | `1800` | dmesg 增量快照间隔秒 |
+| `FIO_STEADY_WAIT` | `45` | fio 稳态等待秒数 |
+| `LOG_CLEANUP_MODE` | `backup` | 启动时旧日志处理：`backup`（移入 `backup_<时间戳>/`）/ `delete` / `keep` |
+| `SYSTEM_LOG_ACTION` | `backup` | 系统日志策略：`backup`（压测前快照）/ `clear`（清空 dmesg 与 /var/log/messages）/ `none` |
+| `ALLOW_AUTO_PREPARE` | `false` | `true` 时对空白盘自动 wipefs/分区/mkfs 不再交互确认（危险，仅无人值守且盘位已核对时用） |
+
+---
+
+## 6. 配置文件范例
+
+### 范例 A — 正式 7x24H（推荐写法：显式指定测试盘）
+
+`mixed_pressure.conf`：
+
+```bash
+# ===== mixed_pressure_7x24 正式压测配置 =====
+TOTAL_DURATION_SEC=604800              # 168h
+FIO_DISKS="/dev/nvme1n1 /dev/nvme2n1"  # 显式指定测试盘；写错/是系统盘会直接中止
+MEM_TOOL="stress-ng"                   # 按用例要求使用 stress-ng
+MEM_TARGET_PCT=90                      # 可用内存的 90%
+CPU_TARGET_PCT=95
+MEM_ACCESS_MODE="all"
+FIO_REQUIRED_VERSION="3.13"
+FIO_VERSION_STRICT=true
+CPU_THROTTLE_PCT=90
+MEM_BW_MON="auto"
+CSV_MON_INTERVAL=10
+IPMI_MON_INTERVAL=600
+DMESG_SNAP_INTERVAL=1800
+LOG_CLEANUP_MODE="backup"
+SYSTEM_LOG_ACTION="backup"
+```
+
+### 范例 B — 短时冒烟（部署验证用）
+
+```bash
+# 10 分钟冒烟：验证盘识别/系统盘保护/无 OOM/报告生成
+TOTAL_DURATION_SEC=600
+FIO_DISKS="/dev/nvme1n1"
+FIO_STEADY_WAIT=20
+```
+
+冒烟检查点：
+1. 控制台 `系统盘保护列表` 包含真实系统盘
+2. `stress_vm.log` 无 OOM / mmap 失败
+3. status 显示目标 0H（短时长）、压测进程全部运行
+4. stop 后报告正常生成
+
+### 范例 C — memtester 内存压测
+
+```bash
+MEM_TOOL="memtester"
+# memtester 以 2 个 worker 均分目标内存（脚本自动处理）
+```
+
+### 范例 D — 无人值守自动准备空白盘（谨慎）
+
+```bash
+FIO_DISKS="/dev/sdb /dev/sdc"
+ALLOW_AUTO_PREPARE=true   # 空白盘自动 wipefs+分区+mkfs.ext4，不再询问 yes
+```
+
+不设 `ALLOW_AUTO_PREPARE=true` 时，对需要格式化的空白盘会在终端交互式要求输入 `yes` 确认（从 `/dev/tty` 读，重定向不失效）；非交互环境（如 cron）无 /dev/tty 则直接跳过该盘。
+
+---
+
+## 7. 磁盘安全机制
+
+| 机制 | 行为 |
+|---|---|
+| 系统盘保护 | 从 /proc/mounts、根分区、swap、lsblk 主从关系推导系统盘整盘（含全部分区），拒绝分区/格式化/压测；推导失败时保守仅保护 `/dev/sda` 并告警 |
+| FIO_DISKS 显式指定 | 指定盘不存在 / 是系统盘 / 准备失败 → **中止测试**，绝不回退到系统盘文件级模式 |
+| 自动发现模式 | 只接受非系统盘；带 LVM/RAID/LUKS/swap 签名的盘跳过；已有 ext4/xfs 分区直接复用不格式化；空白盘需交互确认（或 ALLOW_AUTO_PREPARE） |
+| 文件级回退 | 仅当未指定 FIO_DISKS 且找不到任何数据盘时，对系统盘 `/var/tmp` 做文件级压测，预留 5GB，空间不足直接退出 |
+| fio 全部走文件系统 | `--directory` + `--direct=1`，不写裸块设备，不做 reset/低级操作，不会主动导致掉盘 |
+
+---
+
+## 8. 日志与报告
+
+日志目录：`<脚本目录>/mixed_pressure_7x24_logs/`（再次 start 时旧日志移入 `backup_<时间戳>/`）
+
+| 文件 | 内容 |
+|---|---|
+| `console_output.log` | start/stop 全程控制台输出 |
+| `pressure_performance_report.txt` | 最终性能报告（判定主要依据） |
+| `fio_pressure_<盘名>.log` / `fio_pressure_file.log` | fio 输出（每盘一个） |
+| `stress_cpu.log` / `stress_vm.log` | stress-ng 输出（末尾有 exit code） |
+| `perf_monitor.csv` / `cpu_freq_monitor.csv` / `mem_bw_monitor.csv` | OS 内存 / CPU 频率 / 内存带宽时序数据 |
+| `ipmi_monitor.log` / `sensor_before.log` / `sensor_after.log` | BMC 传感器全程 + 前后快照 |
+| `mem_baseline.log` / `mem_reset.log` / `dmidecode_memory.log` | 内存基线 / 复位 / SPD 信息 |
+| `dmesg_before.log` / `dmesg_incremental_*.log` / `dmesg_pressure.log` | dmesg 压测前快照 / 每 30min 增量 / 收尾全量 |
+| `var_log_messages*.log` / `journalctl_pressure.log` | 系统日志（压测窗口内） |
+| `crash_stress_cpu.log` / `crash_stress_vm.log` / `crash_fio.log` / `crash_disk.log` | 守护检测到的异常终止 / 掉盘记录（出现即异常） |
+
+---
+
+## 9. 结果判定要点
+
+| 检查项 | 位置 | PASS 标准 |
+|---|---|---|
+| 无崩溃/挂死 + 时长达标 | 报告头 `实际运行 (目标: ...H)` | 实际 ≈ 目标 |
+| 压测进程未提前退出 | `crash_*.log` 不存在或为空 | 无记录 |
+| 无掉盘 | `crash_disk.log` 无记录；fio 日志无 device reset/disconnected | 无 |
+| 系统日志无异常 | 报告"系统日志检查"节：dmesg / journalctl 异常关键词计数 | 0 行 |
+| 无降频 | 报告 CPU 频率节（阈值 CPU_THROTTLE_PCT）；持续满载下降频为手动复核项 | 无降频标记 |
+| 内存无 OOM | `stress_vm.log` exit code 0；journalctl 无 OOM kill | 满足 |
+| 温度/功耗 | 报告 BMC 节（需 ipmitool） | 无过热 |
+
+---
+
+## 10. 常见问题
+
+| 现象 | 处理 |
+|---|---|
+| fio 版本报错退出 | 机器 fio 非 3.13。确认用例允许后可设 `FIO_VERSION_STRICT=false`，否则安装 fio 3.13 |
+| 报"指定测试盘准备失败"后中止 | 按设计行为（显式指定不回退）：检查盘符、是否系统盘、wipefs/mkfs 报错原因（错误信息在 console_output.log） |
+| 想重新开始一轮 | 先 `stop`，旧日志自动移入 `backup_<时间戳>/`，再 `start` |
+| 中途机器重启过 | 测试进程已丢失：`status` 会显示未运行；`stop` 清理残留并出报告，然后重新 start |
+| 不想动系统盘但也没有数据盘 | 会回退 /var/tmp 文件级压测；不想压系统盘就直接指定 `FIO_DISKS`（找不到即中止） |
+| swap 被动了 | 脚本启动时关 swap、结束按启动前记录恢复；异常中断后可手动 `swapon -a` |

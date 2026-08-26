@@ -29,7 +29,7 @@ FIO_STEADY_WAIT=45
 CSV_MON_INTERVAL=10
 IPMI_MON_INTERVAL=600
 CPU_TARGET_PCT=95
-MEM_TARGET_PCT=95
+MEM_TARGET_PCT=90
 FIO_MOUNT_BASE="/mnt/fio_pressure"
 
 MEM_BASELINE_LOG="${LOG_DIR}/mem_baseline.log"
@@ -63,7 +63,7 @@ check_root() {
 load_config() {
     CPU_TARGET_PCT=95
     MEM_TARGET_PCT=90
-    MEM_TOOL="auto"
+    MEM_TOOL="stress-ng"
     FIO_DISKS=""
     FIO_FILE_SIZE_MB=10240
     FIO_FILE_NUMJOBS=1
@@ -272,7 +272,11 @@ check_test_running() {
             done < "$PID_FIO_LIST"
         fi
         [ "$any_alive" -eq 0 ] && [ -f "$PID_STRESS" ] && kill -0 "$(cat "$PID_STRESS")" 2>/dev/null && any_alive=1
-        [ "$any_alive" -eq 0 ] && [ -f "$PID_STRESS_VM" ] && kill -0 "$(cat "$PID_STRESS_VM")" 2>/dev/null && any_alive=1
+        if [ "$any_alive" -eq 0 ] && [ -f "$PID_STRESS_VM" ]; then
+            while read -r vp; do
+                [ -n "$vp" ] && kill -0 "$vp" 2>/dev/null && any_alive=1 && break
+            done < "$PID_STRESS_VM"
+        fi
         [ "$any_alive" -eq 1 ] && return 0
     fi
     return 1
@@ -287,7 +291,13 @@ detect_system_disk() {
         [ -z "$dev" ] && return 0
         [ -b "$dev" ] || dev="/dev/${dev}"
         [ -b "$dev" ] || return 0
-        base=$(echo "$dev" | sed 's/p[0-9][0-9]*$//' | sed 's/[0-9][0-9]*$//')
+        base="/dev/$(lsblk -nlo PKNAME "$dev" 2>/dev/null | awk 'NF{print; exit}')"
+        if [ ! -b "$base" ]; then
+            case "$dev" in
+                *p[0-9]) base="${dev%p*}" ;;
+                *)       base="$dev" ;;
+            esac
+        fi
         [ -b "$base" ] || return 0
         case " ${SYSTEM_DISK_BASES} " in
             *" ${base} "*) ;;
@@ -372,6 +382,22 @@ authorize_disk() {
     echo " ${trimmed} " | grep -q " ${disk} "
 }
 
+prompt_format_confirm() {
+    local disk="$1"
+    [ "${ALLOW_AUTO_PREPARE:-false}" = "true" ] && return 0
+    if [ ! -e /dev/tty ]; then
+        log_warn "非交互环境且未设置 ALLOW_AUTO_PREPARE=true，跳过自动格式化: ${disk}" >&2
+        return 1
+    fi
+    local ans=""
+    read -r -p "[CONFIRM] 即将 wipefs + 重新分区 + mkfs.ext4，清空磁盘 ${disk} 全部数据！输入 yes 确认: " ans < /dev/tty || true
+    if [ "$ans" = "yes" ]; then
+        return 0
+    fi
+    log_warn "用户未确认格式化，跳过: ${disk}" >&2
+    return 1
+}
+
 prepare_and_format_disk() {
     local disk="$1"
     if is_system_disk "$disk"; then
@@ -401,13 +427,17 @@ prepare_and_format_disk() {
                 echo ""
                 return 0
             fi
+            if ! prompt_format_confirm "$disk"; then
+                echo ""
+                return 0
+            fi
             log_info "非系统盘 ${disk} 无可用文件系统且未挂载，执行自动分区与 ext4 格式化..." >&2
             if ! wipefs -a "$disk" >/dev/null 2>&1; then
-                log_error "wipefs 失败: ${disk}"
+                log_error "wipefs 失败: ${disk}" >&2
                 return 1
             fi
             if ! parted -s "$disk" mklabel gpt mkpart primary ext4 0% 100% >/dev/null 2>&1; then
-                log_error "parted 分区失败: ${disk}"
+                log_error "parted 分区失败: ${disk}" >&2
                 return 1
             fi
             sleep 2
@@ -426,11 +456,11 @@ prepare_and_format_disk() {
                 if mkfs.ext4 -F "$new_part" >/dev/null 2>&1; then
                     best_part="$new_part"
                 else
-                    log_error "mkfs.ext4 失败: ${new_part}"
+                    log_error "mkfs.ext4 失败: ${new_part}" >&2
                     return 1
                 fi
             else
-                log_error "自动分区后未发现可用分区: ${disk}"
+                log_error "自动分区后未发现可用分区: ${disk}" >&2
                 return 1
             fi
         else
@@ -445,18 +475,28 @@ find_data_disks() {
     if [ -n "${FIO_DISKS:-}" ]; then
         log_info "使用配置文件指定的测试盘: ${FIO_DISKS}" >&2
         for disk in $FIO_DISKS; do
-            [ -b "$disk" ] || continue
-            is_system_disk "$disk" && continue
+            if [ ! -b "$disk" ]; then
+                log_error "指定测试盘不存在: ${disk}" >&2
+                return 1
+            fi
+            if is_system_disk "$disk"; then
+                log_error "指定测试盘是系统盘，拒绝: ${disk}" >&2
+                return 1
+            fi
             local bp
             if ! bp=$(prepare_and_format_disk "$disk"); then
-                log_error "指定测试盘准备失败: ${disk}"
+                log_error "指定测试盘准备失败: ${disk}" >&2
                 return 1
             fi
             [ -n "$bp" ] && valid_disks="${valid_disks} ${bp}"
         done
         valid_disks=$(echo "$valid_disks" | xargs)
-        [ -n "$valid_disks" ] && echo "$valid_disks" && return 0
-        log_warn "配置文件中指定的测试盘均不可用，回退到自动发现" >&2
+        if [ -n "$valid_disks" ]; then
+            echo "$valid_disks"
+            return 0
+        fi
+        log_error "配置指定的测试盘均未产生可用分区 (FIO_DISKS=\"${FIO_DISKS}\")，中止，不回退" >&2
+        return 1
     fi
 
     local all_disks
@@ -798,29 +838,35 @@ start_mem_bw_monitor() {
         while [ "$(date '+%s')" -lt "$end_ts" ]; do
             local ts
             ts=$(date '+%s')
-            local r w
-            if [ -n "$use_read" ]; then
-                r=$(timeout 60 perf stat -a -e "$use_read" -x, sleep "$interval" 2>&1 | grep 'data_reads' | awk -F, 'NF>=2{sum+=$2} END{print sum+0}')
-            else
-                r=0
-            fi
-            if [ -n "$use_write" ]; then
-                w=$(timeout 60 perf stat -a -e "$use_write" -x, sleep "$interval" 2>&1 | grep 'data_writes' | awk -F, 'NF>=2{sum+=$2} END{print sum+0}')
-            else
-                w=0
-            fi
+            local r w events="" out r_unit="" w_unit=""
+            [ -n "$use_read" ] && events="$use_read"
+            [ -n "$use_write" ] && events="${events:+${events},}${use_write}"
+            # perf stat -x, CSV columns: value,unit,event,... (value=$1, unit=$2)
+            out=$(timeout 60 perf stat -a -e "$events" -x, sleep "$interval" 2>&1)
+            r=$(echo "$out" | awk -F, '$0 ~ /data_reads/  && $1 ~ /^[0-9]+(\.[0-9]+)?$/ {sum+=$1} END{print sum+0}')
+            w=$(echo "$out" | awk -F, '$0 ~ /data_writes/ && $1 ~ /^[0-9]+(\.[0-9]+)?$/ {sum+=$1} END{print sum+0}')
+            r_unit=$(echo "$out" | awk -F, '$0 ~ /data_reads/  {u=$2; gsub(/^[ \t]+|[ \t]+$/,"",u); print u; exit}')
+            w_unit=$(echo "$out" | awk -F, '$0 ~ /data_writes/ {u=$2; gsub(/^[ \t]+|[ \t]+$/,"",u); print u; exit}')
             if [ "$first" -eq 1 ]; then
                 prev_r="$r"; prev_w="$w"; first=0
                 continue
             fi
             local r_mbw w_mbw
             if [ -n "$use_read" ] && [ "$r" -ge "$prev_r" ] && [ "$r" -gt 0 ]; then
-                r_mbw=$(echo "scale=1; ($r - $prev_r) / 1048576 / $interval" | bc 2>/dev/null || echo "0")
+                if [ "$r_unit" = "MiB" ]; then
+                    r_mbw=$(echo "scale=1; ($r - $prev_r) / $interval" | bc 2>/dev/null || echo "0")
+                else
+                    r_mbw=$(echo "scale=1; ($r - $prev_r) / 1048576 / $interval" | bc 2>/dev/null || echo "0")
+                fi
             else
                 r_mbw=0
             fi
             if [ -n "$use_write" ] && [ "$w" -ge "$prev_w" ] && [ "$w" -gt 0 ]; then
-                w_mbw=$(echo "scale=1; ($w - $prev_w) / 1048576 / $interval" | bc 2>/dev/null || echo "0")
+                if [ "$w_unit" = "MiB" ]; then
+                    w_mbw=$(echo "scale=1; ($w - $prev_w) / $interval" | bc 2>/dev/null || echo "0")
+                else
+                    w_mbw=$(echo "scale=1; ($w - $prev_w) / 1048576 / $interval" | bc 2>/dev/null || echo "0")
+                fi
             else
                 w_mbw=0
             fi
@@ -900,12 +946,27 @@ start_stress_guardian() {
             deadline=$(( $(date '+%s') + duration - 5 ))
         fi
         local fio_initial="" fio_alive=0 recorded_fio=""
+        local vm_recorded_dead="" loop_count=0
+        local disk_watch_list=""
+        if [ -s "$FIO_MOUNT_LIST_FILE" ]; then
+            while read -r wpart _wmp; do
+                [ -n "$wpart" ] || continue
+                local pbase
+                pbase=$(lsblk -nlo PKNAME "$wpart" 2>/dev/null | awk 'NF{print; exit}')
+                if [ -n "$pbase" ] && [ -b "/dev/${pbase}" ]; then
+                    disk_watch_list="${disk_watch_list} ${wpart}:/dev/${pbase}"
+                else
+                    disk_watch_list="${disk_watch_list} ${wpart}:${wpart}"
+                fi
+            done < "$FIO_MOUNT_LIST_FILE"
+        fi
         if [ -s "$PID_FIO_LIST" ]; then
             fio_initial=$(awk 'NF{print $1}' "$PID_FIO_LIST" | paste -sd ' ' -)
             fio_alive=$(echo "$fio_initial" | wc -w)
         fi
 
         while [ "$(date '+%s')" -lt "$end_ts" ]; do
+            loop_count=$(( loop_count + 1 ))
             if [ -f "$STOPPING_FLAG" ]; then
                 log_info "检测到停止标志，进程守护静默退出"
                 break
@@ -935,25 +996,30 @@ start_stress_guardian() {
                 fi
             fi
 
-            local vm_pid=""
             if [ -f "$PID_STRESS_VM" ] && [ "$vm_died" -eq 0 ]; then
+                # multi-PID aware (memtester writes 2 PIDs, stress-ng writes 1):
+                # record each newly-dead PID once; all-dead => vm_died=1
+                local vm_alive=0 vm_total=0 vm_newly_dead=""
                 while read -r vp; do
                     [ -n "$vp" ] || continue
-                    if ! kill -0 "$vp" 2>/dev/null; then
-                        vm_pid="$vp"
-                        break
+                    vm_total=$(( vm_total + 1 ))
+                    if kill -0 "$vp" 2>/dev/null; then
+                        vm_alive=$(( vm_alive + 1 ))
+                    elif ! echo "$vm_recorded_dead" | grep -qw "$vp"; then
+                        vm_recorded_dead="${vm_recorded_dead} ${vp}"
+                        vm_newly_dead="${vm_newly_dead} ${vp}"
                     fi
                 done < "$PID_STRESS_VM"
-                if [ -n "$vm_pid" ]; then
-                    vm_died=1
+                if [ -n "$vm_newly_dead" ]; then
                     local now_ts
                     now_ts=$(date '+%s')
                     if [ "$now_ts" -lt "$deadline" ]; then
                         vm_early_death_ts="$now_ts"
-                        log_error "内存压测进程异常退出 (PID: ${vm_pid}, 提前于预期结束时间)"
+                        log_error "内存压测进程异常退出 (PID:${vm_newly_dead}, 存活 ${vm_alive}/${vm_total}, 提前于预期结束时间)"
                         {
                             echo "=== STRESS VM CRASH @ $(date '+%Y-%m-%d %H:%M:%S') ==="
-                            echo "pid=${vm_pid}"
+                            echo "pids=${vm_newly_dead}"
+                            echo "alive=${vm_alive}/${vm_total}"
                             echo "expected_end_ts=${deadline}"
                             echo "crash_ts=${vm_early_death_ts}"
                             echo "=== Memory state ==="
@@ -962,9 +1028,11 @@ start_stress_guardian() {
                             tail -30 "${LOG_DIR}/stress_vm.log" 2>/dev/null || echo "(log not available)"
                         } > "${LOG_DIR}/crash_stress_vm.log"
                     else
-                        log_info "内存压测进程正常结束 (PID: ${vm_pid})"
+                        log_info "内存压测进程结束 (PID:${vm_newly_dead}, 存活 ${vm_alive}/${vm_total})"
                     fi
-                    pkill -9 -P "$vm_pid" 2>/dev/null || true
+                fi
+                if [ "$vm_total" -gt 0 ] && [ "$vm_alive" -eq 0 ]; then
+                    vm_died=1
                 fi
             fi
 
@@ -1011,6 +1079,29 @@ start_stress_guardian() {
                     fi
                 done
                 fio_alive="$new_alive"
+            fi
+
+            # disk-drop detection: every 60s verify test partitions/disks still exist
+            if [ $(( loop_count % 12 )) -eq 0 ] && [ -n "$disk_watch_list" ]; then
+                for entry in $disk_watch_list; do
+                    local dpart dbase
+                    dpart="${entry%%:*}"
+                    dbase="${entry##*:}"
+                    if [ ! -b "$dpart" ] && [ ! -b "$dbase" ]; then
+                        if ! grep -q "partition=${dpart}" "${LOG_DIR}/crash_disk.log" 2>/dev/null; then
+                            log_error "测试盘疑似掉盘: ${dpart} (base ${dbase}) 设备节点消失"
+                            {
+                                echo "=== DISK LOST @ $(date '+%Y-%m-%d %H:%M:%S') ==="
+                                echo "partition=${dpart}"
+                                echo "base=${dbase}"
+                                echo "=== lsblk snapshot ==="
+                                lsblk 2>/dev/null
+                                echo "=== dmesg tail ==="
+                                dmesg 2>/dev/null | tail -30
+                            } >> "${LOG_DIR}/crash_disk.log"
+                        fi
+                    fi
+                done
             fi
 
             sleep 5
@@ -1072,8 +1163,13 @@ start_stress_vm() {
             done
             ;;
         stress-ng|*)
-            log_info "启动 ${STRESS_CMD} 内存压测 (${mem_pct} 物理内存, 2 workers, mode=${vm_mode})"
-            local vm_args="--vm 2 --vm-bytes ${mem_pct} --vm-keep"
+            # NOTE: stress-ng --vm-bytes is PER-WORKER; split target across 2 workers
+            local mb_total mb_each
+            mb_total=$(echo "$mem_pct" | sed 's/[Mm]$//')
+            mb_each=$(( mb_total / 2 ))
+            [ "$mb_each" -lt 1 ] && mb_each=1
+            log_info "启动 ${STRESS_CMD} 内存压测 (总计 ${mem_pct}, 2 workers x ${mb_each}M/worker, mode=${vm_mode})"
+            local vm_args="--vm 2 --vm-bytes ${mb_each}M --vm-keep"
             case "$vm_mode" in
                 rand|random)  vm_args="${vm_args} --vm-method random" ;;
                 seq|sequential) vm_args="${vm_args} --vm-method inc" ;;
@@ -1088,9 +1184,10 @@ start_stress_vm() {
             ;;
     esac
 
-    wait
+    local vm_rc=0
+    wait || vm_rc=$?
     {
-        echo "stress VM exit code: 0"
+        echo "stress VM exit code: ${vm_rc}"
         echo "stress VM tool: ${mem_tool}"
         echo "stress VM bytes: ${mem_pct}"
         echo "stress VM mode: ${vm_mode}"
@@ -1123,7 +1220,7 @@ generate_performance_report() {
             et=$(cat "${LOG_DIR}/.end_timestamp")
             actual_hours=$(echo "scale=1; (${et} - ${st}) / 3600" | bc)
         fi
-        echo "  实际运行: ${actual_hours} 小时 (目标: 168H)"
+        echo "  实际运行: ${actual_hours} 小时 (目标: $(( TOTAL_DURATION_SEC / 3600 ))H)"
         echo ""
 
         echo "========== 内存性能指标 =========="
@@ -1248,21 +1345,31 @@ generate_performance_report() {
 
         echo ""
         echo "========== 系统日志检查 =========="
-        if [ -f "${LOG_DIR}/dmesg_pressure.log" ]; then
-            local dmesg_err
-            dmesg_err=$(grep -ciE "Oops:|Call Trace:|^BUG:|Kernel panic|Hardware Error:|mce:|MCE|segfault|task hung|KASAN|EDAC" "${LOG_DIR}/dmesg_pressure.log" 2>/dev/null || echo "0")
-            echo "  dmesg 异常: ${dmesg_err} 行"
+        local dmesg_err_pattern="Oops:|Call Trace:|^BUG:|Kernel panic|Hardware Error:|mce:|MCE|segfault|task hung|KASAN|EDAC|I/O error|nvme .*reset|controller reset|device disconnected|device blocked|ata[0-9]+ .*(error|reset)"
+        local dmesg_files=""
+        [ -f "${LOG_DIR}/dmesg_pressure.log" ] && dmesg_files="${LOG_DIR}/dmesg_pressure.log"
+        local dmesg_inc_count=0
+        if compgen -G "${LOG_DIR}/dmesg_incremental_*.log" > /dev/null; then
+            # shellcheck disable=SC2086
+            dmesg_files="${dmesg_files} ${LOG_DIR}/dmesg_incremental_*.log"
+            dmesg_inc_count=$(ls "${LOG_DIR}"/dmesg_incremental_*.log 2>/dev/null | wc -l)
+        fi
+        if [ -n "$dmesg_files" ]; then
+            local dmesg_err=0
+            # shellcheck disable=SC2086
+            dmesg_err=$(cat $dmesg_files 2>/dev/null | grep -ciE "$dmesg_err_pattern" || true)
+            echo "  dmesg 异常(含增量快照 ${dmesg_inc_count} 个文件): ${dmesg_err} 行"
         fi
 
         if [ -f "${LOG_DIR}/journalctl_pressure.log" ]; then
             local j_err
-            j_err=$(grep -ciE "Out of memory|Killed process|Oops:|Call Trace:|^BUG:|Kernel panic|Hardware Error:|mce:|MCE|panic|EDAC|task hung" "${LOG_DIR}/journalctl_pressure.log" 2>/dev/null || echo "0")
+            j_err=$(grep -ciE "Out of memory|Killed process|Oops:|Call Trace:|^BUG:|Kernel panic|Hardware Error:|mce:|MCE|panic|EDAC|task hung|I/O error|nvme .*reset|controller reset" "${LOG_DIR}/journalctl_pressure.log" 2>/dev/null || echo "0")
             echo "  journalctl 异常关键词: ${j_err} 行"
         fi
 
-        if [ -f "${LOG_DIR}/crash_stress_vm.log" ] || [ -f "${LOG_DIR}/crash_stress_cpu.log" ] || [ -f "${LOG_DIR}/crash_fio.log" ]; then
+        if [ -f "${LOG_DIR}/crash_stress_vm.log" ] || [ -f "${LOG_DIR}/crash_stress_cpu.log" ] || [ -f "${LOG_DIR}/crash_fio.log" ] || [ -f "${LOG_DIR}/crash_disk.log" ]; then
             echo ""
-            echo "  *** 检测到异常终止记录，请检查 crash_*.log ***"
+            echo "  *** 检测到异常终止/掉盘记录，请检查 crash_*.log (含 crash_disk.log) ***"
         fi
 
         echo ""
@@ -1338,12 +1445,21 @@ do_start() {
     start_mem_bw_monitor "$CSV_MON_INTERVAL" "$TOTAL_DURATION_SEC"
     start_dmesg_monitor "$DMESG_SNAP_INTERVAL" "$TOTAL_DURATION_SEC"
 
+    # EXIT-trap teardown (do_stop) only performs full cleanup when START_FLAG
+    # exists; set it now so any later start-phase failure still kills monitors
+    # and restores swap.
+    touch "$START_FLAG"
+
     log_info "Step 8: 检测系统盘..."
     detect_system_disk
 
     log_info "Step 9: 查找可用数据盘..."
     local data_disks
     if ! data_disks=$(find_data_disks); then
+        if [ -n "${FIO_DISKS:-}" ]; then
+            log_error "指定测试盘准备失败 (FIO_DISKS=\"${FIO_DISKS}\")，中止测试（不回退文件级模式）"
+            exit 1
+        fi
         log_warn "查找或准备数据盘失败，回退到文件级压测模式"
         data_disks=""
     fi
@@ -1436,6 +1552,7 @@ do_start() {
         echo "target_mem_mb=${target_mem_mb}"
         echo "vm_mode=${MEM_ACCESS_MODE}"
         echo "fio_mode=${fio_mode}"
+        echo "total_duration_sec=${TOTAL_DURATION_SEC}"
     } > "${LOG_DIR}/.resource_usage.log"
 
     log_info "  总 CPU 核心: ${total_cpus}"
@@ -1458,7 +1575,7 @@ do_start() {
     touch "$START_FLAG"
 
     local end_time
-    end_time=$(date -d "+168 hours" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "168 小时后")
+    end_time=$(date -d "+${TOTAL_DURATION_SEC} seconds" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "$(( TOTAL_DURATION_SEC / 3600 )) 小时后")
 
     echo ""
     echo "=============================================="
@@ -1684,7 +1801,13 @@ do_status() {
             local now_ts elapsed_h
             now_ts=$(date '+%s')
             elapsed_h=$(echo "scale=1; (${now_ts} - ${start_ts}) / 3600" | bc)
-            echo "  已运行: ${elapsed_h} 小时 (目标: 168H)"
+            local target_h=168
+            if [ -f "${LOG_DIR}/.resource_usage.log" ]; then
+                local dur_saved
+                dur_saved=$(get_mem_stat_val total_duration_sec "${LOG_DIR}/.resource_usage.log")
+                case "$dur_saved" in ''|*[!0-9]*) ;; *) target_h=$(( dur_saved / 3600 )) ;; esac
+            fi
+            echo "  已运行: ${elapsed_h} 小时 (目标: ${target_h}H)"
         fi
     else
         echo "  状态: 未运行"
@@ -1721,10 +1844,19 @@ do_status() {
         echo "    stress-ng CPU:  未运行"
     fi
 
-    if [ -f "$PID_STRESS_VM" ] && kill -0 "$(cat "$PID_STRESS_VM")" 2>/dev/null; then
-        echo "    stress-ng VM:   运行中 (PID: $(cat "$PID_STRESS_VM"))"
+    if [ -s "$PID_STRESS_VM" ]; then
+        local vm_alive=0 vm_total=0
+        vm_total=$(awk 'NF{n++} END{print n+0}' "$PID_STRESS_VM")
+        while read -r vpid; do
+            [ -n "$vpid" ] && kill -0 "$vpid" 2>/dev/null && vm_alive=$(( vm_alive + 1 ))
+        done < "$PID_STRESS_VM"
+        if [ "$vm_alive" -gt 0 ]; then
+            echo "    内存压测:       ${vm_alive}/${vm_total} 进程运行中"
+        else
+            echo "    内存压测:       未运行 (${vm_total} 记录)"
+        fi
     else
-        echo "    stress-ng VM:   未运行"
+        echo "    内存压测:       未运行"
     fi
 
     if [ -f "$PID_IPMI_MON" ] && [ -s "$PID_IPMI_MON" ]; then
@@ -1800,11 +1932,11 @@ usage() {
     echo "  可配置参数 (在配置文件中设置):"
     echo "    TOTAL_DURATION_SEC    测试持续秒数 (默认: 604800 = 168H)"
     echo "    CPU_TARGET_PCT        CPU 压测目标百分比 (默认: 95)"
-    echo "    MEM_TARGET_PCT        内存压测目标百分比 (默认: 95)"
+    echo "    MEM_TARGET_PCT        内存压测目标百分比 (默认: 90)"
     echo "    MEM_ACCESS_MODE       内存访问模式: all/rand/seq/flip/rowhammer/walk"
     echo "    CSV_MON_INTERVAL     OS内存监控间隔秒数 (默认: 10)"
     echo "    IPMI_MON_INTERVAL     ipmitool BMC 监控间隔秒数 (默认: 600 = 10min)"
-    echo "    MEM_TOOL              内存压测工具: auto/memtester/stress-ng (默认: auto，优先 memtester)"
+    echo "    MEM_TOOL              内存压测工具: stress-ng/memtester/auto (默认: stress-ng，按用例要求；auto=优先 memtester)"
     echo "    FIO_REQUIRED_VERSION  fio 要求版本 (默认: 3.13)"
     echo "    FIO_VERSION_STRICT    是否强制校验 fio 版本 true/false (默认: true)"
     echo "    CPU_THROTTLE_PCT      疑似降频判定阈值% (默认: 90，任一核频率低于 max 该比例即标记)"
