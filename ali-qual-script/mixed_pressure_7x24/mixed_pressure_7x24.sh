@@ -3,6 +3,7 @@
 # WARNING:
 #   This script may modify block devices, create partitions, run mkfs, disable
 #   swap, clear/backup logs, and generate sustained CPU/memory/IO pressure.
+#   SYSTEM_DISKS must be configured explicitly; FIO_DISKS may be wiped.
 #   Run it only on RD/lab machines where data loss and service interruption are acceptable.
 #
 
@@ -64,6 +65,7 @@ load_config() {
     CPU_TARGET_PCT=95
     MEM_TARGET_PCT=90
     MEM_TOOL="stress-ng"
+    SYSTEM_DISKS=""
     FIO_DISKS=""
     FIO_FILE_SIZE_MB=10240
     FIO_FILE_NUMJOBS=1
@@ -282,8 +284,13 @@ check_test_running() {
     return 1
 }
 
-detect_system_disk() {
+configure_system_disk_protection() {
     SYSTEM_DISK_BASES=""
+
+    if [ -z "${SYSTEM_DISKS:-}" ]; then
+        log_error "未配置 SYSTEM_DISKS，拒绝启动：必须显式指定所有系统盘"
+        return 1
+    fi
 
     local add_base
     add_base() {
@@ -305,42 +312,22 @@ detect_system_disk() {
         esac
     }
 
-    local src
-    while read -r src; do
-        [ -n "$src" ] && add_base "$src"
-    done < <(awk '!/^#/ && $1 ~ /^\// {print $1}' /proc/mounts)
-
-    local root_src
-    root_src=$(findmnt -n -o SOURCE / 2>/dev/null || echo "")
-    [ -z "$root_src" ] && root_src=$(df / | tail -1 | awk '{print $1}')
-    add_base "$root_src"
-
-    if command -v swapon &>/dev/null; then
-        local sw
-        while read -r sw; do
-            [ -n "$sw" ] && add_base "$sw"
-        done < <(swapon --noheadings --show=NAME 2>/dev/null)
-    else
-        while read -r sw; do
-            [ -n "$sw" ] && add_base "$sw"
-        done < <(awk 'NR>1{print $1}' /proc/swaps 2>/dev/null)
-    fi
-
-    local slaves
-    slaves=$(lsblk -nlo NAME,TYPE / 2>/dev/null | grep -v "disk\|part" | while read -r n _; do
-        lsblk -s -nlo NAME,TYPE "/dev/${n}" 2>/dev/null | grep disk | awk '{print "/dev/" $1}'
-    done | sort -u || true)
-    for sd in $slaves; do
-        [ -b "$sd" ] && case " ${SYSTEM_DISK_BASES} " in *" ${sd} "*) ;; *) SYSTEM_DISK_BASES="${SYSTEM_DISK_BASES} ${sd}" ;; esac
+    for configured_disk in $SYSTEM_DISKS; do
+        if [ ! -b "$configured_disk" ] && [ ! -b "/dev/${configured_disk}" ]; then
+            log_error "SYSTEM_DISKS 中的设备不存在或不是块设备: ${configured_disk}"
+            return 1
+        fi
+        local before="$SYSTEM_DISK_BASES"
+        add_base "$configured_disk"
+        if [ "$before" = "$SYSTEM_DISK_BASES" ]; then
+            log_error "无法解析 SYSTEM_DISKS 中的设备: ${configured_disk}"
+            return 1
+        fi
     done
 
     SYSTEM_DISK_BASES=$(echo "$SYSTEM_DISK_BASES" | xargs)
-    if [ -z "$SYSTEM_DISK_BASES" ]; then
-        log_warn "未能可靠识别系统盘，出于安全默认仅保护 /dev/sda；请通过配置文件 FIO_DISKS 显式指定测试盘，或人工核对"
-        SYSTEM_DISK_BASES="/dev/sda"
-    fi
 
-    log_info "系统盘保护列表: ${SYSTEM_DISK_BASES}"
+    log_info "系统盘保护列表（来自 SYSTEM_DISKS 配置）: ${SYSTEM_DISK_BASES}"
     log_info "以上磁盘及其分区不会被分区/格式化/压测"
 }
 
@@ -884,21 +871,21 @@ start_dmesg_monitor() {
     local interval="$1"
     local duration="$2"
 
-    log_info "启动 dmesg 中途增量快照监控 (每 ${interval}s 保存并清空一次, 持续 ${duration}s)"
+    log_info "启动 dmesg 中途快照监控 (每 ${interval}s 保存一次，不清空内核 ring buffer, 持续 ${duration}s)"
 
     {
         local end_ts=$(( $(date '+%s') + duration ))
         local seq=0
         while [ "$(date '+%s')" -lt "$end_ts" ]; do
             seq=$(( seq + 1 ))
-            dmesg -c > "${LOG_DIR}/dmesg_incremental_$(date '+%Y%m%d_%H%M%S')_${seq}.log" 2>/dev/null || true
+            dmesg > "${LOG_DIR}/dmesg_snapshot_$(date '+%Y%m%d_%H%M%S')_${seq}.log" 2>/dev/null || true
             sleep "$interval"
         done
-        log_info "dmesg 中途增量快照监控已结束"
+        log_info "dmesg 中途快照监控已结束"
     } &
     local dmesg_pid=$!
     echo "$dmesg_pid" > "$PID_DMESG_MON"
-    log_info "dmesg 中途增量快照监控已启动 (PID: ${dmesg_pid})"
+    log_info "dmesg 中途快照监控已启动 (PID: ${dmesg_pid})"
 }
 
 parse_ipmi_thermal() {
@@ -1346,19 +1333,16 @@ generate_performance_report() {
         echo ""
         echo "========== 系统日志检查 =========="
         local dmesg_err_pattern="Oops:|Call Trace:|^BUG:|Kernel panic|Hardware Error:|mce:|MCE|segfault|task hung|KASAN|EDAC|I/O error|nvme .*reset|controller reset|device disconnected|device blocked|ata[0-9]+ .*(error|reset)"
-        local dmesg_files=""
-        [ -f "${LOG_DIR}/dmesg_pressure.log" ] && dmesg_files="${LOG_DIR}/dmesg_pressure.log"
-        local dmesg_inc_count=0
-        if compgen -G "${LOG_DIR}/dmesg_incremental_*.log" > /dev/null; then
-            # shellcheck disable=SC2086
-            dmesg_files="${dmesg_files} ${LOG_DIR}/dmesg_incremental_*.log"
-            dmesg_inc_count=$(ls "${LOG_DIR}"/dmesg_incremental_*.log 2>/dev/null | wc -l)
+        local dmesg_err=0
+        local dmesg_snapshot_count=0
+        if compgen -G "${LOG_DIR}/dmesg_snapshot_*.log" > /dev/null; then
+            dmesg_snapshot_count=$(ls "${LOG_DIR}"/dmesg_snapshot_*.log 2>/dev/null | wc -l)
         fi
-        if [ -n "$dmesg_files" ]; then
-            local dmesg_err=0
-            # shellcheck disable=SC2086
-            dmesg_err=$(cat $dmesg_files 2>/dev/null | grep -ciE "$dmesg_err_pattern" || true)
-            echo "  dmesg 异常(含增量快照 ${dmesg_inc_count} 个文件): ${dmesg_err} 行"
+        if [ -f "${LOG_DIR}/dmesg_pressure.log" ]; then
+            dmesg_err=$(grep -ciE "$dmesg_err_pattern" "${LOG_DIR}/dmesg_pressure.log" 2>/dev/null || true)
+            echo "  dmesg 收尾快照异常: ${dmesg_err} 行（中途快照 ${dmesg_snapshot_count} 个文件，未重复计数）"
+        elif [ "$dmesg_snapshot_count" -gt 0 ]; then
+            echo "  dmesg 收尾快照缺失（中途快照 ${dmesg_snapshot_count} 个文件未计入异常统计）"
         fi
 
         if [ -f "${LOG_DIR}/journalctl_pressure.log" ]; then
@@ -1451,7 +1435,10 @@ do_start() {
     touch "$START_FLAG"
 
     log_info "Step 8: 检测系统盘..."
-    detect_system_disk
+    if ! configure_system_disk_protection; then
+        log_error "系统盘保护配置无效，中止测试"
+        exit 1
+    fi
 
     log_info "Step 9: 查找可用数据盘..."
     local data_disks
@@ -1700,7 +1687,7 @@ do_stop() {
         done < "$PID_MEM_BW_MON"
     fi
 
-    log_info "停止 dmesg 增量快照监控进程..."
+    log_info "停止 dmesg 快照监控进程..."
     if [ -f "$PID_DMESG_MON" ]; then
         while read -r pid; do
             [ -z "$pid" ] && continue
@@ -1882,9 +1869,9 @@ do_status() {
     fi
 
     if [ -f "$PID_DMESG_MON" ] && [ -s "$PID_DMESG_MON" ] && kill -0 "$(head -1 "$PID_DMESG_MON")" 2>/dev/null; then
-        echo "    dmesg 增量快照:  运行中"
+        echo "    dmesg 快照:      运行中"
     else
-        echo "    dmesg 增量快照:  未运行"
+        echo "    dmesg 快照:      未运行"
     fi
 
     if [ -f "$PID_GUARDIAN" ] && kill -0 "$(cat "$PID_GUARDIAN")" 2>/dev/null; then
@@ -1941,8 +1928,9 @@ usage() {
     echo "    FIO_VERSION_STRICT    是否强制校验 fio 版本 true/false (默认: true)"
     echo "    CPU_THROTTLE_PCT      疑似降频判定阈值% (默认: 90，任一核频率低于 max 该比例即标记)"
     echo "    MEM_BW_MON            内存带宽监控: auto/off (默认: auto，依赖 perf uncore 计数器)"
-    echo "    DMESG_SNAP_INTERVAL   dmesg 中途增量快照间隔秒数 (默认: 1800 = 30min)"
+    echo "    DMESG_SNAP_INTERVAL   dmesg 中途快照间隔秒数 (默认: 1800 = 30min，不清空 ring buffer)"
     echo "    FIO_STEADY_WAIT       fio 稳态等待秒数 (默认: 45)"
+    echo "    SYSTEM_DISKS          显式指定所有系统盘 (必填，空格分隔；不再自动探测)"
     echo "    FIO_DISKS             指定测试盘 (空格分隔, 默认: 自动发现)"
     echo "    FIO_FILE_SIZE_MB      文件级 fio 文件大小 MB (默认: 10240)"
     echo "    FIO_FILE_NUMJOBS      文件级 fio 并发数 (默认: 1)"

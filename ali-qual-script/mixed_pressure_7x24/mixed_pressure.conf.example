@@ -21,6 +21,9 @@
 #MEM_ACCESS_MODE="all"
 
 # ===== 磁盘 / fio =====
+# 显式指定所有系统盘（必填，空格分隔）；脚本不会自动探测系统盘
+# 配置错误或设备不存在时将直接终止，避免误操作系统盘
+#SYSTEM_DISKS="/dev/nvme0n1"
 # 显式指定测试盘，空格分隔（默认空 = 自动发现）
 # 注意：显式指定后，盘不存在 / 是系统盘 / 准备失败 会直接中止测试，不会回退到文件级模式
 #FIO_DISKS="/dev/nvme1n1 /dev/nvme2n1"
@@ -42,7 +45,7 @@
 #CSV_MON_INTERVAL=10
 # ipmitool BMC 传感器轮询间隔，秒（默认 600 = 10 分钟）
 #IPMI_MON_INTERVAL=600
-# dmesg 增量快照间隔，秒（默认 1800 = 30 分钟）
+# dmesg 中途快照间隔，秒（默认 1800 = 30 分钟，不清空内核 ring buffer）
 #DMESG_SNAP_INTERVAL=1800
 # 内存带宽监控：auto / off（默认 auto，依赖 perf uncore 计数器；无 perf 自动跳过）
 #MEM_BW_MON="auto"
@@ -54,6 +57,6 @@
 #SYSTEM_LOG_ACTION="backup"
 
 # ===== 危险项 =====
-# true = 对空白盘自动 wipefs + 分区 + mkfs.ext4，不再交互确认（默认 false）
-# 仅在无人值守且盘位已人工核对时开启；开错盘会清空磁盘数据
+# true = 对测试盘自动 wipefs + 分区 + mkfs.ext4，不再交互确认（默认 false）
+# 测试盘上的数据允许被清除；仅在无人值守且盘位已人工核对时开启
 #ALLOW_AUTO_PREPARE=false
