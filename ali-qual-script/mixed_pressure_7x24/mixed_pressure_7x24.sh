@@ -1711,11 +1711,12 @@ start_stress_vm() {
             log_info "启动 ${STRESS_CMD} 内存压测 (总计 ${mem_pct}, ${mb_workers} workers, mode=${vm_mode})"
             local vm_args="--vm ${mb_workers} --vm-bytes ${mb_total}M --vm-keep"
             case "$vm_mode" in
-                rand|random)  vm_args="${vm_args} --vm-method random" ;;
-                seq|sequential) vm_args="${vm_args} --vm-method inc" ;;
+                rand|random)  vm_args="${vm_args} --vm-method rand-set" ;;
+                seq|sequential) vm_args="${vm_args} --vm-method incdec" ;;
                 flip)         vm_args="${vm_args} --vm-method flip" ;;
                 rowhammer)    vm_args="${vm_args} --vm-method rowhammer" ;;
-                walk)         vm_args="${vm_args} --vm-method walk-one --vm-method walk-zero" ;;
+                walk)         vm_args="${vm_args} --vm-method walk-0d" ;;
+                write)        vm_args="${vm_args} --vm-method write64" ;;
                 all)          vm_args="${vm_args}" ;;
                 *)            log_warn "未知内存访问模式: ${vm_mode}, 使用默认 all"; vm_args="${vm_args}" ;;
             esac
@@ -2804,7 +2805,7 @@ usage() {
     echo "    TOTAL_DURATION_SEC    测试持续秒数 (默认: 604800 = 168H)"
     echo "    CPU_TARGET_PCT        CPU 压测目标百分比 (默认: 95)"
     echo "    MEM_TARGET_PCT        内存压测目标百分比 (默认: 90)"
-    echo "    MEM_ACCESS_MODE       内存访问模式: all/rand/seq/flip/rowhammer/walk"
+    echo "    MEM_ACCESS_MODE       内存访问模式: all/rand/seq/flip/rowhammer/walk/write"
     echo "    CSV_MON_INTERVAL     OS内存监控间隔秒数 (默认: 10)"
     echo "    IPMI_MON_INTERVAL     ipmitool BMC 监控间隔秒数 (默认: 600 = 10min)"
     echo "    MEM_TOOL              内存压测工具: stress-ng/memtester/auto (默认: stress-ng，按用例要求；auto=优先 memtester)"

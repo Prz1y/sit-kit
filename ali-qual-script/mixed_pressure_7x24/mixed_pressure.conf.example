@@ -17,8 +17,10 @@
 #MEM_TARGET_PCT=90
 # 内存压测工具：stress-ng / memtester / auto（默认 stress-ng，按用例要求；auto=优先 memtester）
 #MEM_TOOL="stress-ng"
-# 内存访问模式：all / rand / seq / flip / rowhammer / walk（默认 all）
-#MEM_ACCESS_MODE="all"
+# 内存访问模式：all / rand / seq / flip / rowhammer / walk / write（默认 all）
+# 注意：stress-ng >= 0.17 默认 all 会轮换全部 vm 方法，部分方法会额外分配 buffer 的 1/8
+# 临时内存（实测 RSS = 配额 x9/8），高占用配比下会 OOM 硬锁；write(write64) 无额外分配
+#MEM_ACCESS_MODE="write"
 
 # ===== 磁盘 / fio =====
 # 显式指定所有系统盘（必填，空格分隔）；脚本不会自动探测系统盘
