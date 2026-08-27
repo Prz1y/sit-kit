@@ -13,7 +13,7 @@
 #CPU_THROTTLE_PCT=90
 
 # ===== 内存 =====
-# 内存压测目标（默认 90；按 MemAvailable 可用内存的百分比，自动拆分给 2 个 worker）
+# 内存压测目标（默认 90；按 MemAvailable 可用内存的百分比，stress-ng --vm-bytes 直接使用该总量）
 #MEM_TARGET_PCT=90
 # 内存压测工具：stress-ng / memtester / auto（默认 stress-ng，按用例要求；auto=优先 memtester）
 #MEM_TOOL="stress-ng"
@@ -24,6 +24,8 @@
 # 显式指定所有系统盘（必填，空格分隔）；脚本不会自动探测系统盘
 # 配置错误或设备不存在时将直接终止，避免误操作系统盘
 #SYSTEM_DISKS="/dev/nvme0n1"
+# Existing ext4 filesystems are reused only when explicitly enabled.
+ALLOW_EXISTING_FS=false
 # 显式指定测试盘，空格分隔（默认空 = 自动发现）
 # 注意：显式指定后，盘不存在 / 是系统盘 / 准备失败 会直接中止测试，不会回退到文件级模式
 #FIO_DISKS="/dev/nvme1n1 /dev/nvme2n1"

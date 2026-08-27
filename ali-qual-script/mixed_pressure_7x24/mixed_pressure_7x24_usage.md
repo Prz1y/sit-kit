@@ -1,7 +1,7 @@
 # mixed_pressure_7x24.sh 使用说明
 
 整机混合压力稳定性测试脚本（CPU / 内存 / 磁盘 并行加压，默认 7x24H = 168 小时）。
-按测试用例要求实现：全部逻辑 CPU 加压、内存加压至可用内存 90%、fio 3.13 文件级 50%读/50%写带宽压测（ext4）、CPU 频率 / 内存带宽 / 温度功耗 / 系统日志全程监控。不含网卡与 GPU 加压功能。
+按测试用例要求实现：全部逻辑 CPU 加压、内存加压至可用内存 90%、fio 3.13 文件系统级 50%读/50%写带宽压测（ext4）、CPU 频率 / 内存带宽 / 温度功耗 / 系统日志全程监控。不含网卡与 GPU 加压功能。
 
 > 警告：必须在配置文件中显式指定 `SYSTEM_DISKS`。脚本可能对 `FIO_DISKS` 测试盘执行 wipefs / 重新分区 / mkfs.ext4，测试盘上的原有数据允许被清除；同时会临时关闭 swap 并产生持续高压。仅允许在 RD/实验室机器上运行。
 
@@ -68,13 +68,14 @@ tmux new-session -s pressure
 ## 4. 启动流程（start 内部步骤）
 
 1. 处理系统日志（默认 backup：压测前快照，不清空）
-2. 记录开始时间；dmidecode 内存信息；内存基线；BMC 传感器基线
+2. 记录测试准备信息；dmidecode 内存信息；内存基线；BMC 传感器基线
 3. 记录并关闭 swap（结束时按原列表恢复）
-4. 启动监控：OS 内存（默认 10s）、BMC 传感器（默认 600s）、CPU 频率（10s）、内存带宽（perf，10s）、dmesg 快照（默认 1800s，不清空内核 ring buffer）
-5. 检测系统盘 → 生成保护列表
-6. 查找数据盘：优先用配置 `FIO_DISKS`；否则自动发现。找到则挂载到 `FIO_MOUNT_BASE` 下并启动块设备级 fio（4 线程，占盘 90% 空闲空间，iodepth 64）；**显式指定的盘准备失败会直接中止，不会回退**；未指定且无可用数据盘时回退为系统盘 `/var/tmp` 文件级压测（预留 5GB 安全空间）
-7. 等 fio 稳态（默认 45s）→ 按"总核数 × CPU_TARGET_PCT% − fio 占用"计算 stress-ng CPU 核数；按"可用内存 × MEM_TARGET_PCT%"计算内存加压量（2 个 worker 均分，避免 --vm-bytes 按 worker 计导致的超卖）
-8. 启动 stress-ng CPU / 内存压测 / 进程守护，睡眠到总时长后自动 stop
+4. 按 `SYSTEM_DISKS` 生成系统盘保护列表
+5. 查找数据盘：优先用配置 `FIO_DISKS`；否则自动发现。找到则挂载到 `FIO_MOUNT_BASE` 下并启动 ext4 文件系统级 fio（4 线程，占盘 90% 空闲空间，iodepth 64）；**显式指定的盘准备失败会直接中止，不会回退**；未指定且无可用数据盘时回退为系统盘 `/var/tmp` 文件级压测（预留 5GB 安全空间）
+6. 等 fio 稳态（默认 45s）→ 按"总核数 × CPU_TARGET_PCT% − fio 占用"计算 stress-ng CPU 核数；按"可用内存 × MEM_TARGET_PCT%"计算内存加压总量，`--vm-bytes` 直接传该总量（stress-ng ≥ 0.17 内部在 4 个 worker 间均分），`--vm-keep` 保持驻留
+7. 启动 stress-ng CPU / 内存压测（两者的 `--timeout` 与主计时同长，自启动起算）→ 记录压力开始时间
+8. 启动监控：OS 内存（默认 10s）、BMC 传感器（默认 600s）、CPU 频率（10s）、内存带宽（perf，10s）、dmesg 快照（默认 1800s，不清空内核 ring buffer）
+9. 启动进程守护；达到完整压力时长后自动 stop
 
 ---
 
@@ -94,6 +95,7 @@ tmux new-session -s pressure
 | `MEM_TOOL` | `stress-ng` | 内存压测工具：`stress-ng` / `memtester` / `auto`（auto=优先 memtester） |
 | `MEM_ACCESS_MODE` | `all` | 内存访问模式：`all` / `rand` / `seq` / `flip` / `rowhammer` / `walk` |
 | `SYSTEM_DISKS` | 空（必填） | 显式指定所有系统盘，空格分隔。未配置、设备不存在或不是块设备时直接中止；不再自动探测 |
+| `ALLOW_EXISTING_FS` | `false` | 只有显式设为 `true` 才直接复用已有 ext4 文件系统；否则进入测试盘准备流程 |
 | `FIO_DISKS` | 空（自动发现） | 指定测试盘，空格分隔，如 `"/dev/nvme1n1 /dev/nvme2n1"`。**指定后准备失败即中止，不回退**；测试盘数据允许被清除 |
 | `FIO_MOUNT_BASE` | `/mnt/fio_pressure` | fio 挂载基础路径（第 2 块盘起追加 `_2`、`_3`…） |
 | `FIO_FILE_SIZE_MB` | `10240` | 文件级（回退模式）fio 单线程文件大小 MB |
@@ -158,7 +160,7 @@ FIO_STEADY_WAIT=20
 
 ```bash
 MEM_TOOL="memtester"
-# memtester 以 2 个 worker 均分目标内存（脚本自动处理）
+# memtester 固定 4 个实例均分目标内存（脚本自动处理）
 ```
 
 ### 范例 D — 无人值守自动准备空白盘（谨慎）
@@ -178,7 +180,7 @@ ALLOW_AUTO_PREPARE=true   # 空白盘自动 wipefs+分区+mkfs.ext4，不再询�
 |---|---|
 | 系统盘保护 | 从 `SYSTEM_DISKS` 配置读取系统盘并解析为整盘（含全部分区），拒绝分区/格式化/压测；未配置或设备无效时直接中止 |
 | FIO_DISKS 显式指定 | 指定盘不存在 / 是系统盘 / 准备失败 → **中止测试**，绝不回退到系统盘文件级模式 |
-| 自动发现模式 | 只接受非系统盘；带 LVM/RAID/LUKS/swap 签名的盘跳过；已有 ext4/xfs 分区直接复用不格式化；空白盘需交互确认（或 ALLOW_AUTO_PREPARE） |
+| 自动发现模式 | 只接受非系统盘；带 LVM/RAID/LUKS/swap 签名的盘跳过；已有 ext4 分区直接复用不格式化；空白盘需交互确认（或 ALLOW_AUTO_PREPARE） |
 | 文件级回退 | 仅当未指定 FIO_DISKS 且找不到任何数据盘时，对系统盘 `/var/tmp` 做文件级压测，预留 5GB，空间不足直接退出 |
 | fio 全部走文件系统 | `--directory` + `--direct=1`，不写裸块设备，不做 reset/低级操作，不会主动导致掉盘 |
 
