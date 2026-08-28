@@ -15,7 +15,7 @@
 | bash | 必需 | Linux bash 环境 |
 | bc / dmidecode | 必需 | 计算 / 内存信息采集 |
 | fio 3.13 | 必需 | 版本强校验（`FIO_VERSION_STRICT=true` 时必须精确 3.13） |
-| stress-ng | 必需 | CPU 与内存压测（需支持 `--vm`，0.09+） |
+| stress-ng | 必需 | CPU 与内存压测（需支持 `--vm`；0.17.08 实测通过，`MEM_ACCESS_MODE` 已按 0.17 有效方法名映射） |
 | ipmitool | 可选 | 缺失时跳过 BMC 温度/功耗监控 |
 | perf | 可选 | 缺失时跳过内存带宽监控（以内存负载持续运行为证据） |
 | memtester | 可选 | 仅 `MEM_TOOL=memtester` 或 `auto` 时使用 |
@@ -72,7 +72,7 @@ tmux new-session -s pressure
 3. 记录并关闭 swap（结束时按原列表恢复）
 4. 按 `SYSTEM_DISKS` 生成系统盘保护列表
 5. 查找数据盘：优先用配置 `FIO_DISKS`；否则自动发现。找到则挂载到 `FIO_MOUNT_BASE` 下并启动 ext4 文件系统级 fio（4 线程，占盘 90% 空闲空间，iodepth 64）；**显式指定的盘准备失败会直接中止，不会回退**；未指定且无可用数据盘时回退为系统盘 `/var/tmp` 文件级压测（预留 5GB 安全空间）
-6. 等 fio 稳态（默认 45s）→ 按"总核数 × CPU_TARGET_PCT% − fio 占用"计算 stress-ng CPU 核数；按"可用内存 × MEM_TARGET_PCT%"计算内存加压总量，`--vm-bytes` 直接传该总量（stress-ng ≥ 0.17 内部在 4 个 worker 间均分），`--vm-keep` 保持驻留
+6. 等 fio 稳态（默认 45s）→ 按"总核数 × CPU_TARGET_PCT% − fio 占用"计算 stress-ng CPU 核数；按"可用内存 × MEM_TARGET_PCT%"计算内存加压总量，`--vm-bytes` 直接传该总量（stress-ng ≥ 0.17 内部在 4 个 worker 间均分），`--vm-keep` 保持驻留；访问模式由 `MEM_ACCESS_MODE` 映射为 0.17 有效方法名（机制与风险见 5.1）
 7. 启动 stress-ng CPU / 内存压测（两者的 `--timeout` 与主计时同长，自启动起算）→ 记录压力开始时间
 8. 启动监控：OS 内存（默认 10s）、BMC 传感器（默认 600s）、CPU 频率（10s）、内存带宽（perf，10s）、dmesg 快照（默认 1800s，不清空内核 ring buffer）
 9. 启动进程守护；达到完整压力时长后自动 stop
@@ -91,9 +91,9 @@ tmux new-session -s pressure
 |---|---|---|
 | `TOTAL_DURATION_SEC` | `604800`（168H） | 测试持续秒数 |
 | `CPU_TARGET_PCT` | `95` | CPU 压测目标百分比（总核数口径） |
-| `MEM_TARGET_PCT` | `90` | 内存压测目标（按可用内存百分比） |
+| `MEM_TARGET_PCT` | `90` | 内存压测目标（按 fio 稳态后的可用内存百分比，下限钳位 1024MB）。注意：`MEM_ACCESS_MODE=all` 时 >88% 会确定性超卖死机（见 5.1 节） |
 | `MEM_TOOL` | `stress-ng` | 内存压测工具：`stress-ng` / `memtester` / `auto`（auto=优先 memtester） |
-| `MEM_ACCESS_MODE` | `all` | 内存访问模式：`all` / `rand` / `seq` / `flip` / `rowhammer` / `walk` |
+| `MEM_ACCESS_MODE` | `all` | 内存访问模式：`all` / `rand` / `seq` / `flip` / `rowhammer` / `walk` / `write`。映射 stress-ng 0.17 方法名：rand→rand-set、seq→incdec、walk→walk-0d、write→write64。**推荐 `write`**；`all` 有 ×9/8 超卖风险（见 5.1 节） |
 | `SYSTEM_DISKS` | 空（必填） | 显式指定所有系统盘，空格分隔。未配置、设备不存在或不是块设备时直接中止；不再自动探测 |
 | `ALLOW_EXISTING_FS` | `false` | 只有显式设为 `true` 才直接复用已有 ext4 文件系统；否则进入测试盘准备流程 |
 | `FIO_DISKS` | 空（自动发现） | 指定测试盘，空格分隔，如 `"/dev/nvme1n1 /dev/nvme2n1"`。**指定后准备失败即中止，不回退**；测试盘数据允许被清除 |
@@ -112,6 +112,14 @@ tmux new-session -s pressure
 | `SYSTEM_LOG_ACTION` | `backup` | 系统日志策略：`backup`（压测前快照）/ `clear`（清空 dmesg 与 /var/log/messages）/ `none` |
 | `ALLOW_AUTO_PREPARE` | `false` | `true` 时对空白盘自动 wipefs/分区/mkfs 不再交互确认（危险，仅无人值守且盘位已核对时用） |
 
+### 5.1 内存压测机制与安全边界（重要）
+
+- **目标量计算**：`fio 稳态后的 MemAvailable × MEM_TARGET_PCT%`，下限 1024MB。基于可用内存而非 MemTotal，不同内存容量机器自动适配。
+- **stress-ng ≥ 0.17 语义**：`--vm-bytes` 传的是总量，内部在 4 个 worker 间均分；配合 `--vm-keep` 常驻总量 = 目标量。
+- **`MEM_ACCESS_MODE=all` 的 ×9/8 超卖**：默认 all 模式轮询全部 vm 方法，部分方法会额外申请"每 worker 配额/8"的临时内存，总驻留可达目标量 ×9/8。`90% × 9/8 = 101.25% > 100%`，且脚本已关闭 swap → `all` + `MEM_TARGET_PCT>88` 会爆内存硬锁死机（实测复现，且 OOM 来不及触发、事后无内核日志）。
+  - 规避：`MEM_ACCESS_MODE=write`（write64，实测无超卖，7x24 长稳验证）；或坚持 all 模式时 `MEM_TARGET_PCT≤80`。
+- **memtester 路径**：脚本自动拆 4 个实例均分目标量，无上述超卖问题。
+
 ---
 
 ## 6. 配置文件范例
@@ -128,7 +136,7 @@ FIO_DISKS="/dev/nvme1n1 /dev/nvme2n1"  # 显式指定测试盘；写错/是系�
 MEM_TOOL="stress-ng"                   # 按用例要求使用 stress-ng
 MEM_TARGET_PCT=90                      # 可用内存的 90%
 CPU_TARGET_PCT=95
-MEM_ACCESS_MODE="all"
+MEM_ACCESS_MODE="write"                # write64，无 ×9/8 超卖；用 "all" 时须 MEM_TARGET_PCT<=80（见 5.1）
 FIO_REQUIRED_VERSION="3.13"
 FIO_VERSION_STRICT=true
 CPU_THROTTLE_PCT=90
@@ -215,3 +223,4 @@ ALLOW_AUTO_PREPARE=true   # 空白盘自动 wipefs+分区+mkfs.ext4，不再询�
 | 中途机器重启过 | 测试进程已丢失：`status` 会显示未运行；`stop` 清理残留并出报告，然后重新 start |
 | 不想动系统盘但也没有数据盘 | 会回退 /var/tmp 文件级压测；不想压系统盘就直接指定 `FIO_DISKS`（找不到即中止） |
 | swap 被动了 | 脚本启动时关 swap、结束按启动前记录恢复；异常中断后可手动 `swapon -a` |
+| 高内存负载一段时间后整机硬锁死机、事后无 OOM 日志 | 典型为 `MEM_ACCESS_MODE=all` ×9/8 超卖（见 5.1）：改 `MEM_ACCESS_MODE=write`，或 all 模式下 `MEM_TARGET_PCT≤80` |
