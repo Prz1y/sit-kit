@@ -205,6 +205,18 @@ ALLOW_AUTO_PREPARE=true   # 空白盘自动 wipefs+分区+mkfs.ext4，不再询�
 | `var_log_messages*.log` / `journalctl_pressure.log` | 系统日志（压测窗口内） |
 | `crash_stress_cpu.log` / `crash_stress_vm.log` / `crash_fio.log` / `crash_disk.log` | 守护检测到的异常终止 / 掉盘记录（出现即异常） |
 
+### 8.1 stop 状态标志（`.cleanup_failed` / `.stopping`）
+
+日志目录下的隐藏状态文件，控制"停止是否彻底完成、是否允许下一轮覆盖现场"：
+
+- **写入时机**：stop 过程中任一清理步骤失败即写入 `.cleanup_failed` 并保留 `.stopping`。失败来源包括：压测进程 TERM/KILL 后仍存活、fio 挂载点卸载失败或挂载源/UUID 与记录不一致、swap 恢复失败、dmesg/journalctl 状态 FAIL、报告生成失败、分区回滚失败。文件内容为失败时的 unix 时间戳或 `partition_rollback_failed:<盘名>`，具体原因看 `console_output.log`。
+- **关键行为：不会被后续 stop 自动清除**。只要该标志存在，之后即使完全成功的 stop 也会在末尾报 `清理未完全成功，保留运行标志并写入 ... .cleanup_failed`（并提示 `保留既有清理失败原因: <旧内容>`），且下一轮 `start` 被拒绝（`上一次停止未完成清理，拒绝启动`）。这是防止未确认的失败现场被覆盖的设计，**不代表本次 stop 又出了新故障**。
+- **人工解锁**（确认现场已干净后）：
+  1. 核验：无 stress-ng / fio 残留进程、无 `fio_pressure` 挂载点（`grep fio_pressure /proc/mounts`）、swap 与 fstab 一致（`swapon --show`）
+  2. 删除或改名备份日志目录下的 `.cleanup_failed` 与 `.stopping`
+  3. 重新 `start`
+- **数据盘中途掉线的特例**：NVMe 链路故障后设备重枚举（如 nvme1n1 → nvme1n2），stop 对"挂载源一致但 UUID 已不可读"的挂载点放行卸载并仅告警；若卸载仍失败，可 `umount -l <挂载点>` 后重新执行 stop。
+
 ---
 
 ## 9. 常见问题
@@ -218,3 +230,4 @@ ALLOW_AUTO_PREPARE=true   # 空白盘自动 wipefs+分区+mkfs.ext4，不再询�
 | 不想动系统盘但也没有数据盘 | 会回退 /var/tmp 文件级压测；不想压系统盘就直接指定 `FIO_DISKS`（找不到即中止） |
 | swap 被动了 | 脚本启动时关 swap、结束按启动前记录恢复；异常中断后可手动 `swapon -a` |
 | 高内存负载一段时间后整机硬锁死机、事后无 OOM 日志 | 典型为 `MEM_ACCESS_MODE=all` ×9/8 超卖（见 5.1）：改 `MEM_ACCESS_MODE=write`，或 all 模式下 `MEM_TARGET_PCT≤80` |
+| stop 报 `清理未完全成功，保留运行标志`，或 start 被拒 `上一次停止未完成清理` | 上次 stop 失败留下的 `.cleanup_failed` 标志未清（脚本不会自动清除，后续成功的 stop 也会报这条）。按 8.1 核验现场干净后，手动删除 `.cleanup_failed` 与 `.stopping` 再 start |
