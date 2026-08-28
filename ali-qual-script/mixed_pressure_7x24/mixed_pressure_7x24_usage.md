@@ -124,28 +124,22 @@ tmux new-session -s pressure
 
 ## 6. 配置文件范例
 
-### 范例 A — 正式 7x24H（推荐写法：显式指定测试盘）
+### 范例 A — 正式 7x24H（本次 10.8.149.204 实际使用配置）
 
 `mixed_pressure.conf`：
 
 ```bash
 # ===== mixed_pressure_7x24 正式压测配置 =====
 TOTAL_DURATION_SEC=604800              # 168h
-SYSTEM_DISKS="/dev/nvme0n1"            # 必须显式指定所有系统盘
-FIO_DISKS="/dev/nvme1n1 /dev/nvme2n1"  # 显式指定测试盘；写错/是系统盘会直接中止
+SYSTEM_DISKS="/dev/sda"                # 必须显式指定所有系统盘（204 系统盘为 sda，LVM）
+# FIO_DISKS 不指定 = 自动发现全部数据盘（204 = 12 块 NVMe）
+ALLOW_EXISTING_FS=true                 # 数据盘已有 ext4 分区时直接复用，不重新格式化
+ALLOW_AUTO_PREPARE=true                # 空白数据盘自动 wipefs+分区+mkfs.ext4（无人值守）
+FIO_VERSION_STRICT=false               # 主机 fio 3.42 != 用例要求 3.13，仅告警不退出
 MEM_TOOL="stress-ng"                   # 按用例要求使用 stress-ng
 MEM_TARGET_PCT=90                      # 可用内存的 90%
-CPU_TARGET_PCT=95
 MEM_ACCESS_MODE="write"                # write64，无 ×9/8 超卖；用 "all" 时须 MEM_TARGET_PCT<=80（见 5.1）
-FIO_REQUIRED_VERSION="3.13"
-FIO_VERSION_STRICT=true
-CPU_THROTTLE_PCT=90
-MEM_BW_MON="auto"
-CSV_MON_INTERVAL=10
-IPMI_MON_INTERVAL=600
-DMESG_SNAP_INTERVAL=1800
-LOG_CLEANUP_MODE="backup"
-SYSTEM_LOG_ACTION="backup"
+CPU_TARGET_PCT=95
 ```
 
 ### 范例 B — 短时冒烟（部署验证用）

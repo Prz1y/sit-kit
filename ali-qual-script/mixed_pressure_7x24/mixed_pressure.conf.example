@@ -4,7 +4,7 @@
 
 # ===== 测试时长 =====
 # 测试持续秒数（默认 604800 = 168 小时 = 7x24）
-#TOTAL_DURATION_SEC=604800
+TOTAL_DURATION_SEC=604800
 
 # ===== CPU =====
 # CPU 压测目标百分比（默认 95；stress-ng 核数 = 总核数 × PCT% − fio 占用）
@@ -20,14 +20,14 @@
 # 内存访问模式：all / rand / seq / flip / rowhammer / walk / write（默认 all）
 # 注意：stress-ng >= 0.17 默认 all 会轮换全部 vm 方法，部分方法会额外分配 buffer 的 1/8
 # 临时内存（实测 RSS = 配额 x9/8），高占用配比下会 OOM 硬锁；write(write64) 无额外分配
-#MEM_ACCESS_MODE="write"
+MEM_ACCESS_MODE="write"
 
 # ===== 磁盘 / fio =====
 # 显式指定所有系统盘（必填，空格分隔）；脚本不会自动探测系统盘
 # 配置错误或设备不存在时将直接终止，避免误操作系统盘
-#SYSTEM_DISKS="/dev/nvme0n1"
+SYSTEM_DISKS="/dev/sda"
 # Existing ext4 filesystems are reused only when explicitly enabled.
-ALLOW_EXISTING_FS=false
+ALLOW_EXISTING_FS=true
 # 显式指定测试盘，空格分隔（默认空 = 自动发现）
 # 注意：显式指定后，盘不存在 / 是系统盘 / 准备失败 会直接中止测试，不会回退到文件级模式
 #FIO_DISKS="/dev/nvme1n1 /dev/nvme2n1"
@@ -40,7 +40,7 @@ ALLOW_EXISTING_FS=false
 # fio 要求版本（默认 3.13，按用例要求）
 #FIO_REQUIRED_VERSION="3.13"
 # 是否强制校验 fio 版本（默认 true；false 时仅告警不退出）
-#FIO_VERSION_STRICT=true
+FIO_VERSION_STRICT=false
 # fio 稳态等待秒数，之后再计算 CPU/内存参数（默认 45）
 #FIO_STEADY_WAIT=45
 
@@ -63,4 +63,4 @@ ALLOW_EXISTING_FS=false
 # ===== 危险项 =====
 # true = 对测试盘自动 wipefs + 分区 + mkfs.ext4，不再交互确认（默认 false）
 # 测试盘上的数据允许被清除；仅在无人值守且盘位已人工核对时开启
-#ALLOW_AUTO_PREPARE=false
+ALLOW_AUTO_PREPARE=true
