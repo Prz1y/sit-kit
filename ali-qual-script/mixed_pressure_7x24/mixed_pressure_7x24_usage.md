@@ -205,21 +205,7 @@ ALLOW_AUTO_PREPARE=true   # 空白盘自动 wipefs+分区+mkfs.ext4，不再询�
 
 ---
 
-## 9. 结果判定要点
-
-| 检查项 | 位置 | PASS 标准 |
-|---|---|---|
-| 无崩溃/挂死 + 时长达标 | 报告头 `实际运行 (目标: ...H)` | 实际 ≈ 目标 |
-| 压测进程未提前退出 | `crash_*.log` 不存在或为空 | 无记录 |
-| 无掉盘 | `crash_disk.log` 无记录；fio 日志无 device reset/disconnected | 无 |
-| 系统日志无异常 | 报告"系统日志检查"节：dmesg / journalctl 异常关键词计数 | 0 行 |
-| 无降频 | 报告 CPU 频率节（阈值 CPU_THROTTLE_PCT）；持续满载下降频为手动复核项 | 无降频标记 |
-| 内存无 OOM | `stress_vm.log` exit code 0；journalctl 无 OOM kill | 满足 |
-| 温度/功耗 | 报告 BMC 节（需 ipmitool） | 无过热 |
-
----
-
-## 10. 常见问题
+## 9. 常见问题
 
 | 现象 | 处理 |
 |---|---|
