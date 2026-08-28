@@ -249,9 +249,15 @@ stop_pid_records() {
 
     if [ -n "$pids" ]; then
         sleep "$delay"
+        local kill_grace=0
         while read -r tree_pid tree_start; do
             [ -n "$tree_pid" ] || continue
             terminate_pid_by_start "$tree_pid" "$tree_start" KILL
+            kill_grace=0
+            while [ "$kill_grace" -lt 10 ] && pid_line_matches "$tree_pid" "$tree_start"; do
+                sleep 1
+                kill_grace=$(( kill_grace + 1 ))
+            done
             if pid_line_matches "$tree_pid" "$tree_start"; then
                 log_error "${label} 进程树在 TERM/KILL 后仍存活: ${tree_pid}"
                 cleanup_failed=1
@@ -351,6 +357,10 @@ mount_source_matches() {
     fi
     if [ -n "$expected_uuid" ] && [ "$expected_uuid" != "-" ]; then
         current_uuid=$(blkid -s UUID -o value "$source" 2>/dev/null || true)
+        if [ -z "$current_uuid" ]; then
+            log_warn "设备 ${source} UUID 无法读取（设备可能已掉线），按挂载源一致放行校验"
+            return 0
+        fi
         [ "$current_uuid" = "$expected_uuid" ] || return 1
     fi
     return 0
@@ -483,6 +493,9 @@ restore_original_swap() {
 
     while read -r swap_dev; do
         [ -n "$swap_dev" ] || continue
+        if swapon --noheadings --show=NAME 2>/dev/null | awk 'NF{print $1}' | grep -Fxq "$swap_dev"; then
+            continue
+        fi
         swapon "$swap_dev" 2>/dev/null || log_warn "swapon 失败: ${swap_dev}"
     done < "$SWAP_ORIG_FILE"
     local remaining expected
@@ -2569,7 +2582,7 @@ do_stop() {
             [ -n "$mp" ] || continue
             if is_mountpoint "$mp"; then
                 if ! mount_source_matches "$part_dev" "$mp" "$mount_uuid"; then
-                    log_error "挂载源或 UUID 与记录不一致，拒绝卸载替代挂载: ${mp} (记录 ${part_dev}, 当前 $(get_mount_source "$mp"))"
+                    log_error "挂载源或 UUID 与记录不一致，拒绝卸载替代挂载: ${mp} (记录 ${part_dev} uuid=${mount_uuid}, 当前 $(get_mount_source "$mp") uuid=$(blkid -s UUID -o value "$(get_mount_source "$mp")" 2>/dev/null || echo 无法读取))"
                     cleanup_failed=1
                 elif umount "$mp" 2>/dev/null; then
                     log_info "已卸载: ${mp}"
